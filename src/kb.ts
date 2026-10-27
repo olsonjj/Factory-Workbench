@@ -40,24 +40,35 @@ export function appendEntry(kbFile: string, moment: KbMoment, scope: string, con
 export function readKbFile(kbFile: string, limitChars?: number): string {
   if (!existsSync(kbFile)) return "";
   const text = readFileSync(kbFile, "utf8");
-  return limitChars === undefined || text.length <= limitChars ? text : text.slice(0, limitChars);
+  if (limitChars === undefined || text.length <= limitChars) return text;
+  return `<!-- older KB content elided (${text.length - limitChars} chars) -->\n\n${text.slice(-limitChars)}`;
+}
+
+/** Char budget for triage's lightweight global-KB-only view. */
+export const KB_TRIAGE_LIGHT_LIMIT = 2000;
+
+export interface KbLoadOptions {
+  lightweight?: boolean;
+  maxGlobalChars?: number;
+  maxProjectChars?: number;
 }
 
 /**
  * Read the KB layers a consuming stage should see.
- * - triage gets the global layer lightly (truncated).
- * - spec/implement/review get global + project, in full.
+ * - triage gets the global layer lightly (tail-truncated).
+ * - spec/implement/review get global + project, capped to the configured sizes.
  */
 export function loadKbSnapshot(
   p: FactoryPaths,
   repo: string | undefined,
-  opts: { lightweight?: boolean } = {},
+  opts: KbLoadOptions = {},
 ): { global: string; project: string } {
-  const globalLimit = opts.lightweight ? 2000 : undefined;
+  const globalLimit = opts.lightweight ? KB_TRIAGE_LIGHT_LIMIT : opts.maxGlobalChars;
+  const projectLimit = opts.maxProjectChars;
   // Triage is deliberately lightweight: global layer only, truncated; it also
   // never sees the project layer up front.
   return {
     global: readKbFile(globalKbFile(p), globalLimit),
-    project: opts.lightweight ? "" : repo ? readKbFile(projectKbFile(p, repo)) : "",
+    project: opts.lightweight ? "" : repo ? readKbFile(projectKbFile(p, repo), projectLimit) : "",
   };
 }

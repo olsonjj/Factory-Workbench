@@ -93,6 +93,8 @@ export interface StageRequest {
  */
 export interface StageRunner {
   runStage(req: StageRequest): Promise<StageResult>;
+  /** Release runner-held resources (worktrees, mounts) before the DB closes. */
+  dispose?(): Promise<void>;
 }
 
 export interface PrPublishResult {

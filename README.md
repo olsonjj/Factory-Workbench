@@ -98,6 +98,7 @@ wb status   # everything the factory is doing, waiting on, or blocked by
 wb approve <id>          # release a parked approval gate
 wb reject <id> --reason "fix the X"   # feedback feeds the next agent run
 wb answer <id> -a "..."  # answer parked triage questions; triage re-runs
+wb retry <id>            # re-queue a malformed / infra-failed / exhausted-rework item
 wb curate [project]      # on-demand KB curation proposal (read-only)
 ```
 

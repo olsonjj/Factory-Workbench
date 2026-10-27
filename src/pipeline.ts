@@ -22,6 +22,7 @@ export interface PrPublishRequest {
 
 export interface PrPublisher {
   publish(req: PrPublishRequest): Promise<PrPublishResult>;
+  findExisting(req: { repoPath: string; branchName: string; base: string }): Promise<PrPublishResult | undefined>;
 }
 
 export interface TickEntry {
@@ -35,6 +36,8 @@ export interface TickEntry {
 export interface TickReport {
   entries: TickEntry[];
   changed: boolean;
+  /** True when `resume` stopped because it hit its safety tick cap, not because work ran out. */
+  capped?: boolean;
 }
 
 export interface OrchestratorDeps {
@@ -45,6 +48,8 @@ export interface OrchestratorDeps {
   curator: CuratorRunner | null;
   publisher: PrPublisher;
   sleep: (ms: number) => Promise<void>;
+  /** Safety cap for `resume`'s inner tick loop (default 500). */
+  maxResumeTicks?: number;
 }
 
 export class Orchestrator {
@@ -55,6 +60,7 @@ export class Orchestrator {
   private readonly curator: CuratorRunner | null;
   private readonly publisher: PrPublisher;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly maxResumeTicks: number;
 
   constructor(deps: OrchestratorDeps) {
     this.db = deps.db;
@@ -64,6 +70,7 @@ export class Orchestrator {
     this.curator = deps.curator;
     this.publisher = deps.publisher;
     this.sleep = deps.sleep;
+    this.maxResumeTicks = deps.maxResumeTicks ?? 500;
   }
 
   // ------------------------------------------------------------------ tick
@@ -72,31 +79,95 @@ export class Orchestrator {
   async tickAll(): Promise<TickReport> {
     const report: TickReport = { entries: [], changed: false };
     for (const item of this.db.itemsWithStatus(ACTIONABLE_STATUSES)) {
-      const entry = await this.tickItem(item);
+      let entry: TickEntry;
+      try {
+        entry = await this.tickItem(item);
+      } catch (err) {
+        entry = this.parkUnexpectedError(item, err);
+      }
       report.entries.push(entry);
       report.changed = true;
     }
     return report;
   }
 
+  /** One bad item parks cleanly; the rest of the tick continues. */
+  private parkUnexpectedError(item: ItemRecord, err: unknown): TickEntry {
+    const stage = item.stage;
+    const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    this.db.updateItem(item.id, {
+      status: "infrastructure-failure",
+      parkedReason: "unhandled-error",
+      parkedDetail: { stage, error: message },
+    });
+    this.db.appendHistory(item.id, "parked", stage, { reason: "unhandled-error", error: message });
+    return { id: item.id, slug: item.slug, fromStage: stage, status: "infrastructure-failure", detail: message };
+  }
+
   /**
    * Crash/interruption recovery: restart human-rejected items (their reason
    * rides as feedback into the next agent run), then keep ticking until no
-   * item changes state.
+   * item changes state or the safety tick cap is reached.
    */
   async resume(): Promise<TickReport> {
+    const maxTicks = this.maxResumeTicks;
     for (const item of this.db.itemsWithStatus(["human-rejected"])) {
-      this.db.updateItem(item.id, { status: "queued" });
+      this.db.updateItem(item.id, { status: "queued", parkedReason: null, parkedDetail: null });
       this.db.appendHistory(item.id, "unparked", item.stage, { via: "resume", feedback: item.feedback });
     }
     const combined: TickReport = { entries: [], changed: false };
-    for (let i = 0; i < 500; i++) {
+    let capped = false;
+    for (let i = 0; i < maxTicks; i++) {
       const report = await this.tickAll();
       combined.entries.push(...report.entries);
       if (!report.changed) break;
       combined.changed = true;
+      if (i === maxTicks - 1) capped = true;
     }
-    return combined;
+    return { ...combined, capped };
+  }
+
+  /** Re-queue an item parked by infra failure, exhausted rework, or malformed front-matter. */
+  retry(itemId: number): ItemRecord {
+    const item = this.requireItem(itemId);
+    if (item.status === "malformed") {
+      if (!item.sourceFile || !existsSync(item.sourceFile)) {
+        throw new Error(`item ${item.slug} has no source file to re-parse`);
+      }
+      const parsed = parseItemMarkdown(readFileSync(item.sourceFile, "utf8"));
+      if (!parsed.ok) throw new Error(`still malformed: ${parsed.reason}`);
+      this.db.updateItem(item.id, {
+        title: parsed.item.title,
+        repo: parsed.item.repo,
+        base: parsed.item.base,
+        approvals: [...parsed.item.approvals],
+        stage: "triage",
+        status: "queued",
+        parkedReason: null,
+        parkedDetail: null,
+      });
+      this.db.appendHistory(item.id, "unparked", "triage", { via: "retry", note: "front-matter fixed" });
+    } else if (item.status === "exhausted-rework") {
+      const failedStage = (item.parkedDetail?.stage as StageName | undefined) ?? item.stage;
+      const attempts = { ...item.gateAttempts };
+      delete attempts[failedStage]; // fresh budget for that gate
+      this.db.updateItem(item.id, {
+        stage: reworkTarget(failedStage), // implement is the fix venue
+        status: "queued",
+        gateAttempts: attempts,
+        parkedReason: null,
+        parkedDetail: null, // keep `feedback` so implement sees it
+      });
+      this.db.appendHistory(item.id, "unparked", failedStage, { via: "retry", resetGate: failedStage });
+    } else if (item.status === "infrastructure-failure") {
+      this.db.updateItem(item.id, { status: "queued", parkedReason: null, parkedDetail: null });
+      this.db.appendHistory(item.id, "unparked", item.stage, { via: "retry" });
+    } else {
+      throw new Error(
+        `item ${item.slug} is ${item.status}; retry applies to malformed, exhausted-rework, or infrastructure-failure`,
+      );
+    }
+    return this.db.getItem(item.id)!;
   }
 
   // ------------------------------------------------------------------ verbs
@@ -181,6 +252,11 @@ export class Orchestrator {
     return { file: path.relative(this.paths.root, abs), proposal: content };
   }
 
+  /** Release runner-held resources (worktrees, mounts) before the DB closes. */
+  async dispose(): Promise<void> {
+    await this.runner.dispose?.();
+  }
+
   // ------------------------------------------------------------------ per-item
 
   private async tickItem(item: ItemRecord): Promise<TickEntry> {
@@ -233,13 +309,14 @@ export class Orchestrator {
     this.db.updateItem(item.id, { status: "running" });
     this.db.appendHistory(item.id, "stage-start", stage, { attempt: attemptNo(item, stage) });
 
-    const repoLockAcquired = this.db.acquireRepoLock(repoSlug(item.repo), item.id);
-    if (!repoLockAcquired) {
-      // Stale lock from a crashed run: strictly-sequential MVP proceeds, but
-      // the conflict is on the record.
-      this.db.appendHistory(item.id, "stage-start", stage, { lockConflict: true });
-    }
+    let repoLockAcquired = false;
     try {
+      repoLockAcquired = this.db.acquireRepoLock(repoSlug(item.repo), item.id);
+      if (!repoLockAcquired) {
+        // Stale lock from a crashed run: strictly-sequential MVP proceeds, but
+        // the conflict is on the record.
+        this.db.appendHistory(item.id, "stage-start", stage, { lockConflict: true });
+      }
       let infra = 0;
       for (;;) {
         const req = await this.stageRequest(item, stage);
@@ -452,6 +529,28 @@ export class Orchestrator {
         const ctx = this.contextOf(item);
         const body = this.buildPrBody(item);
         const draft = item.approvals.length > 0;
+        const existing = await this.publisher.findExisting({
+          repoPath: resolveRepoPath(item.repo),
+          branchName: item.branchName,
+          base: item.base,
+        });
+        if (existing) {
+          const prSummary = this.lastPrSummary(item.id)
+            ?? `${item.title}: PR ${existing.number} already existed (${existing.draft ? "draft" : "ready-for-review"})`;
+          appendEntry(projectKbFile(this.paths, item.repo), "pr-outcome", repoSlug(item.repo), prSummary);
+          this.db.updateItem(item.id, {
+            status: "done",
+            parkedReason: null,
+            parkedDetail: { prUrl: existing.url, prNumber: existing.number, draft: existing.draft },
+          });
+          this.db.appendHistory(item.id, "pr-created", "pr", {
+            url: existing.url,
+            number: existing.number,
+            draft: existing.draft,
+            recoveredExisting: true,
+          });
+          return { id: item.id, slug: item.slug, fromStage: "pr", status: "done", detail: `PR ${existing.url} (recovered existing)` };
+        }
         const pr = await this.publisher.publish({
           item: ctx,
           body,
@@ -552,7 +651,11 @@ export class Orchestrator {
 
   private async stageRequest(item: ItemRecord, stage: StageName) {
     const ctx = this.contextOf(item);
-    const kb = loadKbSnapshot(this.paths, item.repo, { lightweight: stage === "triage" });
+    const kb = loadKbSnapshot(this.paths, item.repo, {
+      lightweight: stage === "triage",
+      maxGlobalChars: this.config.kb.maxGlobalChars,
+      maxProjectChars: this.config.kb.maxProjectChars,
+    });
     return { stage, item: ctx, kb };
   }
 
@@ -614,11 +717,19 @@ export class Orchestrator {
   }
 
   private loadCurationKb(projects: string[]): KbSnapshot {
-    const global = loadKbSnapshot(this.paths, undefined, {}).global;
+    const global = loadKbSnapshot(this.paths, undefined, {
+      maxGlobalChars: this.config.kb.maxGlobalChars,
+      maxProjectChars: this.config.kb.maxProjectChars,
+    }).global;
     const parts: string[] = [];
     for (const project of projects) {
       const repo = this.resolveProjectRepo(project);
-      if (repo) parts.push(loadKbSnapshot(this.paths, repo, {}).project);
+      if (repo) {
+        parts.push(loadKbSnapshot(this.paths, repo, {
+          maxGlobalChars: this.config.kb.maxGlobalChars,
+          maxProjectChars: this.config.kb.maxProjectChars,
+        }).project);
+      }
     }
     return { global, project: parts.join("\n") };
   }
@@ -745,16 +856,25 @@ function attemptNo(item: ItemRecord, stage: StageName): number {
   return (item.gateAttempts[stage] ?? 0) + 1;
 }
 
+/** Match one raw answer to each parked question, in order. */
+export function matchAnswers(questions: string[], raw: string[]): { question: string; answer: string }[] {
+  if (raw.length !== questions.length) {
+    throw new Error(`expected ${questions.length} answer(s) for ${questions.length} question(s), got ${raw.length}`);
+  }
+  return questions.map((q, i) => ({ question: q, answer: raw[i]! }));
+}
+
 function normalizeAnswers(
   questions: string[],
   answers: { question: string; answer: string }[],
   rawAnswer?: string,
 ): { question: string; answer: string }[] {
   if (answers.length > 0) return answers;
-  if (rawAnswer && questions.length > 0) {
-    return [{ question: questions[0]!, answer: rawAnswer }];
+  if (rawAnswer) {
+    if (questions.length === 0) return [{ question: "(free-form)", answer: rawAnswer }];
+    if (questions.length === 1) return [{ question: questions[0]!, answer: rawAnswer }];
+    throw new Error(`expected ${questions.length} answers (one per question); pass -a per question`);
   }
-  if (rawAnswer) return [{ question: "(free-form)", answer: rawAnswer }];
   return [];
 }
 
