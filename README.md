@@ -11,6 +11,15 @@ inside sandboxes) and [@ai-hero/sandcastle](https://www.npmjs.com/package/@ai-he
 (Docker sandboxing, git worktrees, named branch strategy). Models run via
 Ollama Cloud.
 
+## Prerequisites
+
+- Node 22+ and `npm`
+- Docker (OrbStack or Docker Desktop) running, with the sandbox image built:
+  `npx sandcastle docker build-image`
+- `OLLAMA_API_KEY` exported on the host (Ollama Cloud) — passed to sandbox
+  agent sessions
+- `gh` CLI pre-authenticated on the host (`gh auth status`) — PR publishing
+
 ## Install
 
 ```bash
@@ -27,7 +36,7 @@ upgrading Node. Without a link, invoke via `npm run wb -- <verb>`.
 Initialize a factory root (self-contained and movable):
 
 ```bash
-npx tsx src/cli/index.ts init
+wb init
 ```
 
 This creates `./factory/` with: `factory.config.json` (per-stage model
@@ -135,3 +144,5 @@ hand.
   first-class table, so cross-repo parallelism later is a scheduler change.
 - See `specs/001-software-factory-mvp.md` for the full spec and
   `tickets/001-software-factory-mvp/` for the ticket-by-ticket contracts.
+- For a fully manual, from-scratch walkthrough (markdown in → PR out, with
+  expected artifacts at each step), see `docs/demo.md`.
