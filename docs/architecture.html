@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Software Factory — Architecture & Progress</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #161d2e;
+    --panel2: #1c2540;
+    --ink: #e6ebf4;
+    --muted: #93a0b8;
+    --line: #2a3550;
+    --green: #55c98a;
+    --green-bg: #143526;
+    --blue: #6ea8fe;
+    --blue-bg: #16253f;
+    --amber: #e8b34c;
+    --amber-bg: #3a2f14;
+    --red: #e87676;
+    --violet: #b48ce8;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 24px 80px; }
+  header.doc { border-bottom: 1px solid var(--line); padding-bottom: 20px; margin-bottom: 28px; }
+  h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: -0.02em; }
+  header.doc p.sub { margin: 0; color: var(--muted); }
+  .badges { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .badge {
+    font-size: 12.5px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--ink); display: inline-flex; align-items: center; gap: 6px;
+  }
+  .badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+  .badge.muted .dot { background: var(--amber); }
+  h2 { font-size: 19px; margin: 42px 0 6px; letter-spacing: -0.01em; }
+  h2 + p.lead { margin-top: 0; color: var(--muted); }
+  h3 { font-size: 15px; margin: 24px 0 8px; color: var(--ink); }
+  p { margin: 8px 0; }
+  code, .mono { font-family: var(--mono); font-size: 12.5px; }
+  code { background: var(--panel2); padding: 1px 5px; border-radius: 5px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 18px 20px; margin: 14px 0;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.05em; }
+  tr:last-child td { border-bottom: none; }
+
+  /* pipeline diagram */
+  .pipeline { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; margin: 18px 0; }
+  .stage {
+    position: relative; flex: 1 1 130px; min-width: 128px;
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 12px 12px 14px;
+  }
+  .stage .n { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .stage .t { font-weight: 650; margin: 2px 0 4px; }
+  .stage .d { font-size: 12.5px; color: var(--muted); }
+  .stage .conn { position: absolute; right: -13px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 15px; z-index: 2; }
+  .stage:last-child .conn { display: none; }
+  .stage.gate { border-left: 3px solid var(--violet); }
+  .stage.hitl { border-left: 3px solid var(--amber); }
+  .tag { font-size: 10.5px; padding: 1px 7px; border-radius: 999px; border: 1px solid; display: inline-block; margin-top: 6px; }
+  .tag.done { color: var(--green); border-color: var(--green); background: var(--green-bg); }
+  .tag.warn { color: var(--amber); border-color: var(--amber); background: var(--amber-bg); }
+  .tag.def { color: var(--muted); border-color: var(--line); background: transparent; }
+  .tag.seam { color: var(--blue); border-color: var(--blue); background: var(--blue-bg); }
+  .tag.host { color: var(--violet); border-color: var(--violet); background: #241a3a; }
+
+  /* component layers */
+  .layers { display: flex; flex-direction: column; gap: 10px; margin: 16px 0; }
+  .layer { display: flex; gap: 10px; align-items: stretch; }
+  .layer > .label {
+    flex: 0 0 150px; display: flex; flex-direction: column; justify-content: center;
+    border-right: 2px solid var(--line); padding-right: 12px;
+  }
+  .layer > .label b { font-size: 13.5px; }
+  .layer > .label span { font-size: 11.5px; color: var(--muted); }
+  .boxes { display: flex; flex-wrap: wrap; gap: 8px; flex: 1; }
+  .box {
+    flex: 1 1 150px; background: var(--panel2); border: 1px solid var(--line); border-radius: 9px;
+    padding: 8px 12px; font-size: 13px;
+  }
+  .box b { display: block; font-size: 13px; }
+  .box span { color: var(--muted); font-size: 12px; }
+  .box file { color: var(--muted); font-family: var(--mono); font-size: 11px; display: block; margin-top: 2px; }
+
+  /* state pills */
+  .states { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+  .state-pill {
+    font-family: var(--mono); font-size: 12px; padding: 3px 9px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--panel);
+  }
+  .state-pill.ok { border-color: var(--green); color: var(--green); }
+  .state-pill.stop { border-color: var(--red); color: var(--red); }
+  .state-pill.wait { border-color: var(--amber); color: var(--amber); }
+  .arrow { color: var(--muted); align-self: center; font-family: var(--mono); font-size: 11px; }
+
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 800px) { .cols { grid-template-columns: 1fr; } }
+  ul.tight { margin: 6px 0; padding-left: 20px; }
+  ul.tight li { margin: 4px 0; }
+  .muted { color: var(--muted); }
+  .kicker {
+    font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted);
+    border-bottom: 1px solid var(--line); padding-bottom: 4px; margin: 26px 0 4px;
+  }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0 0; }
+  footer { margin-top: 56px; border-top: 1px solid var(--line); padding-top: 16px; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <h1>Software Factory — Architecture &amp; Progress</h1>
+  <p class="sub">Markdown work item in, reviewed pull request out. Sequential ticket pipeline on <code>pi</code> agents inside Sandcastle Docker sandboxes. State in SQLite.</p>
+  <div class="badges">
+    <span class="badge"><span class="dot"></span> MVP tickets 01–09 implemented</span>
+    <span class="badge"><span class="dot"></span> 60/60 tests passing (incl. 2 live-agent gates)</span>
+    <span class="badge"><span class="dot"></span> End-to-end verified: grove PR #10</span>
+    <span class="badge muted"><span class="dot"></span> As of 2026-10-27</span>
+  </div>
+</header>
+
+<h2>What we're building</h2>
+<p class="lead">Drop a markdown file with front-matter into an <code>inbox/</code>; the factory picks it up, triages it, plans it, implements it in a sandbox, tests it, reviews it, and opens a GitHub PR whose body is a self-contained audit trail. The factory never merges.</p>
+<div class="card">
+  <ul class="tight">
+    <li><b>Source of truth is the markdown file</b> — claimed out of the inbox into the item store; front-matter (title, repo, base, approvals) can be edited between runs and is honored on the next run.</li>
+    <li><b>Durability is stage-level</b> — SQLite records every item's stage/status/attempts/parking reason; a crashed stage re-runs rather than resuming half-way.</li>
+    <li><b>One seam, one port</b> — all agent stages and their engines hide behind a single <code>StageRunner</code> interface; everything above it is hermetically tested with fakes.</li>
+    <li><b>Human-in-the-loop is per-item, per-stage</b> — an <code>approvals:</code> list in front-matter parks the item after the chosen stages; approve/reject/answer verbs resume or route feedback.</li>
+  </ul>
+</div>
+
+<span class="kicker">Component view</span>
+<h2>How the system is layered</h2>
+<div class="layers">
+  <div class="layer">
+    <div class="label"><b>Operate</b><span>you, on the host</span></div>
+    <div class="boxes">
+      <div class="box"><b>Grove repo</b><span>or any target repo</span></div>
+      <div class="box"><b>CLI verbs</b><span>run · resume · status · approve · reject · answer · curate</span><file>src/cli/index.ts</file></div>
+    </div>
+  </div>
+  <div class="layer">
+    <div class="label"><b>State</b><span>factory root, SQLite-backed</span></div>
+    <div class="boxes">
+      <div class="box"><b>inbox/ → items/ → archive/</b><span>claim moves the file; nothing is ingested twice; rejected items resurrect when re-dropped</span></div>
+      <div class="box"><b>factory.db</b><span>items · history · artifacts · repo_locks — readable by a future web UI</span><file>src/db.ts</file></div>
+      <div class="box"><b>kb/</b><span>global.md + projects/&lt;repo&gt;.md — dated, append-only, three agent write-moments</span><file>src/kb.ts</file></div>
+    </div>
+  </div>
+  <div class="layer">
+    <div class="label"><b>Orchestrate</b><span>above the seam</span></div>
+    <div class="boxes">
+      <div class="box"><b>Orchestrator</b><span>state machine · gate semantics · rework budget (3/gate) · infra-retry budget w/ backoff · HITL parking · artifact persistence · PR assembly</span><file>src/pipeline.ts</file></div>
+    </div>
+  </div>
+  <div class="layer">
+    <div class="label"><b>The seam</b><span>single port</span></div>
+    <div class="boxes">
+      <div class="box"><b>StageRunner</b><span>stage + item + KB snapshot in → outcome (pass / gate-fail / reject / needs-human / infra-fail) + artifacts + feedback out</span><file>src/types.ts</file><span class="tag seam">the one seam worth having</span></div>
+    </div>
+  </div>
+  <div class="layer">
+    <div class="label"><b>Execute</b><span>below the seam</span></div>
+    <div class="boxes">
+      <div class="box"><b>Sandcastle adapter</b><span>every agent stage as <code>pi</code> in a Docker sandbox bound to a git worktree; named per-item branch; pi 1.4 session capture; staged auth/model catalog</span><file>src/adapters/sandcastle.ts</file></div>
+      <div class="box"><b>GhPrPublisher</b><span>host-side push + <code>gh pr create</code>; draft iff approvals; never merges</span><file>src/adapters/sandcastle.ts</file><span class="tag host">runs on host</span></div>
+      <div class="box"><b>SandcastleCurator</b><span>read-only KB hygiene pass → proposal file</span><file>src/adapters/sandcastle.ts</file><span class="tag host">read-only wrt KB</span></div>
+    </div>
+  </div>
+</div>
+<div class="legend">
+  <span class="tag done">live-verified end-to-end</span>
+  <span class="tag seam">tested hermetically above</span>
+  <span class="tag host">not an agent stage</span>
+</div>
+
+<span class="kicker">Pipeline</span>
+<h2>Item pipeline, stage by stage</h2>
+<p class="lead">Every actionable item advances exactly one stage per <code>factory run</code>; <code>factory resume</code> loops ticks until each item is parked or done. Gates fail <em>into</em> rework; everything else fails into infra retries.</p>
+<div class="pipeline">
+  <div class="stage"><span class="conn">→</span><div class="n">1 · agent</div><div class="t">triage</div><div class="d">proceed / reject (archive) / needs-human (park + questions, <code>answer</code> re-runs)</div><span class="tag done">live ✅</span></div>
+  <div class="stage"><span class="conn">→</span><div class="n">2 · agent <i class="muted">(optional approval)</i></div><div class="t">spec</div><div class="d">repo-grounded plan saved as artifact; parks here when in <code>approvals:</code></div><span class="tag done">live ✅</span></div>
+  <div class="stage"><span class="conn">→</span><div class="n">3 · agent</div><div class="t">implement</div><div class="d">commits on <code>factory/&lt;slug&gt;</code> in a worktree sandbox; consumes spec + rework feedback</div><span class="tag done">live ✅</span></div>
+  <div class="stage gate"><span class="conn">⇢</span><div class="n">4 · agent · gate</div><div class="t">test</div><div class="d">runs the project's suite in the sandbox; failure feeds implement (max 3 attempts)</div><span class="tag done">live ✅</span></div>
+  <div class="stage gate"><span class="conn">⇢</span><div class="n">5 · agent · gate</div><div class="t">review</div><div class="d">quality/security/best-practice verdict; <b>different model family</b> (glm-5.3-flash)</div><span class="tag done">live ✅</span></div>
+  <div class="stage"><div class="n">6 · host</div><div class="t">pull request</div><div class="d">push branch · audit-trail body · draft iff approvals — <b>never merges</b></div><span class="tag done">live ✅</span></div>
+</div>
+<div class="card">
+  <h3 style="margin-top:0">Terminal &amp; parked states</h3>
+  <div class="states">
+    <span class="state-pill ok">done</span><span class="arrow">─ terminal (PR created)</span>
+    <span class="state-pill stop">rejected</span><span class="arrow">─ triage archives; re-drop to resurrect</span>
+    <span class="state-pill stop">exhausted-rework</span><span class="arrow">─ 3 gate attempts, full history attached</span>
+    <span class="state-pill stop">infrastructure-failure</span><span class="arrow">─ separate retry budget spent</span>
+    <span class="state-pill wait">needs-human</span><span class="arrow">─ triage questions → <code>answer</code></span>
+    <span class="state-pill wait">awaiting-approval</span><span class="arrow">─ → <code>approve</code></span>
+    <span class="state-pill wait">human-rejected</span><span class="arrow">─ reason becomes feedback → <code>resume</code></span>
+    <span class="state-pill">malformed</span><span class="arrow">─ bad front-matter, parked with reason</span>
+  </div>
+  <p class="muted" style="font-size:13px">Gate feedback always routes to <b>implement</b> (so implement → test → review re-runs in order — per ticket 06's scenario; ticket 03's "previous stage" wording is satisfied for the test gate and consciously generalized for review). Gate attempts and infra retries are independent counters; a flaky model or sandbox never burns a rework round — proven live when review's model needed 3 parse-fail retries at backoff while staying at attempt 1.</p>
+</div>
+
+<span class="kicker">Ticket progress</span>
+<h2>Tickets 01–09 — what is done and how it shows up</h2>
+<table>
+  <tr><th style="width:36px">№</th><th>Ticket</th><th>Status</th><th>Key demonstrations</th></tr>
+  <tr><td>01</td><td>Factory skeleton + inbox ingest</td><td><span class="tag done">done</span></td><td>claim-by-move, idempotent rescan, malformed parking, config w/ sane defaults, SQLite schema</td></tr>
+  <tr><td>02</td><td>Stage machine + run/resume (stubs)</td><td><span class="tag done">done</span></td><td>one-stage-per-<code>run</code>; crash → re-run at stage granularity; terminal items safe to re-resume</td></tr>
+  <tr><td>03</td><td>Rework loop + budgets</td><td><span class="tag done">done</span></td><td>pass-first-time / reject-then-pass / 3-strikes park / infra flake recovery — and the budget independence seen live in the grove run (3 parse-retries, gate attempt 1 untouched)</td></tr>
+  <tr><td>04</td><td>Triage (real agent)</td><td><span class="tag done">done · live</span></td><td>proceed/reject/needs-human via real Ollama Cloud model; <code>answer</code> re-runs triage; resurrection; unparseable verdict → infra budget</td></tr>
+  <tr><td>05</td><td>Spec → implement → PR (Sandcastle)</td><td><span class="tag done">done · live</span></td><td><b>grove PR #10</b>: markdown in → ready-for-review PR out, audit-trail body, factory never merges</td></tr>
+  <tr><td>06</td><td>Test + review gates</td><td><span class="tag done">done · live</span></td><td>real <code>cargo test</code> gate in sandbox; review on separate model family; verdict artifact lands in PR body; rework routing implemented→test→review</td></tr>
+  <tr><td>07</td><td>HITL approval gates</td><td><span class="tag done">done · verified</span></td><td><code>approvals:</code> parks after the listed stages; approve proceeds; reject-with-reason feeds the completed stage on resume; draft-vs-ready PRs</td></tr>
+  <tr><td>08</td><td>KB write-moments + loading</td><td><span class="tag done">done · live</span></td><td>failed-gate / post-rework / pr-outcome entries written by the flow, dated, append-only; triage sees lightweight global only; grove already has its first project KB entry</td></tr>
+  <tr><td>09</td><td>KB curator pass</td><td><span class="tag done">done · verified</span></td><td><code>factory curate</code> → proposal file only; KB provably byte-unchanged; repo evidence via read-only mounts</td></tr>
+</table>
+
+<span class="kicker">Verification</span>
+<h2>Where confidence comes from</h2>
+<div class="cols">
+  <div class="card">
+    <h3 style="margin-top:0">Hermetic suite — 58 tests</h3>
+    <p>Above the seam, all scenario-shaped: claim/idempotency/malformed, resume-after-crash, pass-first-time, reject-loop parking, infra flakes, budget independence, HITL park/approve/reject-with-feedback, KB append-only invariant + layer selection per stage, curator read-only proof. Real filesystem and real SQLite, fakes only for the engine.</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">Live-agent gates — 2 tests</h3>
+    <p>Real triage verdict through Docker + Ollama Cloud, and the planted-stale-fact check: a consuming stage must verify KB facts against the repo (it reported the repo's real test runner over a planted lie). These run whenever Docker + <code>OLLAMA_API_KEY</code> are present.</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">End-to-end — grove PR #10</h3>
+    <p>First real work item: 6 stages, 1 PR, 0 rework rounds, 3 infra retries (review model), ~90 min wall time including crate compilation. <a style="color:var(--blue)" href="https://github.com/olsonjj/grove/pull/10">olsonjj/grove#10</a></p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">Known environment lessons</h3>
+    <p>Symlinked repo paths break Sandcastle's in-container git (fixed: realpath); sandboxed pi needs staged auth/catalog + a writable npm global prefix (fixed); pi 1.4's stream format outgrew Sandcastle 0.12's stdout tag-scanner (fixed: session-based extraction). Image: <code>sandcastle:local</code> with Rust toolchain + warm crate cache.</p>
+  </div>
+</div>
+
+<span class="kicker">Roadmap</span>
+<h2>Where we are, what's next</h2>
+<div class="card">
+  <h3 style="margin-top:0">Delivered (milestones 1–5)</h3>
+  <p>Skeleton → stubs → budgets → real triage → spec/implement/PR via Sandcastle → gates + rework → HITL → KB → curator. Everything observable via <code>factory status</code>; everything durable in SQLite.</p>
+</div>
+<div class="card">
+  <h3 style="margin-top:0">Open / deferred (not started)</h3>
+  <ul class="tight">
+    <li><b>HITL on the first real repo</b> — grove PR #10 ran fully autonomous; the park → approve → resume experience hasn't met a real repo yet; same for <code>curate</code> against grove's accumulating KB.</li>
+    <li><b>Per-stage model differentiation beyond review</b> — mechanism exists; diversified mapping (triage/test on v4-flash) is a config edit away.</li>
+    <li><b><code>factory watch</code></b> — loop around the tick verbs; deferred by design.</li>
+    <li><b>Web status UI</b> — the schema already supports it.</li>
+    <li><b>Cross-repo parallelism</b> — per-repo lock table exists; scheduler work deferred.</li>
+    <li><b>Sandbox-image maintenance</b> — Docker build networking is currently broken under OrbStack (run-networking works); the Rust-enabled image was mutated+committed as a workaround. Revisit the toolchain install via <code>.sandcastle/Dockerfile</code> when builds recover.</li>
+  </ul>
+</div>
+
+<footer>
+  Living document — update alongside each milestone or ticket batch. Sources of truth: <code>specs/001-software-factory-mvp.md</code>, <code>tickets/001-software-factory-mvp/</code>, <code>README.md</code>, <code>docs/demo.md</code>, and the SQLite state under the factory root.
+</footer>
+
+</div>
+</body>
+</html>
