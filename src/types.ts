@@ -66,6 +66,8 @@ export interface ItemContext {
   approvals: string[];
   /** Task description — the markdown body of the item file. */
   body: string;
+  /** Content of the approved spec artifact, when one exists. */
+  spec?: string;
   /** Feedback to incorporate into this run (rework reason, human corrections). */
   feedback?: string;
   /** Operator answers to previously parked triage questions. */

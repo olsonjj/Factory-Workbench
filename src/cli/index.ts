@@ -40,16 +40,34 @@ function openFactory(rootOverride?: string): {
   return { root, paths, db, orch, claimReport };
 }
 
+/** Shared command scaffold: open factory, run the body, always close the db. */
+async function withFactory<T>(
+  root: string | undefined,
+  body: (ctx: { db: FactoryDb; orch: Orchestrator; claimReport: ReturnType<typeof scanInbox> }) => Promise<T> | T,
+): Promise<void> {
+  const ctx = openFactory(root);
+  try {
+    await body(ctx);
+  } finally {
+    ctx.db.close();
+  }
+}
+
+function printTick(entries: { slug: string; id: number; fromStage: string; status: string; detail: string }[], empty: string): void {
+  if (entries.length === 0) console.log(empty);
+  for (const e of entries) {
+    console.log(`${e.slug} (#${e.id}): ${e.fromStage} → ${e.status}` + (e.detail ? ` — ${e.detail}` : ""));
+  }
+}
+
 function requireItem(db: FactoryDb, idOrSlug: string): { id: number; slug: string } {
   const numeric = Number(idOrSlug);
   const item = Number.isInteger(numeric) && numeric > 0 ? db.getItem(numeric) : undefined;
-  const found = item ?? db.getItemBySlug(idOrSlug);
+  const found = item ?? db.findItemBySlugPrefix(idOrSlug);
   if (!found) {
-    void 0;
     console.error(`No item matching ${JSON.stringify(idOrSlug)}.`);
     nodeProcess.exit(1);
   }
-  if (!found) throw new Error("unreachable"); // narrowed above
   return { id: found.id, slug: found.slug };
 }
 
@@ -94,21 +112,10 @@ program
   .description("Claim inbox items and advance every actionable item one stage")
   .option("--root <dir>", "factory root directory")
   .action(async (opts: { root?: string }) => {
-    const { db, orch, claimReport } = openFactory(opts.root);
-    try {
+    await withFactory(opts.root, async ({ orch, claimReport }) => {
       logClaimReport(claimReport);
-      const report = await orch.tickAll();
-      if (report.entries.length === 0) {
-        console.log("Nothing to do.");
-      }
-      for (const e of report.entries) {
-        console.log(`${e.slug} (#${e.id}): ${e.fromStage} → ${e.status}` + (e.detail ? ` — ${e.detail}` : ""));
-      }
-      db.close();
-    } catch (err) {
-      db.close();
-      fail(err);
-    }
+      printTick((await orch.tickAll()).entries, "Nothing to do.");
+    });
   });
 
 program
@@ -116,20 +123,9 @@ program
   .description("Recover interrupted or human-rejected items and keep them moving until parked or done")
   .option("--root <dir>", "factory root directory")
   .action(async (opts: { root?: string }) => {
-    const { db, orch } = openFactory(opts.root);
-    try {
-      const report = await orch.resume();
-      if (report.entries.length === 0) {
-        console.log("Nothing to resume.");
-      }
-      for (const e of report.entries) {
-        console.log(`${e.slug} (#${e.id}): ${e.fromStage} → ${e.status}` + (e.detail ? ` — ${e.detail}` : ""));
-      }
-      db.close();
-    } catch (err) {
-      db.close();
-      fail(err);
-    }
+    await withFactory(opts.root, async ({ orch }) => {
+      printTick((await orch.resume()).entries, "Nothing to resume.");
+    });
   });
 
 program
@@ -137,17 +133,17 @@ program
   .description("List all items and their current state, including why anything is parked")
   .option("--root <dir>", "factory root directory")
   .option("--all", "also show finished/archived items")
-  .action((opts: { root?: string } & StatusFlags) => {
-    const { db, orch: _o, claimReport } = openFactory(opts.root);
-    void _o;
-    logClaimReport(claimReport);
-    const items = db.listItems().filter((i) => opts.all || i.status !== "done");
-    if (items.length === 0) {
-      console.log("No items. Drop a markdown file in the inbox: `factory template`");
-    }
-    for (const item of items) {
-      console.log(`#${item.id} ${item.slug} [${item.status}] stage=${item.stage} repo=${item.repo}`);
-      console.log(`    title: ${item.title}`);
+  .action(async (opts: { root?: string } & StatusFlags) => {
+    await withFactory(opts.root, ({ db, claimReport }) => {
+      logClaimReport(claimReport);
+      const items = db.listItems().filter((i) => opts.all || i.status !== "done");
+      if (items.length === 0) {
+        console.log("No items. Drop a markdown file in the inbox: `factory template`");
+      }
+      for (const item of items) {
+        console.log(`#${item.id} ${item.slug} [${item.status}] stage=${item.stage} repo=${item.repo}`);
+        console.log(`    title: ${item.title}`);
+        if (item.sourceFile) console.log(`    source: ${item.sourceFile}`);
       if (item.parkedReason) console.log(`    parked: ${item.parkedReason}`);
       if (item.parkedDetail) {
         const d = item.parkedDetail;
@@ -170,8 +166,8 @@ program
         console.log(`    gate attempts: ${attempts.map(([s, n]) => `${s}=${n}`).join(", ")}`);
       }
       if (item.infraAttempts > 0) console.log(`    infra retries so far: ${item.infraAttempts}`);
-    }
-    db.close();
+      }
+    });
   });
 
 program
@@ -180,16 +176,11 @@ program
   .option("--root <dir>", "factory root directory")
   .option("-n, --note <note>", "optional approval note")
   .action((idOrSlug: string, opts: { root?: string; note?: string }) => {
-    const { db, orch } = openFactory(opts.root);
-    const { id } = requireItem(db, idOrSlug);
-    try {
+    return withFactory(opts.root, ({ db, orch }) => {
+      const { id } = requireItem(db, idOrSlug);
       const item = orch.approve(id, opts.note);
       console.log(`Approved ${item.slug} — run \`factory run\` or \`factory resume\` to continue.`);
-      db.close();
-    } catch (err) {
-      db.close();
-      fail(err);
-    }
+    });
   });
 
 program
@@ -198,16 +189,11 @@ program
   .option("--root <dir>", "factory root directory")
   .requiredOption("-r, --reason <reason>", "why you rejected the stage output")
   .action((idOrSlug: string, opts: { root?: string; reason: string }) => {
-    const { db, orch } = openFactory(opts.root);
-    const { id } = requireItem(db, idOrSlug);
-    try {
+    return withFactory(opts.root, ({ db, orch }) => {
+      const { id } = requireItem(db, idOrSlug);
       const item = orch.rejectItem(id, opts.reason);
       console.log(`Rejected ${item.slug}. Reason stored as feedback; resume with \`factory resume\`.`);
-      db.close();
-    } catch (err) {
-      db.close();
-      fail(err);
-    }
+    });
   });
 
 program
@@ -216,16 +202,11 @@ program
   .option("--root <dir>", "factory root directory")
   .option("-a, --answer <answers...>", "one answer per parked question, in order")
   .action((idOrSlug: string, opts: { root?: string; answer?: string[] }) => {
-    const { db, orch } = openFactory(opts.root);
-    const { id } = requireItem(db, idOrSlug);
-    try {
+    return withFactory(opts.root, ({ db, orch }) => {
+      const { id } = requireItem(db, idOrSlug);
       const item = orch.answer(id, [], opts.answer?.join("\n"));
       console.log(`Answers recorded for ${item.slug}. Triage will re-run with them.`);
-      db.close();
-    } catch (err) {
-      db.close();
-      fail(err);
-    }
+    });
   });
 
 program
@@ -233,25 +214,16 @@ program
   .description("Run a KB curation pass and write a proposal file (read-only; you apply it by hand)")
   .option("--root <dir>", "factory root directory")
   .action(async (projects: string[], opts: { root?: string }) => {
-    const { db, orch } = openFactory(opts.root);
-    try {
+    await withFactory(opts.root, async ({ orch }) => {
       const { file } = await orch.curate(projects);
       console.log(`Proposal written to ${file} — review it and apply what you agree with by hand.`);
-      db.close();
-    } catch (err) {
-      db.close();
-      fail(err);
-    }
+    });
   });
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-program.parseAsync(nodeProcess.argv).catch(failAlways);
+program.parseAsync(nodeProcess.argv).catch((err: unknown) => fail(err));
 
 function fail(err: unknown): never {
   console.error(`factory: ${err instanceof Error ? err.message : String(err)}`);
   nodeProcess.exit(1);
-}
-
-function failAlways(err: unknown): never {
-  fail(err);
 }

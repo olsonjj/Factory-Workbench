@@ -52,24 +52,8 @@ export function createHarness(budgetOverrides: Partial<FactoryConfig["budgets"]>
     paths,
     db: new FactoryDb(root),
     config,
-    inboxFile: (baseName, fm, body) => {
-      const name = uniqueName(root, baseName ?? "item");
-      const fmText = [
-        "---",
-        ...Object.entries(fm).map(([k, v]) => `${k}: ${Array.isArray(v) ? `[${v.join(", ")}]` : String(v)}`),
-        "---",
-      ].join("\n");
-      return writeInbox(root, name, `${fmText}\n\n${body}\n`);
-    },
-    dropAgain: (baseName, fm, body) => {
-      const name = uniqueName(root, baseName ?? "item");
-      const fmText = [
-        "---",
-        ...Object.entries(fm).map(([k, v]) => `${k}: ${Array.isArray(v) ? `[${v.join(", ")}]` : String(v)}`),
-        "---",
-      ].join("\n");
-      return writeInbox(root, name, `${fmText}\n\n${body}\n`);
-    },
+    inboxFile: (baseName, fm, body) => writeItemFile(root, baseName ?? "item", fm, body),
+    dropAgain: (baseName, fm, body) => writeItemFile(root, baseName ?? "item", fm, body),
     readItemFile: (slug) => harness.readFile(path.join(paths.items, slug, "item.md")),
     writeFile: (abs, content) => {
       mkdirSync(path.dirname(abs), { recursive: true });
@@ -83,6 +67,32 @@ export function createHarness(budgetOverrides: Partial<FactoryConfig["budgets"]>
     },
   };
   return harness;
+}
+
+function uniqueName(rootDir: string, base: string): string {
+  const inbox = path.join(rootDir, "inbox");
+  let name = base;
+  let n = 0;
+  while (existsSync(path.join(inbox, `${name}.md`))) {
+    n += 1;
+    name = `${base}-${n}`;
+  }
+  return name;
+}
+
+function writeItemFile(
+  root: string,
+  baseName: string,
+  fm: Record<string, unknown>,
+  body: string,
+): string {
+  const name = uniqueName(root, baseName);
+  const fmText = [
+    "---",
+    ...Object.entries(fm).map(([k, v]) => `${k}: ${Array.isArray(v) ? `[${v.join(", ")}]` : String(v)}`),
+    "---",
+  ].join("\n");
+  return writeInbox(root, name, `${fmText}\n\n${body}\n`);
 }
 
 function writeInbox(root: string, name: string, content: string): string {

@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { mkdirSync, renameSync, writeFileSync, readFileSync, existsSync } from "node:fs";
-import { ACTIONABLE_STATUSES, APPROVAL_STAGES, STAGES, type CuratorRunner, type ItemContext, type ItemRecord, type ItemStatus, type KbSnapshot, type PrPublishResult, type StageName, type StageResult, type StageRunner } from "./types.js";
+import { ACTIONABLE_STATUSES, APPROVAL_STAGES, GATE_STAGES, STAGES, type CuratorRunner, type ItemContext, type ItemRecord, type ItemStatus, type KbSnapshot, type PrPublishResult, type StageName, type StageResult, type StageRunner } from "./types.js";
 import type { FactoryDb } from "./db.js";
 import type { FactoryPaths } from "./paths.js";
 import { artifactDir, itemDir } from "./paths.js";
@@ -103,6 +103,9 @@ export class Orchestrator {
   approve(itemId: number, note?: string): ItemRecord {
     const item = this.requireItem(itemId);
     this.requireStatus(item, "awaiting-approval");
+    const approvedStage = (item.parkedDetail?.stage as string | undefined) ?? item.stage;
+    this.saveOperatorArtifact(item, `approval-${approvedStage}`,
+      `# approval after ${approvedStage}\n\ndecision: approved\n${note ? `note: ${note}\n` : ""}`);
     this.db.updateItem(item.id, {
       status: "queued",
       parkedReason: null,
@@ -118,6 +121,8 @@ export class Orchestrator {
     // Human feedback routes into the completed stage: it re-runs with the
     // reason as feedback on the next tick.
     const completedStage = previousStage(item.stage);
+    this.saveOperatorArtifact(item, `rejection-${completedStage}`,
+      `# human rejection after ${completedStage}\n\ndecision: rejected\nreason: ${reason}\n\nThe reason above is fed as feedback when the item is resumed.`);
     this.db.updateItem(item.id, {
       status: "human-rejected",
       feedback: reason,
@@ -137,6 +142,8 @@ export class Orchestrator {
       ...(item.answers ?? []),
       ...normalizeAnswers(questions, answers, rawAnswer),
     ];
+    this.saveOperatorArtifact(item, "answers",
+      `# answers to triage questions\n\n${merged.map((a) => `- Q: ${a.question}\n  A: ${a.answer}`).join("\n")}\n\nTriage re-runs with these answers in context.`);
     this.db.updateItem(item.id, {
       answers: merged,
       status: "queued",
@@ -226,6 +233,11 @@ export class Orchestrator {
     this.db.appendHistory(item.id, "stage-start", stage, { attempt: attemptNo(item, stage) });
 
     const repoLockAcquired = this.db.acquireRepoLock(repoSlug(item.repo), item.id);
+    if (!repoLockAcquired) {
+      // Stale lock from a crashed run: strictly-sequential MVP proceeds, but
+      // the conflict is on the record.
+      this.db.appendHistory(item.id, "stage-start", stage, { lockConflict: true });
+    }
     try {
       let infra = 0;
       for (;;) {
@@ -436,7 +448,7 @@ export class Orchestrator {
     let infra = 0;
     for (;;) {
       try {
-        const ctx = this.contextOf(item, {});
+        const ctx = this.contextOf(item);
         const body = this.buildPrBody(item);
         const draft = item.approvals.length > 0;
         const pr = await this.publisher.publish({
@@ -517,12 +529,12 @@ export class Orchestrator {
   // ------------------------------------------------------------------ plumbing
 
   private async stageRequest(item: ItemRecord, stage: StageName) {
-    const ctx = this.contextOf(item, {});
+    const ctx = this.contextOf(item);
     const kb = loadKbSnapshot(this.paths, item.repo, { lightweight: stage === "triage" });
     return { stage, item: ctx, kb };
   }
 
-  private contextOf(item: ItemRecord, _opts: Record<string, never>): ItemContext {
+  private contextOf(item: ItemRecord): ItemContext {
     // Body reads fresh from the item file on every run.
     let body = "";
     if (item.sourceFile && existsSync(item.sourceFile)) {
@@ -530,6 +542,7 @@ export class Orchestrator {
       if (parsed.ok) body = parsed.item.body;
     }
     const answers = item.answers ?? [];
+    const spec = this.latestArtifactContent(item.id, "spec");
     return {
       id: item.id,
       slug: item.slug,
@@ -538,10 +551,19 @@ export class Orchestrator {
       base: item.base,
       approvals: item.approvals,
       body,
+      ...(spec ? { spec } : {}),
       feedback: item.feedback ?? undefined,
       answers: answers.length > 0 ? answers : undefined,
       branchName: item.branchName,
     };
+  }
+
+  /** Content of the most recent artifact with the given name, absolute-resolved. */
+  private latestArtifactContent(itemId: number, name: string): string | undefined {
+    const artifact = [...this.db.getArtifacts(itemId)].reverse().find((a) => a.name === name);
+    if (!artifact) return undefined;
+    const abs = path.join(this.paths.root, artifact.path);
+    return existsSync(abs) ? readFileSync(abs, "utf8") : undefined;
   }
 
   private saveArtifacts(item: ItemRecord, stage: StageName, result: StageResult, dirOverride?: string): void {
@@ -584,6 +606,15 @@ export class Orchestrator {
     return known.find((k) => repoSlug(k.repo) === slug)?.repo;
   }
 
+  /** Operator decisions are first-class artifacts (ticket 04/07). */
+  private saveOperatorArtifact(item: ItemRecord, name: string, content: string): void {
+    const dir = artifactDir(this.paths, item.slug);
+    mkdirSync(dir, { recursive: true });
+    const abs = path.join(dir, `${stamp()}-${name}.md`);
+    writeFileSync(abs, content, "utf8");
+    this.db.addArtifact(item.id, null, name, path.relative(this.paths.root, abs));
+  }
+
   private requireItem(itemId: number): ItemRecord {
     const item = this.db.getItem(itemId);
     if (!item) throw new Error(`unknown item id ${itemId}`);
@@ -600,7 +631,7 @@ export class Orchestrator {
 // ---------------------------------------------------------------- helpers
 
 export function isGate(stage: StageName): boolean {
-  return stage === "test" || stage === "review";
+  return (GATE_STAGES as readonly string[]).includes(stage);
 }
 
 export function nextStageOf(stage: StageName): StageName {

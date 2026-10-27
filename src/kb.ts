@@ -30,10 +30,6 @@ export function dateStamp(d = new Date()): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-export function timeStamp(d = new Date()): string {
-  return dateStamp(d);
-}
-
 /** One dated entry header + body. Append-only. */
 export function appendEntry(kbFile: string, moment: KbMoment, scope: string, content: string): void {
   mkdirSync(path.dirname(kbFile), { recursive: true });

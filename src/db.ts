@@ -168,8 +168,8 @@ export class FactoryDb {
     return row ? toItem(row) : undefined;
   }
 
-  /** Exact or prefix match on slug, else numeric id lookup via caller. */
-  getItemBySlug(slugOrPrefix: string): ItemRecord | undefined {
+  /** Exact match first, then unique-prefix match. */
+  findItemBySlugPrefix(slugOrPrefix: string): ItemRecord | undefined {
     const exact = this.db.prepare("SELECT * FROM items WHERE slug = ?").get(slugOrPrefix) as ItemRow | undefined;
     if (exact) return toItem(exact);
     const rows = this.db

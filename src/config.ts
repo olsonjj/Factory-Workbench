@@ -36,7 +36,12 @@ export interface FactoryConfig {
 export const DEFAULT_MODEL = "deepseek-v4-pro";
 
 export const DEFAULT_CONFIG: Omit<FactoryConfig, "root"> = {
-  models: { default: DEFAULT_MODEL },
+  models: {
+    default: DEFAULT_MODEL,
+    // Review deliberately runs a different model family from implement
+    // (ticket 06) to avoid shared blind spots. Overridable per config file.
+    review: "glm-5.3-flash",
+  },
   budgets: {
     maxGateAttempts: 3,
     maxInfraRetries: 3,

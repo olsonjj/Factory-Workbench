@@ -192,19 +192,19 @@ ${req.kb.project || "(none)"}`;
   }
 
   private async runImplement(req: StageRequest, model: string, wt: Worktree): Promise<StageResult> {
-    const specPath = req.item && path.join(wt.worktreePath, ".factory", "spec.md");
-    void specPath;
     const prompt = `You are the implementation stage of a software factory. Implement the work item in this repository worktree and commit your changes to the current branch.
 
 Rules:
 - Commit your work with clear commit messages.
-- Follow the spec exactly where it exists; use judgement where it is silent.
+- Follow the spec below exactly where it exists; use judgement where it is silent.
 ${TRUST_BUT_VERIFY}
 
 ## Item: ${req.item.title}
 
 ${req.item.body}
-${req.item.feedback ? `\n## Rework feedback you MUST address\n\n${req.item.feedback}\n` : ""}
+${req.item.spec ? `\n## Approved spec (follow this)
+
+${req.item.spec}\n` : ""}${req.item.feedback ? `\n## Rework feedback you MUST address\n\n${req.item.feedback}\n` : ""}
 ## Knowledge base
 
 Global:
