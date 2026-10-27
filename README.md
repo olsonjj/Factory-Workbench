@@ -11,6 +11,36 @@ inside sandboxes) and [@ai-hero/sandcastle](https://www.npmjs.com/package/@ai-he
 (Docker sandboxing, git worktrees, named branch strategy). Models run via
 Ollama Cloud.
 
+## How it flows
+
+```mermaid
+flowchart LR
+    INBOX["inbox/<br>drop a .md file"] -->|"claim"| TRI{triage}
+    TRI -->|"proceed"| SPEC[spec]
+    TRI -->|"reject"| ARCH["archive/<br>resurrectable"]
+    TRI -->|"needs-human"| ANS["parked +<br>questions"]
+    ANS -->|"wb answer,<br>re-run"| TRI
+    SPEC --> IMPL[implement]
+    IMPL --> TEST[test]
+    TEST -->|"failures<br>as feedback"| IMPL
+    TEST -->|"pass"| REV{review}
+    REV -->|"findings<br>as feedback"| IMPL
+    REV -->|"pass"| PR["GitHub PR<br>body = audit trail"]
+    TEST & REV -->|"budget<br>exhausted"| PARK["parked +<br>full history"]
+    PR --> READY["ready-for-review<br>(autonomous item)"]
+    PR --> DRAFT["draft<br>(approval-gated item)"]
+```
+
+- **Approval gates:** any stage named in the item's `approvals:` front-matter
+  parks for your decision right after completing — `wb status` shows it
+  awaiting approval with the stage's artifact ready to read, then
+  `wb approve`/`wb reject` drive what happens next.
+- **Infra failures are not gates:** model timeouts and sandbox flakes retry
+  with backoff under their own budget; a flaky network never consumes a work
+  item's rework rounds.
+- **The factory never merges.** PR creation is the terminal stage; the merge
+  decision is always yours.
+
 ## Prerequisites
 
 - Node 22+ and `npm`
@@ -39,10 +69,24 @@ Initialize a factory root (self-contained and movable):
 wb init
 ```
 
-This creates `./factory/` with: `factory.config.json` (per-stage model
-mapping, budgets), `inbox/` (drop work items here), `items/` (claimed items
-and artifacts), `archive/` (triage-rejected items), `kb/` (global +
-per-project knowledge base), `proposals/`, `logs/`, and `factory.db` (SQLite).
+This creates a self-contained, movable root:
+
+```text
+factory/
+├── factory.config.json       # per-stage models, budgets, sandbox image
+├── inbox/                    # drop work items here
+├── items/
+│   └── <slug>/
+│       ├── item.md           # the item's source of truth
+│       └── artifacts/        # triage report, spec, test log, review verdict, ...
+├── archive/                  # triage-rejected items (resurrectable)
+├── kb/
+│   ├── global.md             # knowledge base: global layer
+│   └── projects/<repo>.md    # knowledge base: per-project layer
+├── proposals/                # wb curate output — you apply by hand
+├── logs/
+└── factory.db                # SQLite state; designed for direct UI reads
+```
 
 ## Usage
 
@@ -69,6 +113,23 @@ wb approve <id>          # release a parked approval gate
 wb reject <id> --reason "fix the X"   # feedback feeds the next agent run
 wb answer <id> -a "..."  # answer parked triage questions; triage re-runs
 wb curate [project]      # on-demand KB curation proposal (read-only)
+```
+
+What the operator sees — `wb status` shows every item's state, including *why*
+anything is parked:
+
+```text
+#2 add-dark-mode [awaiting-approval] stage=implement repo=/Users/me/projects/watchdog
+    title: Add dark mode to the settings panel
+    source: factory/items/add-dark-mode/item.md
+    parked: awaiting-approval
+    completed stage: spec
+    artifact from spec: items/add-dark-mode/artifacts/20261027-091122-847-spec-spec.md
+#3 fix-flaky-watchdog [parked] stage=review repo=/Users/me/projects/watchdog
+    title: Add a watchdog for the ingest queue
+    source: factory/items/fix-flaky-watchdog/item.md
+    parked: exhausted-rework
+    gate attempts: review=3
 ```
 
 Pipeline: **triage → spec → implement → test → review → pull-request**.
