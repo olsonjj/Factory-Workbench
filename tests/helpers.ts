@@ -35,6 +35,7 @@ export function createHarness(budgetOverrides: Partial<FactoryConfig["budgets"]>
       ...budgetOverrides,
     },
     sandbox: { imageName: "test:sandbox" },
+    kb: { maxGlobalChars: 24000, maxProjectChars: 24000 },
   };
   let fileNo = 0;
   function uniqueName(rootDir: string, base: string): string {
@@ -143,10 +144,23 @@ export function gateFail(stage: string, feedback: string, extra: Partial<StageRe
 
 export class FakePublisher {
   readonly published: PrPublishRequest[] = [];
-  constructor(private readonly failTimes = 0) {}
+  private readonly existingPr: PrPublishResult | undefined;
+  private existingReturned = false;
+
+  constructor(private readonly failTimes = 0, existingPr?: PrPublishResult) {
+    this.existingPr = existingPr;
+  }
 
   count(): number {
     return this.published.length;
+  }
+
+  async findExisting(_req: { repoPath: string; branchName: string; base: string }): Promise<PrPublishResult | undefined> {
+    if (this.existingPr && !this.existingReturned) {
+      this.existingReturned = true;
+      return this.existingPr;
+    }
+    return undefined;
   }
 
   async publish(req: PrPublishRequest): Promise<PrPublishResult> {
@@ -165,6 +179,7 @@ export function makeOrchestrator(
   opts: {
     publisher?: PrPublisher;
     curator?: CuratorRunner | null;
+    maxResumeTicks?: number;
   } = {},
 ): Orchestrator {
   const { config, configFile } = { config: harness.config, configFile: "" };
@@ -178,6 +193,7 @@ export function makeOrchestrator(
     curator: opts.curator ?? null,
     publisher: opts.publisher ?? new FakePublisher(),
     sleep: async () => {},
+    maxResumeTicks: opts.maxResumeTicks,
   });
 }
 

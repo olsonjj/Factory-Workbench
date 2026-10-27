@@ -7,7 +7,7 @@ import type { FactoryPaths } from "./paths.js";
 import { artifactDir, itemDir } from "./paths.js";
 import type { FactoryConfig } from "./config.js";
 import { parseItemMarkdown } from "./frontmatter.js";
-import { appendEntry, loadKbSnapshot, projectKbFile, repoSlug } from "./kb.js";
+import { appendEntry, chunkKbLayer, globalKbFile, loadKbSnapshot, projectKbFile, readKbFile, repoSlug } from "./kb.js";
 import { stamp } from "./util.js";
 
 /** PR publication happens on the host, outside the stage seam. Never merges. */
@@ -22,6 +22,7 @@ export interface PrPublishRequest {
 
 export interface PrPublisher {
   publish(req: PrPublishRequest): Promise<PrPublishResult>;
+  findExisting(req: { repoPath: string; branchName: string; base: string }): Promise<PrPublishResult | undefined>;
 }
 
 export interface TickEntry {
@@ -35,6 +36,8 @@ export interface TickEntry {
 export interface TickReport {
   entries: TickEntry[];
   changed: boolean;
+  /** True when `resume` stopped because it hit its safety tick cap, not because work ran out. */
+  capped?: boolean;
 }
 
 export interface OrchestratorDeps {
@@ -45,6 +48,8 @@ export interface OrchestratorDeps {
   curator: CuratorRunner | null;
   publisher: PrPublisher;
   sleep: (ms: number) => Promise<void>;
+  /** Safety cap for `resume`'s inner tick loop (default 500). */
+  maxResumeTicks?: number;
 }
 
 export class Orchestrator {
@@ -55,6 +60,7 @@ export class Orchestrator {
   private readonly curator: CuratorRunner | null;
   private readonly publisher: PrPublisher;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly maxResumeTicks: number;
 
   constructor(deps: OrchestratorDeps) {
     this.db = deps.db;
@@ -64,6 +70,7 @@ export class Orchestrator {
     this.curator = deps.curator;
     this.publisher = deps.publisher;
     this.sleep = deps.sleep;
+    this.maxResumeTicks = deps.maxResumeTicks ?? 500;
   }
 
   // ------------------------------------------------------------------ tick
@@ -72,31 +79,95 @@ export class Orchestrator {
   async tickAll(): Promise<TickReport> {
     const report: TickReport = { entries: [], changed: false };
     for (const item of this.db.itemsWithStatus(ACTIONABLE_STATUSES)) {
-      const entry = await this.tickItem(item);
+      let entry: TickEntry;
+      try {
+        entry = await this.tickItem(item);
+      } catch (err) {
+        entry = this.parkUnexpectedError(item, err);
+      }
       report.entries.push(entry);
       report.changed = true;
     }
     return report;
   }
 
+  /** One bad item parks cleanly; the rest of the tick continues. */
+  private parkUnexpectedError(item: ItemRecord, err: unknown): TickEntry {
+    const stage = item.stage;
+    const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    this.db.updateItem(item.id, {
+      status: "infrastructure-failure",
+      parkedReason: "unhandled-error",
+      parkedDetail: { stage, error: message },
+    });
+    this.db.appendHistory(item.id, "parked", stage, { reason: "unhandled-error", error: message });
+    return { id: item.id, slug: item.slug, fromStage: stage, status: "infrastructure-failure", detail: message };
+  }
+
   /**
    * Crash/interruption recovery: restart human-rejected items (their reason
    * rides as feedback into the next agent run), then keep ticking until no
-   * item changes state.
+   * item changes state or the safety tick cap is reached.
    */
   async resume(): Promise<TickReport> {
+    const maxTicks = this.maxResumeTicks;
     for (const item of this.db.itemsWithStatus(["human-rejected"])) {
-      this.db.updateItem(item.id, { status: "queued" });
+      this.db.updateItem(item.id, { status: "queued", parkedReason: null, parkedDetail: null });
       this.db.appendHistory(item.id, "unparked", item.stage, { via: "resume", feedback: item.feedback });
     }
     const combined: TickReport = { entries: [], changed: false };
-    for (let i = 0; i < 500; i++) {
+    let capped = false;
+    for (let i = 0; i < maxTicks; i++) {
       const report = await this.tickAll();
       combined.entries.push(...report.entries);
       if (!report.changed) break;
       combined.changed = true;
+      if (i === maxTicks - 1) capped = true;
     }
-    return combined;
+    return { ...combined, capped };
+  }
+
+  /** Re-queue an item parked by infra failure, exhausted rework, or malformed front-matter. */
+  retry(itemId: number): ItemRecord {
+    const item = this.requireItem(itemId);
+    if (item.status === "malformed") {
+      if (!item.sourceFile || !existsSync(item.sourceFile)) {
+        throw new Error(`item ${item.slug} has no source file to re-parse`);
+      }
+      const parsed = parseItemMarkdown(readFileSync(item.sourceFile, "utf8"));
+      if (!parsed.ok) throw new Error(`still malformed: ${parsed.reason}`);
+      this.db.updateItem(item.id, {
+        title: parsed.item.title,
+        repo: parsed.item.repo,
+        base: parsed.item.base,
+        approvals: [...parsed.item.approvals],
+        stage: "triage",
+        status: "queued",
+        parkedReason: null,
+        parkedDetail: null,
+      });
+      this.db.appendHistory(item.id, "unparked", "triage", { via: "retry", note: "front-matter fixed" });
+    } else if (item.status === "exhausted-rework") {
+      const failedStage = (item.parkedDetail?.stage as StageName | undefined) ?? item.stage;
+      const attempts = { ...item.gateAttempts };
+      delete attempts[failedStage]; // fresh budget for that gate
+      this.db.updateItem(item.id, {
+        stage: reworkTarget(failedStage), // implement is the fix venue
+        status: "queued",
+        gateAttempts: attempts,
+        parkedReason: null,
+        parkedDetail: null, // keep `feedback` so implement sees it
+      });
+      this.db.appendHistory(item.id, "unparked", failedStage, { via: "retry", resetGate: failedStage });
+    } else if (item.status === "infrastructure-failure") {
+      this.db.updateItem(item.id, { status: "queued", parkedReason: null, parkedDetail: null });
+      this.db.appendHistory(item.id, "unparked", item.stage, { via: "retry" });
+    } else {
+      throw new Error(
+        `item ${item.slug} is ${item.status}; retry applies to malformed, exhausted-rework, or infrastructure-failure`,
+      );
+    }
+    return this.db.getItem(item.id)!;
   }
 
   // ------------------------------------------------------------------ verbs
@@ -161,7 +232,7 @@ export class Orchestrator {
     if (!this.curator) throw new Error("no curator runner configured");
     const known = this.db.knownRepos();
     const wanted = projects.length > 0 ? projects : known.map((k) => repoSlug(k.repo));
-    const kb = this.loadCurationKb(wanted);
+    const kb = this.loadFullCurationKb(wanted);
     const repoPaths: Record<string, string> = {};
     for (const project of wanted) {
       const match = known.find((k) => repoSlug(k.repo) === project);
@@ -170,15 +241,86 @@ export class Orchestrator {
         repoPaths[project] = rp;
       }
     }
-    const result = await this.curator.propose({ projects: wanted, kb, repoPaths });
+    // Curation must see every entry ever appended, but prompts must stay
+    // bounded: oversized layers are chunked at entry boundaries and reviewed
+    // in sequential batches; per-batch proposals are merged into one artifact.
+    const globalChunks = chunkKbLayer(kb.global, this.config.kb.maxGlobalChars);
+    const projectChunks = chunkKbLayer(kb.project, this.config.kb.maxProjectChars);
+    const batches = Math.max(globalChunks.length, projectChunks.length, 1);
+    const proposalOf = (r: StageResult): string => r.artifacts[0]?.content ?? r.feedback ?? r.report ?? "(empty proposal)";
     const ts = stamp();
     const name = `curate-${ts}${projects.length === 1 ? `-${projects[0]}` : ""}.md`;
     const dir = this.paths.proposals;
     mkdirSync(dir, { recursive: true });
     const abs = path.join(dir, name);
-    const content = result.artifacts[0]?.content ?? result.feedback ?? result.report ?? "(empty proposal)";
-    writeFileSync(abs, content, "utf8");
-    return { file: path.relative(this.paths.root, abs), proposal: content };
+    // Save via temp-file + atomic rename: writeFileSync truncates the
+    // destination in place, so a crash or disk-full mid-save could erase the
+    // only copy of earlier batches' proposals. rename over the target is
+    // atomic — the operator's saved proposals are never half-written.
+    const tmp = `${abs}.tmp-${process.pid}`;
+    const save = (content: string): void => {
+      writeFileSync(tmp, content, "utf8");
+      renameSync(tmp, abs);
+    };
+    const file = path.relative(this.paths.root, abs);
+
+    if (batches === 1) {
+      // Build the request from the computed chunks even for a single batch: a
+      // lone entry larger than the budget was boundary-truncated by
+      // chunkKbLayer, and the full uncapped layer must not bypass that bound.
+      const result = await this.curator.propose({
+        projects: wanted,
+        kb: { global: globalChunks[0] ?? "", project: projectChunks[0] ?? "" },
+        repoPaths,
+      });
+      const content = proposalOf(result);
+      save(content);
+      return { file, proposal: content };
+    }
+
+    const note = (status: string): string =>
+      `> ${status} The knowledge base exceeded its prompt budget and was reviewed in ${batches} entry-aligned batches. Findings spanning batch boundaries are possible — cross-check batches 1..${batches} manually before applying.\n\n`;
+    const sections: string[] = [];
+    for (let i = 0; i < batches; i++) {
+      const slice: KbSnapshot = {
+        global: globalChunks[i] ?? "",
+        project: projectChunks[i] ?? "",
+      };
+      let proposal: string;
+      try {
+        const result = await this.curator.propose({
+          projects: wanted,
+          kb: slice,
+          repoPaths,
+          batch: { index: i + 1, total: batches },
+        });
+        proposal = proposalOf(result);
+      } catch (err) {
+        const done = sections.length;
+        if (done > 0) {
+          // Completed batches are persisted even when a later batch fails —
+          // each is a paid agent run the operator should not have to repeat.
+          save(note(`INCOMPLETE: ${done} of ${batches} batches completed; re-run after fixing the failure.`) + sections.join("\n\n---\n\n"));
+        }
+        throw new Error(
+          `curation batch ${i + 1} of ${batches} failed: ${err instanceof Error ? err.message : String(err)}` +
+            (done > 0 ? ` — proposals from completed batches saved in ${file}` : " — no batches had completed; nothing to save"),
+        );
+      }
+      sections.push(`# curation batch ${i + 1} of ${batches}\n\n${proposal}`);
+      if (i < batches - 1) {
+        // Incremental persistence after every batch for the same reason.
+        save(note(`PARTIAL: ${sections.length} of ${batches} batches completed so far.`) + sections.join("\n\n---\n\n"));
+      }
+    }
+    const content = note("NOTE") + sections.join("\n\n---\n\n");
+    save(content);
+    return { file, proposal: content };
+  }
+
+  /** Release runner-held resources (worktrees, mounts) before the DB closes. */
+  async dispose(): Promise<void> {
+    await this.runner.dispose?.();
   }
 
   // ------------------------------------------------------------------ per-item
@@ -233,13 +375,14 @@ export class Orchestrator {
     this.db.updateItem(item.id, { status: "running" });
     this.db.appendHistory(item.id, "stage-start", stage, { attempt: attemptNo(item, stage) });
 
-    const repoLockAcquired = this.db.acquireRepoLock(repoSlug(item.repo), item.id);
-    if (!repoLockAcquired) {
-      // Stale lock from a crashed run: strictly-sequential MVP proceeds, but
-      // the conflict is on the record.
-      this.db.appendHistory(item.id, "stage-start", stage, { lockConflict: true });
-    }
+    let repoLockAcquired = false;
     try {
+      repoLockAcquired = this.db.acquireRepoLock(repoSlug(item.repo), item.id);
+      if (!repoLockAcquired) {
+        // Stale lock from a crashed run: strictly-sequential MVP proceeds, but
+        // the conflict is on the record.
+        this.db.appendHistory(item.id, "stage-start", stage, { lockConflict: true });
+      }
       let infra = 0;
       for (;;) {
         const req = await this.stageRequest(item, stage);
@@ -452,6 +595,28 @@ export class Orchestrator {
         const ctx = this.contextOf(item);
         const body = this.buildPrBody(item);
         const draft = item.approvals.length > 0;
+        const existing = await this.publisher.findExisting({
+          repoPath: resolveRepoPath(item.repo),
+          branchName: item.branchName,
+          base: item.base,
+        });
+        if (existing) {
+          const prSummary = this.lastPrSummary(item.id)
+            ?? `${item.title}: PR ${existing.number} already existed (${existing.draft ? "draft" : "ready-for-review"})`;
+          appendEntry(projectKbFile(this.paths, item.repo), "pr-outcome", repoSlug(item.repo), prSummary);
+          this.db.updateItem(item.id, {
+            status: "done",
+            parkedReason: null,
+            parkedDetail: { prUrl: existing.url, prNumber: existing.number, draft: existing.draft },
+          });
+          this.db.appendHistory(item.id, "pr-created", "pr", {
+            url: existing.url,
+            number: existing.number,
+            draft: existing.draft,
+            recoveredExisting: true,
+          });
+          return { id: item.id, slug: item.slug, fromStage: "pr", status: "done", detail: `PR ${existing.url} (recovered existing)` };
+        }
         const pr = await this.publisher.publish({
           item: ctx,
           body,
@@ -552,7 +717,11 @@ export class Orchestrator {
 
   private async stageRequest(item: ItemRecord, stage: StageName) {
     const ctx = this.contextOf(item);
-    const kb = loadKbSnapshot(this.paths, item.repo, { lightweight: stage === "triage" });
+    const kb = loadKbSnapshot(this.paths, item.repo, {
+      lightweight: stage === "triage",
+      maxGlobalChars: this.config.kb.maxGlobalChars,
+      maxProjectChars: this.config.kb.maxProjectChars,
+    });
     return { stage, item: ctx, kb };
   }
 
@@ -613,12 +782,18 @@ export class Orchestrator {
     this.db.addArtifact(item.id, "triage", "triage-questions", path.relative(this.paths.root, abs));
   }
 
-  private loadCurationKb(projects: string[]): KbSnapshot {
-    const global = loadKbSnapshot(this.paths, undefined, {}).global;
+  /** Curation reads the FULL layers, uncapped — unlike stage prompts, the
+   * curator must see older entries to judge contradictions, staleness, and
+   * merge candidates. Bounded prompts are preserved by batch slicing in
+   * curate(). */
+  private loadFullCurationKb(projects: string[]): KbSnapshot {
+    const global = readKbFile(globalKbFile(this.paths));
     const parts: string[] = [];
     for (const project of projects) {
       const repo = this.resolveProjectRepo(project);
-      if (repo) parts.push(loadKbSnapshot(this.paths, repo, {}).project);
+      if (repo) {
+        parts.push(readKbFile(projectKbFile(this.paths, repo)));
+      }
     }
     return { global, project: parts.join("\n") };
   }
@@ -745,16 +920,25 @@ function attemptNo(item: ItemRecord, stage: StageName): number {
   return (item.gateAttempts[stage] ?? 0) + 1;
 }
 
+/** Match one raw answer to each parked question, in order. */
+export function matchAnswers(questions: string[], raw: string[]): { question: string; answer: string }[] {
+  if (raw.length !== questions.length) {
+    throw new Error(`expected ${questions.length} answer(s) for ${questions.length} question(s), got ${raw.length}`);
+  }
+  return questions.map((q, i) => ({ question: q, answer: raw[i]! }));
+}
+
 function normalizeAnswers(
   questions: string[],
   answers: { question: string; answer: string }[],
   rawAnswer?: string,
 ): { question: string; answer: string }[] {
   if (answers.length > 0) return answers;
-  if (rawAnswer && questions.length > 0) {
-    return [{ question: questions[0]!, answer: rawAnswer }];
+  if (rawAnswer) {
+    if (questions.length === 0) return [{ question: "(free-form)", answer: rawAnswer }];
+    if (questions.length === 1) return [{ question: questions[0]!, answer: rawAnswer }];
+    throw new Error(`expected ${questions.length} answers (one per question); pass -a per question`);
   }
-  if (rawAnswer) return [{ question: "(free-form)", answer: rawAnswer }];
   return [];
 }
 

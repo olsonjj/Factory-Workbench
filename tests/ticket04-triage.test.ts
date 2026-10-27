@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { createHarness, makeOrchestrator, claim, ScriptedRunner, pass, type TestHarness } from "./helpers.js";
 import { scanInbox } from "../src/inbox.js";
 import { artifactDir } from "../src/paths.js";
+import { matchAnswers } from "../src/pipeline.js";
 
 let harness: TestHarness;
 afterEach(() => {
@@ -119,6 +120,47 @@ describe("ticket 04: triage stage", () => {
     expect(triageReqs[1]!.req.item.answers).toEqual([{ question: "Which UI framework?", answer: "React, like the rest of the repo" }]);
     const itemAfter = harness.db.listItems()[0]!;
     expect(itemAfter.stage).toBe("spec");
+  });
+
+  it("wb answer with multiple questions records index-aligned answers and never collapses them", async () => {
+    harness = createHarness();
+    dropItem(harness);
+    const runner = new ScriptedRunner({
+      triage: [
+        { outcome: "needs-human", artifacts: [], questions: ["Which UI?", "Which DB?"] },
+        () => ({ outcome: "pass", artifacts: [{ name: "triage-report", content: "ok" }] }),
+      ],
+    });
+    const orch = makeOrchestrator(harness, runner);
+    await orch.tickAll();
+    const parked = harness.db.listItems()[0]!;
+
+    // Legacy single-string answer can no longer collapse two questions.
+    expect(() => orch.answer(parked.id, [], "raw")).toThrow(/expected 2 answers/);
+
+    orch.answer(parked.id, [
+      { question: "Which UI?", answer: "React" },
+      { question: "Which DB?", answer: "Postgres" },
+    ]);
+    const item = harness.db.listItems()[0]!;
+    expect(item.answers).toHaveLength(2);
+    expect(item.answers[0]).toEqual({ question: "Which UI?", answer: "React" });
+    expect(item.answers[1]).toEqual({ question: "Which DB?", answer: "Postgres" });
+
+    await orch.tickAll();
+    const triageReqs = runner.calls.filter((c) => c.req.stage === "triage");
+    expect(triageReqs[1]!.req.item.answers).toEqual([
+      { question: "Which UI?", answer: "React" },
+      { question: "Which DB?", answer: "Postgres" },
+    ]);
+  });
+
+  it("matchAnswers is index-aligned and rejects count mismatches", () => {
+    expect(matchAnswers(["Which UI?", "Which DB?"], ["React", "Postgres"])).toEqual([
+      { question: "Which UI?", answer: "React" },
+      { question: "Which DB?", answer: "Postgres" },
+    ]);
+    expect(() => matchAnswers(["Which UI?"], ["React", "Postgres"])).toThrow(/expected 1 answer\(s\).*got 2/);
   });
 
   it("an unparseable triage verdict retries under the infra budget rather than advancing", async () => {

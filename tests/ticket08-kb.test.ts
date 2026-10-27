@@ -54,7 +54,8 @@ describe("ticket 08: knowledge base write-moments + loading", () => {
     await orch.resume();
 
     const triageReq = runner.calls!.find((c) => c.req.stage === "triage")!.req;
-    expect(triageReq.kb.global.length).toBe(2000); // truncated, "lightly"
+    expect(triageReq.kb.global).toContain("older KB content elided"); // tail-truncated, "lightly"
+    expect(triageReq.kb.global.endsWith("G".repeat(2000))).toBe(true);
     expect(triageReq.kb.project).toBe("");         // triage never sees project layer
     const specReq = runner.calls!.find((c) => c.req.stage === "spec")!.req;
     expect(specReq.kb.global).toBe("G".repeat(3000));

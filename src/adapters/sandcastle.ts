@@ -178,15 +178,17 @@ export class SandcastleStageRunner implements StageRunner {
   private readonly config: FactoryConfig;
   private readonly env: Record<string, string>;
   private readonly worktrees = new Map<string, Worktree>();
-  private readonly piEnv: Record<string, string>;
-  private readonly piConfigMounts: { hostPath: string; sandboxPath: string; readonly?: true }[];
   private runStartedAt = 0;
+
+  private staging(): PiConfigStage | null {
+    return getPiConfigStage(this.config.root);
+  }
 
   /** Assistant text from the sandboxed pi session, with stream-parse fallback. */
   private agentText(result: RunResult): string | undefined {
-    const stagedAgentDir = this.piConfigMounts[0]?.hostPath;
-    if (stagedAgentDir) {
-      const text = assistantTextFromSessions(path.join(stagedAgentDir, "sessions"), this.runStartedAt);
+    const staged = this.staging();
+    if (staged) {
+      const text = assistantTextFromSessions(path.join(staged.agentDir, "sessions"), this.runStartedAt);
       if (text) return text;
     }
     return lastIterationText(result) || undefined;
@@ -195,20 +197,11 @@ export class SandcastleStageRunner implements StageRunner {
   constructor(deps: SandcastleRunnerDeps) {
     this.config = deps.config;
     this.env = deps.env ?? {};
-    const staged = preparePiConfigDir(deps.config.root);
-    this.piConfigMounts = staged
-      ? [
-          { hostPath: staged.agentDir, sandboxPath: "/home/agent/.pi/agent" },
-          ...(staged.npmGlobalPrefix
-            ? [{ hostPath: staged.npmGlobalPrefix, sandboxPath: NPM_GLOBAL_PREFIX }]
-            : []),
-        ]
-      : [];
-    this.piEnv = { ...this.env, ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefix }) };
   }
 
   async runStage(req: StageRequest): Promise<StageResult> {
     const started = Date.now();
+    this.runStartedAt = Date.now();
     const model = modelFor(this.config.models, req.stage);
     const wt = await this.worktreeFor(req.item);
     const result = await this.dispatch(req, model, wt);
@@ -250,11 +243,21 @@ export class SandcastleStageRunner implements StageRunner {
 
   private async wtRun(opts: { wt: Worktree; model: string; prompt: string }): Promise<RunResult> {
     const { wt, model, prompt } = opts;
+    const staged = this.staging();
+    const piConfigMounts = staged
+      ? [
+          { hostPath: staged.agentDir, sandboxPath: "/home/agent/.pi/agent" },
+          ...(staged.npmGlobalPrefix
+            ? [{ hostPath: staged.npmGlobalPrefix, sandboxPath: NPM_GLOBAL_PREFIX }]
+            : []),
+        ]
+      : [];
+    const piEnv = { ...this.env, ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefix }) };
     return wt.run({
-      agent: pi(model, { env: this.piEnv }),
+      agent: pi(model, { env: piEnv }),
       sandbox: docker({
         imageName: this.config.sandbox.imageName,
-        ...(this.piConfigMounts.length > 0 ? { mounts: this.piConfigMounts } : {}),
+        ...(piConfigMounts.length > 0 ? { mounts: piConfigMounts } : {}),
       }),
       prompt: [prompt, COMPLETE].join("\n\n"),
       maxIterations: 1,
@@ -449,6 +452,24 @@ Return your verdict as JSON inside a <review>...</review> tag:
  * The factory never merges — there is deliberately no merge call anywhere.
  */
 export class GhPrPublisher {
+  /** Non-throwing pre-publish lookup; publish() remains the throwing path. */
+  async findExisting(req: { repoPath: string; branchName: string; base: string }): Promise<{ url: string; number: number; draft: boolean } | undefined> {
+    if (!fs.existsSync(path.join(req.repoPath, ".git"))) return undefined;
+    try {
+      const out = execFileSync(
+        "gh", ["pr", "list", "--head", req.branchName, "--base", req.base, "--state", "open",
+               "--json", "number,url,isDraft", "--jq", ".[0]"],
+        { cwd: req.repoPath, encoding: "utf8", timeout: 60_000 },
+      );
+      const t = out.trim();
+      if (!t || t === "null") return undefined;
+      const j = JSON.parse(t) as { number: number; url: string; isDraft?: boolean };
+      return { url: j.url, number: j.number, draft: j.isDraft ?? false };
+    } catch {
+      return undefined; // gh unavailable — publish() will surface the real error
+    }
+  }
+
   async publish(req: {
     body: string;
     repoPath: string;
@@ -467,22 +488,33 @@ export class GhPrPublisher {
     const bodyFile = path.join(os.tmpdir(), `factory-pr-body-${process.pid}-${Date.now()}.md`);
     fs.writeFileSync(bodyFile, req.body, "utf8");
     try {
-      const out = execFileSync(
-        "gh",
-        [
-          "pr", "create",
-          "--head", req.branchName,
-          "--base", req.base,
-          "--title", req.item.title,
-          "--body-file", bodyFile,
-          ...(req.draft ? ["--draft"] : []),
-        ],
-        { cwd: req.repoPath, encoding: "utf8", timeout: 180_000, env: { ...process.env } },
-      );
-      const url = out.trim().split("\n").pop()?.trim() ?? "";
-      const m = url.match(/\/pull\/(\d+)/);
-      if (!url) throw new Error(`gh pr create produced no url: ${out}`);
-      return { url, number: m ? Number(m[1]) : 0, draft: req.draft };
+      try {
+        const out = execFileSync(
+          "gh",
+          [
+            "pr", "create",
+            "--head", req.branchName,
+            "--base", req.base,
+            "--title", req.item.title,
+            "--body-file", bodyFile,
+            ...(req.draft ? ["--draft"] : []),
+          ],
+          { cwd: req.repoPath, encoding: "utf8", timeout: 180_000, env: { ...process.env } },
+        );
+        const url = out.trim().split("\n").pop()?.trim() ?? "";
+        const m = url.match(/\/pull\/(\d+)/);
+        if (!url) throw new Error(`gh pr create produced no url: ${out}`);
+        return { url, number: m ? Number(m[1]) : 0, draft: req.draft };
+      } catch (err) {
+        // Defense-in-depth: a crash after `gh pr create` succeeded leaves the
+        // PR existing; recover it instead of failing a duplicate create.
+        const stderr = (err as { stderr?: string }).stderr ?? "";
+        if (/already exists/i.test(stderr)) {
+          const existing = await this.findExisting({ repoPath: req.repoPath, branchName: req.branchName, base: req.base });
+          if (existing) return existing;
+        }
+        throw err;
+      }
     } finally {
       fs.rmSync(bodyFile, { force: true });
     }
@@ -494,20 +526,11 @@ export class SandcastleCurator implements CuratorRunner {
 
   constructor(deps: { config: FactoryConfig; env?: Record<string, string> }) {
     this.deps = deps;
-    const staged = preparePiConfigDir(deps.config.root);
-    this.piConfigMounts = staged
-      ? [
-          { hostPath: staged.agentDir, sandboxPath: "/home/agent/.pi/agent" },
-          ...(staged.npmGlobalPrefix
-            ? [{ hostPath: staged.npmGlobalPrefix, sandboxPath: NPM_GLOBAL_PREFIX }]
-            : []),
-        ]
-      : [];
-    this.env = { ...(deps.env ?? {}), ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefix }) };
   }
 
-  private readonly piConfigMounts: { hostPath: string; sandboxPath: string; readonly?: true }[];
-  private readonly env: Record<string, string>;
+  private staging(): PiConfigStage | null {
+    return getPiConfigStage(this.deps.config.root);
+  }
 
   async propose(req: CuratorRequest): Promise<StageResult> {
     const { config } = this.deps;
@@ -517,26 +540,30 @@ export class SandcastleCurator implements CuratorRunner {
     // scratch must contain a real initial commit — a bare `git init` leaves
     // HEAD unborn and the run aborts with "ambiguous argument 'HEAD'".
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "factory-curate-"));
-    execFileSync("git", ["init", "-q"], { cwd: scratch });
-    fs.writeFileSync(path.join(scratch, "README.md"), "# scratch dir anchoring the curator sandbox (read-only mounts carry the real repos)\n");
-    execFileSync("git", ["add", "-A"], { cwd: scratch });
-    execFileSync(
-      "git",
-      ["-c", "user.name=wb", "-c", "user.email=wb@factory.workbench", "commit", "-q", "-m", "scratch anchor"],
-      { cwd: scratch },
-    );
-    const mounts = Object.values(req.repoPaths).map(
-      (rp): { hostPath: string; sandboxPath: string; readonly: true } => ({
-        hostPath: rp,
-        sandboxPath: path.join("repos", path.basename(rp)),
-        readonly: true,
-      }),
-    );
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: scratch });
+      fs.writeFileSync(path.join(scratch, "README.md"), "# scratch dir anchoring the curator sandbox (read-only mounts carry the real repos)\n");
+      execFileSync("git", ["add", "-A"], { cwd: scratch });
+      execFileSync(
+        "git",
+        ["-c", "user.name=wb", "-c", "user.email=wb@factory.workbench", "commit", "-q", "-m", "scratch anchor"],
+        { cwd: scratch },
+      );
+      const mounts = Object.values(req.repoPaths).map(
+        (rp): { hostPath: string; sandboxPath: string; readonly: true } => ({
+          hostPath: rp,
+          sandboxPath: path.join("repos", path.basename(rp)),
+          readonly: true,
+        }),
+      );
 
-    const repoGuidance = Object.entries(req.repoPaths)
-      .map(([slug, rp]) => `- ${slug}: mounted read-only at repos/${path.basename(rp)}`)
-      .join("\n");
-    const prompt = `You are the knowledge-base curator for a software factory. Read the KB layers below${Object.keys(req.repoPaths).length ? " and the mounted repositories" : ""} and write a curation PROPOSAL. You must not change anything — your only output is the proposal.
+      const repoGuidance = Object.entries(req.repoPaths)
+        .map(([slug, rp]) => `- ${slug}: mounted read-only at repos/${path.basename(rp)}`)
+        .join("\n");
+      const batchNote = req.batch
+        ? `\nThe KB was too large for one pass and has been split into ${req.batch.total} entry-aligned batches; you are reviewing batch ${req.batch.index}. Focus on the entries provided; cross-batch findings are handled by the operator comparing batch proposals.`
+        : "";
+      const prompt = `You are the knowledge-base curator for a software factory. Read the KB layers below${Object.keys(req.repoPaths).length ? " and the mounted repositories" : ""} and write a curation PROPOSAL. You must not change anything — your only output is the proposal.${batchNote}
 
 Your proposal must list, each citing the entries and repo evidence involved:
 - contradictions between entries
@@ -557,22 +584,36 @@ ${req.kb.project || "(empty)"}
 Return the full proposal markdown inside a <proposal>...</proposal> tag.
 ${COMPLETE}`;
 
-    const result = await this.wtRunScratch({ scratch, model, prompt, mounts });
-    fs.rmSync(scratch, { recursive: true, force: true });
-    const stagedAgentDir = path.join(this.deps.config.root, "pi-config");
-    const text = assistantTextFromSessions(path.join(stagedAgentDir, "sessions"), Date.now() - 600_000)
-      ?? lastIterationText(result);
-    const proposal = parseStructuredString(result, "proposal", text || undefined);
-    return { outcome: "pass", artifacts: [{ name: "proposal", content: proposal }] };
+      const startedAt = Date.now();
+      const result = await this.wtRunScratch({ scratch, model, prompt, mounts });
+      const staged = this.staging();
+      const text = staged
+        ? assistantTextFromSessions(path.join(staged.agentDir, "sessions"), startedAt) ?? lastIterationText(result)
+        : lastIterationText(result);
+      const proposal = parseStructuredString(result, "proposal", text || undefined);
+      return { outcome: "pass", artifacts: [{ name: "proposal", content: proposal }] };
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
   }
 
   private async wtRunScratch(opts: { scratch: string; model: string; prompt: string; mounts: { hostPath: string; sandboxPath: string; readonly: true }[] }): Promise<RunResult> {
     const { run } = await import("@ai-hero/sandcastle");
+    const staged = this.staging();
+    const piConfigMounts = staged
+      ? [
+          { hostPath: staged.agentDir, sandboxPath: "/home/agent/.pi/agent" },
+          ...(staged.npmGlobalPrefix
+            ? [{ hostPath: staged.npmGlobalPrefix, sandboxPath: NPM_GLOBAL_PREFIX }]
+            : []),
+        ]
+      : [];
+    const env = { ...(this.deps.env ?? {}), ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefix }) };
     return run({
-      agent: pi(opts.model, { env: this.env }),
+      agent: pi(opts.model, { env }),
       sandbox: docker({
         imageName: this.deps.config.sandbox.imageName,
-        mounts: [...this.piConfigMounts, ...opts.mounts],
+        mounts: [...piConfigMounts, ...opts.mounts],
       }),
       cwd: opts.scratch,
       prompt: opts.prompt,
@@ -657,6 +698,12 @@ export function preparePiConfigDir(factoryRoot: string): PiConfigStage | null {
     }
   }
   return { agentDir: target, npmGlobalPrefix };
+}
+
+const piConfigCache = new Map<string, PiConfigStage | null>();
+export function getPiConfigStage(factoryRoot: string): PiConfigStage | null {
+  if (!piConfigCache.has(factoryRoot)) piConfigCache.set(factoryRoot, preparePiConfigDir(factoryRoot));
+  return piConfigCache.get(factoryRoot) ?? null;
 }
 
 function piOllamaSpecIn(packages: string[]): boolean {

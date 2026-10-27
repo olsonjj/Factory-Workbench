@@ -93,6 +93,8 @@ export interface StageRequest {
  */
 export interface StageRunner {
   runStage(req: StageRequest): Promise<StageResult>;
+  /** Release runner-held resources (worktrees, mounts) before the DB closes. */
+  dispose?(): Promise<void>;
 }
 
 export interface PrPublishResult {
@@ -106,6 +108,10 @@ export interface CuratorRequest {
   projects: string[];
   kb: KbSnapshot;
   repoPaths: Record<string, string>;
+  /** Present only when the KB exceeds its char budget and is reviewed in
+   * bounded, entry-aligned slices. The curator focuses on its slice; the
+   * orchestrator merges per-slice proposals into one artifact. */
+  batch?: { index: number; total: number };
 }
 
 /**

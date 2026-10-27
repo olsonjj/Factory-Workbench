@@ -1,5 +1,6 @@
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
+import { z } from "zod";
 
 export interface StageModels {
   default: string;
@@ -25,12 +26,20 @@ export interface SandboxConfig {
   imageName: string;
 }
 
+export interface KbConfig {
+  /** Max chars of the global KB layer loaded into a full (non-triage) stage. */
+  maxGlobalChars: number;
+  /** Max chars of the project KB layer loaded into a full stage. */
+  maxProjectChars: number;
+}
+
 export interface FactoryConfig {
   /** Factory root directory (self-contained, movable). */
   root: string;
   models: StageModels;
   budgets: Budgets;
   sandbox: SandboxConfig;
+  kb: KbConfig;
 }
 
 export const DEFAULT_MODEL = "deepseek-v4-pro:0813";
@@ -48,6 +57,7 @@ export const DEFAULT_CONFIG: Omit<FactoryConfig, "root"> = {
     retryBackoffMs: 5000,
   },
   sandbox: { imageName: "sandcastle:local" },
+  kb: { maxGlobalChars: 24000, maxProjectChars: 24000 },
 };
 
 /** Model id for a stage: explicit per-stage override, else the default. */
@@ -64,6 +74,31 @@ export interface ConfigLoadResult {
   configFile: string;
 }
 
+const configSchema = z.object({
+  root: z.string().min(1),
+  models: z.object({
+    default: z.string().min(1),
+    triage: z.string().min(1).optional(),
+    spec: z.string().min(1).optional(),
+    implement: z.string().min(1).optional(),
+    test: z.string().min(1).optional(),
+    review: z.string().min(1).optional(),
+    curate: z.string().min(1).optional(),
+  }),
+  budgets: z.object({
+    maxGateAttempts: z.number().int().positive(),
+    // nonnegative (not positive): 0 is a legitimate way to disable automatic
+    // retries, and loadConfig must not reject it at startup.
+    maxInfraRetries: z.number().int().nonnegative(),
+    retryBackoffMs: z.number().int().nonnegative(),
+  }),
+  sandbox: z.object({ imageName: z.string().min(1) }),
+  kb: z.object({
+    maxGlobalChars: z.number().int().positive(),
+    maxProjectChars: z.number().int().positive(),
+  }),
+});
+
 /**
  * Load the factory configuration. `rootOverride` (CLI --root) wins over
  * `FACTORY_ROOT`, which wins over the config file's own `root` field, which
@@ -74,7 +109,11 @@ export function loadConfig(rootOverride?: string, cwd: string = process.cwd()): 
   const configFile = path.join(candidate, CONFIG_FILE_NAME);
   let raw: Partial<FactoryConfig> = {};
   if (existsSync(configFile)) {
-    raw = JSON.parse(readFileSync(configFile, "utf8")) as Partial<FactoryConfig>;
+    try {
+      raw = JSON.parse(readFileSync(configFile, "utf8")) as Partial<FactoryConfig>;
+    } catch (err) {
+      throw new Error(`cannot parse factory config ${configFile}: ${err instanceof Error ? err.message : String(err)}`);
+    }
     if (rootOverride === undefined && process.env.FACTORY_ROOT === undefined) {
       if (typeof raw.root === "string" && raw.root.length > 0) candidate = raw.root;
     }
@@ -93,8 +132,17 @@ export function loadConfig(rootOverride?: string, cwd: string = process.cwd()): 
       ...DEFAULT_CONFIG.sandbox,
       ...(raw.sandbox ?? {}),
     },
+    kb: {
+      ...DEFAULT_CONFIG.kb,
+      ...(raw.kb ?? {}),
+    },
   };
-  return { config, root: candidate, configFile };
+  const parsed = configSchema.safeParse(config);
+  if (!parsed.success) {
+    const detail = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
+    throw new Error(`invalid factory config ${configFile}: ${detail}`);
+  }
+  return { config: parsed.data, root: candidate, configFile };
 }
 
 /** Write a default config file if the factory root has none. Returns whether it was created. */

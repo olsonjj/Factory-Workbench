@@ -6,11 +6,12 @@ import nodeProcess from "node:process";
 import { loadConfig, ensureConfigFile } from "../config.js";
 import { makePaths, ensureLayout } from "../paths.js";
 import { FactoryDb } from "../db.js";
+import { acquireFactoryLock } from "../lock.js";
 import { scanInbox } from "../inbox.js";
 import { ITEM_TEMPLATE } from "../frontmatter.js";
 import { authorItem, type NewOptions } from "../new.js";
 import { makeRealIO } from "../prompt.js";
-import { Orchestrator } from "../pipeline.js";
+import { Orchestrator, matchAnswers } from "../pipeline.js";
 import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, ollamaEnv } from "../adapters/sandcastle.js";
 import { sleep } from "../util.js";
 
@@ -22,24 +23,31 @@ function openFactory(rootOverride?: string): {
   db: FactoryDb;
   orch: Orchestrator;
   claimReport: ReturnType<typeof scanInbox>;
+  release: () => void;
 } {
   const { config, root } = loadConfig(rootOverride);
   ensureConfigFile(root);
   const paths = makePaths(root);
   ensureLayout(paths);
-  const db = new FactoryDb(root);
-  const runner = new SandcastleStageRunner({ config, env: ollamaEnv() });
-  const claimReport = scanInbox(paths, db);
-  const orch = new Orchestrator({
-    db,
-    paths,
-    config,
-    runner,
-    curator: new SandcastleCurator({ config, env: ollamaEnv() }),
-    publisher: new GhPrPublisher(),
-    sleep,
-  });
-  return { root, paths, db, orch, claimReport };
+  const release = acquireFactoryLock(root);
+  try {
+    const db = new FactoryDb(root);
+    const runner = new SandcastleStageRunner({ config, env: ollamaEnv() });
+    const claimReport = scanInbox(paths, db);
+    const orch = new Orchestrator({
+      db,
+      paths,
+      config,
+      runner,
+      curator: new SandcastleCurator({ config, env: ollamaEnv() }),
+      publisher: new GhPrPublisher(),
+      sleep,
+    });
+    return { root, paths, db, orch, claimReport, release };
+  } catch (err) {
+    release();
+    throw err;
+  }
 }
 
 /**
@@ -50,15 +58,22 @@ function openAuthoringRoot(rootOverride?: string): {
   root: string;
   paths: ReturnType<typeof makePaths>;
   db: FactoryDb;
+  release: () => void;
 } {
   const { config, root } = loadConfig(rootOverride);
   ensureConfigFile(root);
   const paths = makePaths(root);
   ensureLayout(paths);
-  return { root, paths, db: new FactoryDb(root) };
+  const release = acquireFactoryLock(root);
+  try {
+    return { root, paths, db: new FactoryDb(root), release };
+  } catch (err) {
+    release();
+    throw err;
+  }
 }
 
-/** Shared command scaffold: open factory, run the body, always close the db. */
+/** Shared command scaffold: open factory, run the body, always release resources. */
 async function withFactory<T>(
   root: string | undefined,
   body: (ctx: { db: FactoryDb; orch: Orchestrator; claimReport: ReturnType<typeof scanInbox> }) => Promise<T> | T,
@@ -67,7 +82,9 @@ async function withFactory<T>(
   try {
     await body(ctx);
   } finally {
+    await ctx.orch.dispose();
     ctx.db.close();
+    ctx.release();
   }
 }
 
@@ -135,7 +152,7 @@ program
   .option("--approvals <stages>", "comma-separated approval stages, e.g. spec,review")
   .option("--description-file <path>", "read the description from a file")
   .action(async (description: string | undefined, opts: NewOptions & { root?: string }) => {
-    const { paths, db } = openAuthoringRoot(opts.root);
+    const { paths, db, release } = openAuthoringRoot(opts.root);
     try {
       const result = await authorItem({ ...opts, description }, db, paths, makeRealIO());
       if (!result.ok) {
@@ -145,6 +162,7 @@ program
       console.log(`Wrote ${result.file} — next: \`wb run\``);
     } finally {
       db.close();
+      release();
     }
   });
 
@@ -165,7 +183,9 @@ program
   .option("--root <dir>", "factory root directory")
   .action(async (opts: { root?: string }) => {
     await withFactory(opts.root, async ({ orch }) => {
-      printTick((await orch.resume()).entries, "Nothing to resume.");
+      const report = await orch.resume();
+      printTick(report.entries, "Nothing to resume.");
+      if (report.capped) console.error("resume hit its safety cap — run `wb resume` again to continue.");
     });
   });
 
@@ -238,6 +258,18 @@ program
   });
 
 program
+  .command("retry <id-or-slug>")
+  .description("Re-queue an item parked by infrastructure failure, exhausted rework, or malformed front-matter (fix the item file first for malformed)")
+  .option("--root <dir>", "factory root directory")
+  .action((idOrSlug: string, opts: { root?: string }) => {
+    return withFactory(opts.root, ({ db, orch }) => {
+      const { id } = requireItem(db, idOrSlug);
+      const item = orch.retry(id);
+      console.log(`Re-queued ${item.slug} at stage ${item.stage}. Run \`wb run\` or \`wb resume\`.`);
+    });
+  });
+
+program
   .command("answer <id-or-slug>")
   .description("Answer a parked item's triage questions; the next run re-runs triage with the answers")
   .option("--root <dir>", "factory root directory")
@@ -245,8 +277,18 @@ program
   .action((idOrSlug: string, opts: { root?: string; answer?: string[] }) => {
     return withFactory(opts.root, ({ db, orch }) => {
       const { id } = requireItem(db, idOrSlug);
-      const item = orch.answer(id, [], opts.answer?.join("\n"));
-      console.log(`Answers recorded for ${item.slug}. Triage will re-run with them.`);
+      const item = db.getItem(id)!;
+      const questions = (item.parkedDetail?.questions as string[] | undefined) ?? [];
+      const raw = opts.answer ?? [];
+      if (raw.length === 0 && questions.length > 0) {
+        console.error(`expected ${questions.length} answer(s); pass -a "..." for each question`);
+        nodeProcess.exit(1);
+      }
+      // Free-form feedback for items parked without questions must not go
+      // through matchAnswers (an answer/question count mismatch throws).
+      const answers = questions.length > 0 ? matchAnswers(questions, raw) : [];
+      const out = orch.answer(id, answers, questions.length === 0 ? raw.join("\n") : undefined);
+      console.log(`Answers recorded for ${out.slug}. Triage will re-run with them.`);
     });
   });
 

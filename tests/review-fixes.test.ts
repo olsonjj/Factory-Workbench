@@ -26,6 +26,24 @@ describe("review fixes: spec handoff and operator artifacts", () => {
     expect(implementReq.item.spec).toContain("# spec output");
   });
 
+  it("free-form answers are accepted for items parked without questions", async () => {
+    harness = createHarness();
+    dropItem(harness);
+    const runner = new ScriptedRunner({
+      triage: [{ outcome: "needs-human", artifacts: [], questions: [] }],
+    });
+    const orch = makeOrchestrator(harness, runner);
+    await orch.tickAll();
+    const parked = harness.db.listItems()[0]!;
+    expect(parked.status).toBe("needs-human");
+    const out = orch.answer(parked.id, [], "please include a migration step in the spec");
+    expect(out.status).toBe("queued");
+    const artifacts = harness.db.getArtifacts(parked.id);
+    const answersArtifact = artifacts.find((a) => a.name === "answers")!;
+    expect(answersArtifact).toBeTruthy();
+    expect(harness.readFile(harness.root + "/" + answersArtifact.path)).toContain("migration step");
+  });
+
   it("answers are saved as an item artifact", async () => {
     harness = createHarness();
     dropItem(harness);
