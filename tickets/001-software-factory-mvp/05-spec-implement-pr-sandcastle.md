@@ -6,7 +6,7 @@
 
 **Status:** ready-for-agent
 
-- [ ] A fully autonomous item (no approvals front-matter, well-formed description targeting a real local repo) produces a GitHub PR whose diff matches a reasonable reading of the item request — without any command other than `factory run`/`factory resume`
+- [ ] A fully autonomous item (no approvals front-matter, well-formed description targeting a real local repo) produces a GitHub PR whose diff matches a reasonable reading of the item request — without any command other than `wb run`/`wb resume`
 - [ ] Spec is saved as an item artifact and its content is grounded in the actual repo (agent works in a worktree, never the host working copy)
 - [ ] Implementation commits land on a named per-item branch inside a bind-mounted Docker sandbox (OrbStack-compatible); the host filesystem is untouched beyond worktree/git plumbing
 - [ ] The branch is pushed and a PR created with body assembled from the request, spec, and artifact index; draft vs ready-for-review follows the item's approvals front-matter

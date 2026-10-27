@@ -7,14 +7,14 @@
     "test": "vitest run",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "factory": "tsx src/cli/index.ts"
+    "wb": "tsx src/cli/index.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "bin": {
-    "factory": "./dist/cli/index.js"
+    "wb": "./dist/cli/index.js"
   },
   "dependencies": {
     "@ai-hero/sandcastle": "^0.12.0",

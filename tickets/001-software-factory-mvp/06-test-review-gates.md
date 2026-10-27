@@ -10,5 +10,5 @@
 - [ ] An implementation that passes tests but fails review (e.g. missing input validation, security smell) is reworked with the review's reasons as feedback, up to the budget, then proceeds or parks with the full history
 - [ ] The review gate's verdict (pass/fail with findings) is saved as an artifact and included in the PR body's audit trail
 - [ ] Review runs with the model family configured for it — different from implement by default per config
-- [ ] Exhausted rework parks the item with every round's report, visible in `factory status` with a clear parked-reason
+- [ ] Exhausted rework parks the item with every round's report, visible in `wb status` with a clear parked-reason
 - [ ] Scenario tests above the seam: test-fail-then-fix → proceed; test-fail loop → park; review-reject-then-pass → proceed; review-reject loop → park; both gates failing in different orders behave deterministically

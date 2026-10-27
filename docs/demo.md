@@ -12,7 +12,7 @@ Then:
 
 ```bash
 # 1. Create the factory root next to nothing else
-npx factory init                       # writes ./factory/
+npx wb init                       # writes ./factory/
 
 # 2. Drop an item (no approvals → autonomous → ready-for-review PR)
 cat > factory/inventory.md <<'EOF'  # (put the file in factory/inbox/)
@@ -28,9 +28,9 @@ test asserting it.
 EOF
 
 # 3. Drive the pipeline — nothing but the tick verbs
-npx factory run     # each invocation advances the item one stage
-npx factory status  # shows triage → spec → … → waiting on / done
-npx factory resume  # finish the run: pushes `factory/<slug>` and opens the PR
+npx wb run     # each invocation advances the item one stage
+npx wb status  # shows triage → spec → … → waiting on / done
+npx wb resume  # finish the run: pushes `factory/<slug>` and opens the PR
 
 # 4. Verify
 gh pr list --repo <greeter-repo>          # PR exists, body contains:
@@ -39,7 +39,7 @@ gh pr list --repo <greeter-repo>          # PR exists, body contains:
 #   - the review verdict artifact
 #   - rework history ("None — first pass." for a clean run)
 git -C /path/to/greeter-repo log --oneline factory/<slug>   # commits on the branch
-npx factory status    # item is `done`; PR list shows ready-for-review (no --draft flag)
+npx wb status    # item is `done`; PR list shows ready-for-review (no --draft flag)
 
 # 5. HITL variant: repeat with approvals: [spec, review] → the PR is created
 #    as a draft, and the factory parks at both approved stages for you.

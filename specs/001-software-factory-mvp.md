@@ -10,7 +10,7 @@ I want a "software factory": a system where I drop in a markdown task file and a
 
 A small, sequentially-processing software factory built on `pi` (as the agent harness inside sandboxes) and Sandcastle (for Docker-based sandboxing, git worktrees, and branch strategy). Work is ingested by dropping markdown files into an inbox folder. Each file is the durable source of truth for a work item; a SQLite-backed state machine tracks its progress through the pipeline: **triage → spec → implement → test → review → pull request**.
 
-The factory is a local CLI with tick-based execution (`factory run` / `factory resume`), not a daemon. Agents never touch my filesystem — every stage runs in a Sandcastle Docker sandbox bound to a git worktree of the target repo, and commits land on a named branch. The final stage creates a GitHub pull request whose body is an audit trail assembled from the pipeline's artifacts; the factory never merges.
+The factory is a local CLI with tick-based execution (`wb run` / `wb resume`), not a daemon. Agents never touch my filesystem — every stage runs in a Sandcastle Docker sandbox bound to a git worktree of the target repo, and commits land on a named branch. The final stage creates a GitHub pull request whose body is an audit trail assembled from the pipeline's artifacts; the factory never merges.
 
 Human-in-the-loop is configurable per item and per stage: as items gain my trust I remove approval gates from the front-matter, and the factory takes more of the pipeline AFK. A dated, append-only markdown knowledge base (global + per-project) lets stages learn from failed gates and rework rounds, with an on-demand curator pass to keep it from going stale.
 
@@ -22,8 +22,8 @@ Human-in-the-loop is configurable per item and per stage: as items gain my trust
 4. As a factory operator, I want the factory to claim inbox files by moving them into its item store, so that a file cannot be ingested twice.
 5. As a factory operator, I want the factory to rescan the inbox on startup, so that recovery after downtime requires no special handling.
 6. As a factory operator, I want each item tracked in SQLite by stage, status, attempt counts, and artifact paths, so that the factory's progress survives crashes and restarts.
-7. As a factory operator, I want `factory run` to process every currently-actionable item one stage further, so that I can advance the factory on demand without a long-running process.
-8. As a factory operator, I want `factory resume` to continue items parked by crashes or interruptions from their last recorded stage, so that nothing is ever silently lost.
+7. As a factory operator, I want `wb run` to process every currently-actionable item one stage further, so that I can advance the factory on demand without a long-running process.
+8. As a factory operator, I want `wb resume` to continue items parked by crashes or interruptions from their last recorded stage, so that nothing is ever silently lost.
 9. As a factory operator, I want triage to decide whether an item can be worked on, so that junk or dangerous tasks never reach implementation.
 10. As a factory operator, I want triage to have three outcomes (proceed, reject, needs-human), so that "no" and "I can't tell yet" are treated differently.
 11. As a factory operator, I want rejected items archived with their triage report attached, so that I can later see why work was refused.
@@ -77,7 +77,7 @@ Human-in-the-loop is configurable per item and per stage: as items gain my trust
 **Pipeline**
 
 - Stage sequence (MVP): ingest → triage → spec → implement → test → review → pull-request.
-- Triage outcomes: `proceed` (continue), `reject` (terminal; archive with report), `needs-human` (park with questions; `factory answer` feeds answers back and re-runs triage).
+- Triage outcomes: `proceed` (continue), `reject` (terminal; archive with report), `needs-human` (park with questions; `wb answer` feeds answers back and re-runs triage).
 - Test stage runs the target project's test suite in the sandbox; failures become rework feedback to implement.
 - Review gate covers code quality, security, and best practices in a single agent (splitting into separate security and review agents is a later addition, not a change).
 - Gate failure → feedback to prior stage → at most three total attempts per gate → exhausted budget parks the item with full failure history.
@@ -106,7 +106,7 @@ Human-in-the-loop is configurable per item and per stage: as items gain my trust
 - Markdown KB in the factory root: global layer and per-project layer keyed by repo.
 - All entries are dated and append-only; agents never rewrite existing entries.
 - Agent write moments are limited to three: failed-gate lessons, post-rework fixes, and one-line PR outcome summaries. Consuming stages (triage lightweight; spec, implement, review fully) load the relevant KB layers into their prompts and are instructed to verify KB facts against the repo before relying on them.
-- `factory curate` runs a curator agent that writes a *proposal file* (contradictions, stale facts, prune candidates); the human reviews and applies it by hand.
+- `wb curate` runs a curator agent that writes a *proposal file* (contradictions, stale facts, prune candidates); the human reviews and applies it by hand.
 
 **State & storage layout**
 

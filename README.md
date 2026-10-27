@@ -1,4 +1,4 @@
-# factory
+# wb — software workbench
 
 A small, sequentially-processing software factory: drop a markdown task file
 into an inbox folder, get a reviewed, pull-request-ready branch out — with
@@ -31,7 +31,7 @@ per-project knowledge base), `proposals/`, `logs/`, and `factory.db` (SQLite).
 
 ## Usage
 
-Write a work item (see `npx factory template`):
+Write a work item (see `npx wb template`):
 
 ```markdown
 ---
@@ -47,13 +47,13 @@ Describe the task. This file is the item's source of truth.
 Drop it into `factory/inbox/`, then:
 
 ```bash
-npx factory run      # claim inbox + advance every actionable item one stage
-npx factory resume   # drive interrupted/human-rejected items until parked or done
-npx factory status   # everything the factory is doing, waiting on, or blocked by
-npx factory approve <id>          # release a parked approval gate
-npx factory reject <id> --reason "fix the X"   # feedback feeds the next agent run
-npx factory answer <id> -a "..."  # answer parked triage questions; triage re-runs
-npx factory curate [project]      # on-demand KB curation proposal (read-only)
+npx wb run      # claim inbox + advance every actionable item one stage
+npx wb resume   # drive interrupted/human-rejected items until parked or done
+npx wb status   # everything the factory is doing, waiting on, or blocked by
+npx wb approve <id>          # release a parked approval gate
+npx wb reject <id> --reason "fix the X"   # feedback feeds the next agent run
+npx wb answer <id> -a "..."  # answer parked triage questions; triage re-runs
+npx wb curate [project]      # on-demand KB curation proposal (read-only)
 ```
 
 Pipeline: **triage → spec → implement → test → review → pull-request**.
@@ -107,7 +107,7 @@ a failed gate (lesson), post-rework (what fixed it), and PR creation (one-line
 outcome) — and only ever append. Consuming stages load their designated
 layers (triage: lightweight global only; spec/implement/review: global +
 project) and are instructed to verify KB facts against the repo before
-trusting them. `factory curate` runs a read-only pass that writes a proposal
+trusting them. `wb curate` runs a read-only pass that writes a proposal
 file (contradictions, repo mismatches, prune candidates) which you apply by
 hand.
 

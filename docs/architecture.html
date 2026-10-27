@@ -188,7 +188,7 @@
 
 <span class="kicker">Pipeline</span>
 <h2>Item pipeline, stage by stage</h2>
-<p class="lead">Every actionable item advances exactly one stage per <code>factory run</code>; <code>factory resume</code> loops ticks until each item is parked or done. Gates fail <em>into</em> rework; everything else fails into infra retries.</p>
+<p class="lead">Every actionable item advances exactly one stage per <code>wb run</code>; <code>wb resume</code> loops ticks until each item is parked or done. Gates fail <em>into</em> rework; everything else fails into infra retries.</p>
 <div class="pipeline">
   <div class="stage"><span class="conn">→</span><div class="n">1 · agent</div><div class="t">triage</div><div class="d">proceed / reject (archive) / needs-human (park + questions, <code>answer</code> re-runs)</div><span class="tag done">live ✅</span></div>
   <div class="stage"><span class="conn">→</span><div class="n">2 · agent <i class="muted">(optional approval)</i></div><div class="t">spec</div><div class="d">repo-grounded plan saved as artifact; parks here when in <code>approvals:</code></div><span class="tag done">live ✅</span></div>
@@ -256,14 +256,14 @@
 <h2>Where we are, what's next</h2>
 <div class="card">
   <h3 style="margin-top:0">Delivered (milestones 1–5)</h3>
-  <p>Skeleton → stubs → budgets → real triage → spec/implement/PR via Sandcastle → gates + rework → HITL → KB → curator. Everything observable via <code>factory status</code>; everything durable in SQLite.</p>
+  <p>Skeleton → stubs → budgets → real triage → spec/implement/PR via Sandcastle → gates + rework → HITL → KB → curator. Everything observable via <code>wb status</code>; everything durable in SQLite.</p>
 </div>
 <div class="card">
   <h3 style="margin-top:0">Open / deferred (not started)</h3>
   <ul class="tight">
     <li><b>HITL on the first real repo</b> — grove PR #10 ran fully autonomous; the park → approve → resume experience hasn't met a real repo yet; same for <code>curate</code> against grove's accumulating KB.</li>
     <li><b>Per-stage model differentiation beyond review</b> — mechanism exists; diversified mapping (triage/test on v4-flash) is a config edit away.</li>
-    <li><b><code>factory watch</code></b> — loop around the tick verbs; deferred by design.</li>
+    <li><b><code>wb watch</code></b> — loop around the tick verbs; deferred by design.</li>
     <li><b>Web status UI</b> — the schema already supports it.</li>
     <li><b>Cross-repo parallelism</b> — per-repo lock table exists; scheduler work deferred.</li>
     <li><b>Sandbox-image maintenance</b> — Docker build networking is currently broken under OrbStack (run-networking works); the Rust-enabled image was mutated+committed as a workaround. Revisit the toolchain install via <code>.sandcastle/Dockerfile</code> when builds recover.</li>

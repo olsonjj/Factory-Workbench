@@ -12,7 +12,7 @@ import { Orchestrator } from "../pipeline.js";
 import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, ollamaEnv } from "../adapters/sandcastle.js";
 import { sleep } from "../util.js";
 
-const program = new Command("factory");
+const program = new Command("wb");
 
 function openFactory(rootOverride?: string): {
   root: string;
@@ -85,7 +85,7 @@ function logClaimReport(report: ReturnType<typeof scanInbox>): void {
 interface StatusFlags { all?: boolean }
 
 program
-  .name("factory")
+  .name("wb")
   .description("A small, sequentially-processing software factory: markdown inbox in, reviewed pull request out.");
 
 program
@@ -138,7 +138,7 @@ program
       logClaimReport(claimReport);
       const items = db.listItems().filter((i) => opts.all || i.status !== "done");
       if (items.length === 0) {
-        console.log("No items. Drop a markdown file in the inbox: `factory template`");
+        console.log("No items. Drop a markdown file in the inbox: `wb template`");
       }
       for (const item of items) {
         console.log(`#${item.id} ${item.slug} [${item.status}] stage=${item.stage} repo=${item.repo}`);
@@ -179,7 +179,7 @@ program
     return withFactory(opts.root, ({ db, orch }) => {
       const { id } = requireItem(db, idOrSlug);
       const item = orch.approve(id, opts.note);
-      console.log(`Approved ${item.slug} — run \`factory run\` or \`factory resume\` to continue.`);
+      console.log(`Approved ${item.slug} — run \`wb run\` or \`wb resume\` to continue.`);
     });
   });
 
@@ -192,7 +192,7 @@ program
     return withFactory(opts.root, ({ db, orch }) => {
       const { id } = requireItem(db, idOrSlug);
       const item = orch.rejectItem(id, opts.reason);
-      console.log(`Rejected ${item.slug}. Reason stored as feedback; resume with \`factory resume\`.`);
+      console.log(`Rejected ${item.slug}. Reason stored as feedback; resume with \`wb resume\`.`);
     });
   });
 
