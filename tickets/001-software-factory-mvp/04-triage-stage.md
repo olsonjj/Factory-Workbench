@@ -6,11 +6,11 @@
 
 **Status:** ready-for-agent
 
-- [ ] A dropped markdown item gets a real triage decision from the configured model (Ollama Cloud provider config works end-to-end)
-- [ ] `proceed` moves the item onward in the pipeline state; `reject` archives it with the triage report as an artifact and a rejected status in `wb status`
-- [ ] Re-dropping an archived item's file into the inbox creates a fresh claim (resurrection works)
-- [ ] `needs-human` parks the item with its questions visible in `wb status`; the questions are also stored as an artifact
-- [ ] `wb answer <id>` records answers to the parked questions; the next run re-executes triage with them in context
-- [ ] Structured output is validated (an unparseable triage verdict retries under the infra budget rather than advancing the pipeline)
-- [ ] Triage report, questions, and answers are saved as item artifacts; attempts and model usage are recorded in item state
-- [ ] Scenario tests above the seam use fake triage runners for park/answer/re-run and archive/resurrect flows; one thin real-agent test exists but is gated on model availability
+- [x] A dropped markdown item gets a real triage decision from the configured model (Ollama Cloud provider config works end-to-end)
+- [x] `proceed` moves the item onward in the pipeline state; `reject` archives it with the triage report as an artifact and a rejected status in `wb status`
+- [x] Re-dropping an archived item's file into the inbox creates a fresh claim (resurrection works)
+- [x] `needs-human` parks the item with its questions visible in `wb status`; the questions are also stored as an artifact
+- [x] `wb answer <id>` records answers to the parked questions; the next run re-executes triage with them in context
+- [x] Structured output is validated (an unparseable triage verdict retries under the infra budget rather than advancing the pipeline)
+- [x] Triage report, questions, and answers are saved as item artifacts; attempts and model usage are recorded in item state
+- [x] Scenario tests above the seam use fake triage runners for park/answer/re-run and archive/resurrect flows; one thin real-agent test exists but is gated on model availability

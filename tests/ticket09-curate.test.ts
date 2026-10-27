@@ -29,7 +29,7 @@ function seedWorld(h: TestHarness): void {
 }
 
 describe("ticket 09: curator pass for the knowledge base", () => {
-  it("factory curate produces a proposal file listing concrete findings, each citing entries and evidence", async () => {
+  it("wb curate produces a proposal file listing concrete findings, each citing entries and evidence", async () => {
     harness = createHarness();
     seedWorld(harness);
     const curator = new FakeCurator();

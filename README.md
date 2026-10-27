@@ -1,4 +1,4 @@
-# wb — software workbench
+# wb — Factory Workbench
 
 A small, sequentially-processing software factory: drop a markdown task file
 into an inbox folder, get a reviewed, pull-request-ready branch out — with

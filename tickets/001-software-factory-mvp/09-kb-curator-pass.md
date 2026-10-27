@@ -6,9 +6,9 @@
 
 **Status:** ready-for-agent
 
-- [ ] `wb curate` (optionally scoped to one project) produces a proposal file in the factory root listing concrete, actionable findings — each citing the entries and repo evidence involved
-- [ ] Contradictory entries and repo-mismatched facts are detected against the actual repositories, not just the KB text
-- [ ] Stale dated entries are flagged with a recommendation (prune, merge, or keep) rather than auto-decided
-- [ ] The curator is strictly read-only with respect to the KB: no entry is modified, added, or removed by the pass; output is the proposal file only
-- [ ] A human applying the proposal edits the KB files directly; a subsequent consuming run uses the curated content
-- [ ] Scenario tests above the seam: contradiction flagged, repo-mismatch detected with planted evidence, read-only invariant enforced, proposal file format validated; the pass runs hermetically above the stage seam
+- [x] `wb curate` (optionally scoped to one project) produces a proposal file in the factory root listing concrete, actionable findings — each citing the entries and repo evidence involved
+- [x] Contradictory entries and repo-mismatched facts are detected against the actual repositories, not just the KB text
+- [x] Stale dated entries are flagged with a recommendation (prune, merge, or keep) rather than auto-decided
+- [x] The curator is strictly read-only with respect to the KB: no entry is modified, added, or removed by the pass; output is the proposal file only
+- [x] A human applying the proposal edits the KB files directly; a subsequent consuming run uses the curated content
+- [x] Scenario tests above the seam: contradiction flagged, repo-mismatch detected with planted evidence, read-only invariant enforced, proposal file format validated; the pass runs hermetically above the stage seam

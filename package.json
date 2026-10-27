@@ -1,7 +1,7 @@
 {
-  "name": "factory",
+  "name": "factory-workbench",
   "version": "1.0.0",
-  "description": "",
+  "description": "Factory Workbench (wb) — markdown work items in, reviewed pull requests out",
   "main": "index.js",
   "scripts": {
     "test": "vitest run",

@@ -88,7 +88,7 @@ describe("ticket 04: triage stage", () => {
     expect(artifacts.some((a) => a.name === "triage-questions")).toBe(true);
   });
 
-  it("factory answer records answers; the next run re-runs triage with them in context", async () => {
+  it("wb answer records answers; the next run re-runs triage with them in context", async () => {
     harness = createHarness();
     dropItem(harness);
     const runner = new ScriptedRunner({

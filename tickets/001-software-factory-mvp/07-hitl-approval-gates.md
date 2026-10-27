@@ -6,9 +6,9 @@
 
 **Status:** ready-for-agent
 
-- [ ] An item with `approvals:` listing a stage parks after completing that stage; `wb status` shows it awaiting approval with the stage's artifact available to read
-- [ ] `wb approve <id>` resumes the item from the parked stage's next step; no approval-gated stage behavior changes for items without the flag
-- [ ] `wb reject <id> --reason "..."` parks the item as human-rejected and records the reason; when the item is resumed/re-run, the reason is fed as feedback into the next agent run's context
-- [ ] Approval-gated items produce draft PRs; autonomous items produce ready-for-review PRs (interaction with the terminal stage is correct in both modes)
-- [ ] Approve/reject events, reasons, and outcomes appear in the item's history and artifacts
-- [ ] Scenario tests above the seam: park-after-spec → approve → proceeds; park → reject with reason → resume → stage receives the reason; autonomous item runs unaffected
+- [x] An item with `approvals:` listing a stage parks after completing that stage; `wb status` shows it awaiting approval with the stage's artifact available to read
+- [x] `wb approve <id>` resumes the item from the parked stage's next step; no approval-gated stage behavior changes for items without the flag
+- [x] `wb reject <id> --reason "..."` parks the item as human-rejected and records the reason; when the item is resumed/re-run, the reason is fed as feedback into the next agent run's context
+- [x] Approval-gated items produce draft PRs; autonomous items produce ready-for-review PRs (interaction with the terminal stage is correct in both modes)
+- [x] Approve/reject events, reasons, and outcomes appear in the item's history and artifacts
+- [x] Scenario tests above the seam: park-after-spec → approve → proceeds; park → reject with reason → resume → stage receives the reason; autonomous item runs unaffected

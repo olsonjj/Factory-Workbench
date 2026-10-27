@@ -6,11 +6,11 @@
 
 **Status:** ready-for-agent
 
-- [ ] Dropping a well-formed markdown file into the inbox and running the status command shows it as a claimed item with an id/slug, its stage, and its source file location
-- [ ] The claimed file has been moved out of the inbox into the item store; the inbox no longer contains it
-- [ ] Front-matter is parsed and validated (title, repo, base, approvals); malformed items park with a clear reason rather than crashing the scan
-- [ ] Running the scan again (including across restarts) does not duplicate items
-- [ ] Config file exists and is read (factory root paths, default model, per-stage model mapping structure, rework/retry budgets) with sane defaults
-- [ ] SQLite state is queryable for item id, stage, status, attempts, parked reason, and artifact paths (future web UI reads this directly)
-- [ ] `wb status` output lists all items and their current state, including items parked/failed for reasons
-- [ ] Scenario tests cover claim, move, idempotency, and malformed-front-matter parking against a real temporary filesystem and real SQLite
+- [x] Dropping a well-formed markdown file into the inbox and running the status command shows it as a claimed item with an id/slug, its stage, and its source file location
+- [x] The claimed file has been moved out of the inbox into the item store; the inbox no longer contains it
+- [x] Front-matter is parsed and validated (title, repo, base, approvals); malformed items park with a clear reason rather than crashing the scan
+- [x] Running the scan again (including across restarts) does not duplicate items
+- [x] Config file exists and is read (factory root paths, default model, per-stage model mapping structure, rework/retry budgets) with sane defaults
+- [x] SQLite state is queryable for item id, stage, status, attempts, parked reason, and artifact paths (future web UI reads this directly)
+- [x] `wb status` output lists all items and their current state, including items parked/failed for reasons
+- [x] Scenario tests cover claim, move, idempotency, and malformed-front-matter parking against a real temporary filesystem and real SQLite

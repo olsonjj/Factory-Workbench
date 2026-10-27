@@ -6,9 +6,9 @@
 
 **Status:** ready-for-agent
 
-- [ ] A gate failure records the failure report, routes feedback to the previous stage, and re-runs it; the loop is visible in the item's history
-- [ ] After the configured number of total gate attempts (default 3), the item parks with every round's report attached and a parked-reason of exhausted-rework
-- [ ] A pass after rework continues the pipeline normally, with the full rework history retained in the item record
-- [ ] Infra-style transient failures retry automatically with backoff under a separate budget; exhaustion parks the item with a distinct parked-reason, without consuming gate attempt budget
-- [ ] Both budgets are configurable from the config file
-- [ ] Scenario tests (hermetic, deterministic fakes): pass-first-time; reject-then-pass rework; reject-reject-reject → parked with 3 rounds of history; flaky-infra → recovers via retry; always-failing-infra → parked with infra reason; mixed gate+infra failure patterns keep the budgets independent
+- [x] A gate failure records the failure report, routes feedback to the previous stage, and re-runs it; the loop is visible in the item's history
+- [x] After the configured number of total gate attempts (default 3), the item parks with every round's report attached and a parked-reason of exhausted-rework
+- [x] A pass after rework continues the pipeline normally, with the full rework history retained in the item record
+- [x] Infra-style transient failures retry automatically with backoff under a separate budget; exhaustion parks the item with a distinct parked-reason, without consuming gate attempt budget
+- [x] Both budgets are configurable from the config file
+- [x] Scenario tests (hermetic, deterministic fakes): pass-first-time; reject-then-pass rework; reject-reject-reject → parked with 3 rounds of history; flaky-infra → recovers via retry; always-failing-infra → parked with infra reason; mixed gate+infra failure patterns keep the budgets independent

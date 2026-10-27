@@ -131,7 +131,7 @@ Human-in-the-loop is configurable per item and per stage: as items gain my trust
 ## Out of Scope
 
 - Web status UI (schema designed to permit it; construction deferred).
-- Daemon/watch mode (`factory watch` as a loop around the tick verbs; deferred).
+- Daemon/watch mode (`wb watch` as a loop around the tick verbs; deferred).
 - pi-durable as the orchestration layer (revisit trigger: needing long-lived durable conversations, or rebuilding its task graph).
 - Separate security-review and general-code-review agents (single review gate in MVP; split later).
 - Parallel execution across repos (repo-lock concept exists; scheduler work deferred).

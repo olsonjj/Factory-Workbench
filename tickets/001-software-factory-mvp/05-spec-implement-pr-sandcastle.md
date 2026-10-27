@@ -6,12 +6,12 @@
 
 **Status:** ready-for-agent
 
-- [ ] A fully autonomous item (no approvals front-matter, well-formed description targeting a real local repo) produces a GitHub PR whose diff matches a reasonable reading of the item request — without any command other than `wb run`/`wb resume`
-- [ ] Spec is saved as an item artifact and its content is grounded in the actual repo (agent works in a worktree, never the host working copy)
-- [ ] Implementation commits land on a named per-item branch inside a bind-mounted Docker sandbox (OrbStack-compatible); the host filesystem is untouched beyond worktree/git plumbing
-- [ ] The branch is pushed and a PR created with body assembled from the request, spec, and artifact index; draft vs ready-for-review follows the item's approvals front-matter
-- [ ] The factory never merges; PR creation is the item's terminal step
-- [ ] Agent stages require no network access beyond what Sandcastle/git/gh plumbing provides
-- [ ] Model/stage config is honored from the config file (per-stage mapping structure, single default model for all stages)
-- [ ] One Sandcastle adapter integration test exists behind a Docker-availability gate; all other tests above the seam remain hermetic
-- [ ] Manual verification documented: a demo item from this repo's example produces a PR on a test repo
+- [x] A fully autonomous item (no approvals front-matter, well-formed description targeting a real local repo) produces a GitHub PR whose diff matches a reasonable reading of the item request — without any command other than `wb run`/`wb resume`
+- [x] Spec is saved as an item artifact and its content is grounded in the actual repo (agent works in a worktree, never the host working copy)
+- [x] Implementation commits land on a named per-item branch inside a bind-mounted Docker sandbox (OrbStack-compatible); the host filesystem is untouched beyond worktree/git plumbing
+- [x] The branch is pushed and a PR created with body assembled from the request, spec, and artifact index; draft vs ready-for-review follows the item's approvals front-matter
+- [x] The factory never merges; PR creation is the item's terminal step
+- [x] Agent stages require no network access beyond what Sandcastle/git/gh plumbing provides
+- [x] Model/stage config is honored from the config file (per-stage mapping structure, single default model for all stages)
+- [x] One Sandcastle adapter integration test exists behind a Docker-availability gate; all other tests above the seam remain hermetic
+- [x] Manual verification documented: a demo item from this repo's example produces a PR on a test repo
