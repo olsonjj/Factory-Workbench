@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
+import { mkdtempSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -33,7 +34,9 @@ let repoDir: string;
 d("integration: sandcastle adapter (requires docker + OLLAMA_API_KEY)", () => {
   beforeAll(() => {
     harness = createHarness();
-    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "factory-int-repo-"));
+    // Sandcastle mounts the parent .git at the literal path it is given while
+    // git records realpaths — a /var symlinked fixture would dangle in-container.
+    repoDir = mkdtempSync(path.join(os.tmpdir(), "factory-int-repo-"));
     const git = (args: string[]): void => execFileSync("git", args, { cwd: repoDir });
     fs.writeFileSync(path.join(repoDir, "README.md"), "# integration repo\n");
     fs.writeFileSync(path.join(repoDir, "package.json"), JSON.stringify({ name: "x", scripts: { test: "node -e \"console.log('ok')\"" } }));

@@ -33,7 +33,7 @@ export interface FactoryConfig {
   sandbox: SandboxConfig;
 }
 
-export const DEFAULT_MODEL = "deepseek-v4-pro";
+export const DEFAULT_MODEL = "deepseek-v4-pro:0813";
 
 export const DEFAULT_CONFIG: Omit<FactoryConfig, "root"> = {
   models: {

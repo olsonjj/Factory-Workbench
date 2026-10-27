@@ -81,11 +81,11 @@ Pipeline: **triage → spec → implement → test → review → pull-request**
 {
   "root": "/path/to/factory",
   "models": {
-    "default": "deepseek-v4-pro",
-    "triage": "deepseek-v4-pro",
-    "spec": "deepseek-v4-pro",
-    "implement": "deepseek-v4-pro",
-    "test": "deepseek-v4-pro",
+    "default": "deepseek-v4-pro:0813",
+    "triage": "deepseek-v4.1-flash",
+    "spec": "deepseek-v4-pro:0813",
+    "implement": "deepseek-v4-pro:0813",
+    "test": "deepseek-v4.1-flash",
     "review": "glm-5.3-flash"
   },
   "budgets": { "maxGateAttempts": 3, "maxInfraRetries": 3, "retryBackoffMs": 5000 },

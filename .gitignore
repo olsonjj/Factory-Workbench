@@ -1,4 +1,6 @@
 node_modules/
 dist/
 factory/
-*.tsbuildinfo
+*.tsbuildinfo.sandcastle/
+pi-config/
+.sandcastle/

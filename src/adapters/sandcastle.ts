@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
 import { z } from "zod";
-import { createWorktree, pi, Output } from "@ai-hero/sandcastle";
+import { createWorktree, pi } from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import type { Worktree, RunResult } from "@ai-hero/sandcastle";
 
@@ -43,6 +43,114 @@ const ReviewVerdict = z.object({
 
 const COMPLETE = "When you are done, emit `<promise>COMPLETE</promise>` as the final line of your output.";
 
+/**
+ * pi runs in `--mode json`, so the agent's raw stdout is JSONL — escaped — and
+ * Sandcastle's built-in structured-output extraction (which scans raw stdout
+ * for <tag>...</tag>) cannot find clean content in it. We instead extract from
+ * the parsed stream text and validate with zod ourselves. Missing/unparseable
+ * structured output is an infra-class failure (retried under the infra budget).
+ */
+export class StructuredOutputParseError extends Error {
+  constructor(tag: string, cause: unknown) {
+    super(`Structured output <${tag}> missing or invalid: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "StructuredOutputParseError";
+  }
+}
+
+function lastIterationText(result: RunResult): string {
+  const last = [...(result.iterations ?? [])].reverse().find((i) => typeof (i as { result?: unknown }).result === "string");
+  return ((last as { result?: string } | undefined)?.result ?? "");
+}
+
+/**
+ * pi 1.4 changed its `--mode json` stream format (sandcastle 0.12's parser
+ * predates it), so the stream-derived result text may be empty. The sandboxed
+ * pi writes its session file through our staged ~/.pi/agent mount — read the
+ * last assistant message from the newest session file written since the run
+ * started.
+ */
+function assistantTextFromSessions(sessionsDir: string, sinceMs: number): string | undefined {
+  let newest: { file: string; mtime: number } | undefined;
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        const mtime = fs.statSync(full).mtimeMs;
+        if (mtime >= sinceMs && (!newest || mtime > newest.mtime)) newest = { file: full, mtime };
+      }
+    }
+  };
+  if (!fs.existsSync(sessionsDir)) return undefined;
+  try {
+    walk(sessionsDir);
+  } catch {
+    return undefined;
+  }
+  if (!newest) return undefined;
+  const parts: string[] = [];
+  for (const line of fs.readFileSync(newest.file, "utf8").split("\n")) {
+    if (!line.startsWith("{")) continue;
+    try {
+      const rec = JSON.parse(line) as {
+        type?: string;
+        message?: { role?: string; content?: { type?: string; text?: string }[] };
+      };
+      if (rec.type !== "message" || rec.message?.role !== "assistant") continue;
+      for (const block of rec.message.content ?? []) {
+        if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
+      }
+    } catch {
+      continue;
+    }
+  }
+  const text = parts.join("\n").trim();
+  return text.length > 0 ? text : undefined;
+}
+
+function extractTagContent(text: string, tag: string): string | undefined {
+  const openTag = `<${tag}>`;
+  const closeTag = `</${tag}>`;
+  let last: string | undefined;
+  let from = 0;
+  for (;;) {
+    const openIdx = text.indexOf(openTag, from);
+    if (openIdx === -1) break;
+    const start = openIdx + openTag.length;
+    const closeIdx = text.indexOf(closeTag, start);
+    if (closeIdx === -1) break;
+    last = text.slice(start, closeIdx);
+    from = closeIdx + closeTag.length;
+  }
+  return last;
+}
+
+export function parseStructured<T>(result: RunResult, tag: string, schema: z.ZodType<T>, agentText?: string): T {
+  const raw = extractTagContent(agentText || lastIterationText(result), tag);
+  if (raw === undefined) {
+    throw new StructuredOutputParseError(tag, "tag not found in agent output");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.trim());
+  } catch (cause) {
+    throw new StructuredOutputParseError(tag, cause);
+  }
+  const check = schema.safeParse(parsed);
+  if (!check.success) {
+    throw new StructuredOutputParseError(tag, check.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "));
+  }
+  return check.data;
+}
+
+export function parseStructuredString(result: RunResult, tag: string, agentText?: string): string {
+  const raw = extractTagContent(agentText || lastIterationText(result), tag);
+  if (raw === undefined) {
+    throw new StructuredOutputParseError(tag, "tag not found in agent output");
+  }
+  return raw.trim();
+}
+
 const TRUST_BUT_VERIFY =
   "Knowledge-base entries are observations from past factory runs; they may be stale. " +
   "Verify any KB fact against the current repository state before relying on it, and note (do not silently trust) conflicts.";
@@ -56,14 +164,44 @@ interface SandcastleRunnerDeps {
   env?: Record<string, string>;
 }
 
+export const NPM_GLOBAL_PREFIX = "/home/agent/.npm-global";
+
+/** Env injected into the sandboxed pi process (and its npm children). */
+export function piEnvFor(piConfig: { npmGlobalPrefixMount: boolean }): Record<string, string> {
+  return piConfig.npmGlobalPrefixMount ? { npm_config_prefix: NPM_GLOBAL_PREFIX } : {};
+}
+
 export class SandcastleStageRunner implements StageRunner {
   private readonly config: FactoryConfig;
   private readonly env: Record<string, string>;
   private readonly worktrees = new Map<string, Worktree>();
+  private readonly piEnv: Record<string, string>;
+  private readonly piConfigMounts: { hostPath: string; sandboxPath: string; readonly?: true }[];
+  private runStartedAt = 0;
+
+  /** Assistant text from the sandboxed pi session, with stream-parse fallback. */
+  private agentText(result: RunResult): string | undefined {
+    const stagedAgentDir = this.piConfigMounts[0]?.hostPath;
+    if (stagedAgentDir) {
+      const text = assistantTextFromSessions(path.join(stagedAgentDir, "sessions"), this.runStartedAt);
+      if (text) return text;
+    }
+    return lastIterationText(result) || undefined;
+  }
 
   constructor(deps: SandcastleRunnerDeps) {
     this.config = deps.config;
     this.env = deps.env ?? {};
+    const staged = preparePiConfigDir(deps.config.root);
+    this.piConfigMounts = staged
+      ? [
+          { hostPath: staged.agentDir, sandboxPath: "/home/agent/.pi/agent" },
+          ...(staged.npmGlobalPrefix
+            ? [{ hostPath: staged.npmGlobalPrefix, sandboxPath: NPM_GLOBAL_PREFIX }]
+            : []),
+        ]
+      : [];
+    this.piEnv = { ...this.env, ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefix }) };
   }
 
   async runStage(req: StageRequest): Promise<StageResult> {
@@ -94,28 +232,30 @@ export class SandcastleStageRunner implements StageRunner {
   private async worktreeFor(item: ItemContext): Promise<Worktree> {
     const existing = this.worktrees.get(item.slug);
     if (existing) return existing;
+    // Sandcastle mounts the parent .git at the literal path it is given, but
+    // git records worktree links as realpaths. On macOS a repo under a
+    // symlinked prefix (/tmp, /var/folders, …) would leave the in-container
+    // gitdir chain dangling — pass the resolved real path.
+    const repoRealPath = realRepoPath(item.repo);
     const wt = await createWorktree({
-      cwd: item.repo,
+      cwd: repoRealPath,
       branchStrategy: { type: "branch", branch: item.branchName, baseBranch: item.base },
     });
     this.worktrees.set(item.slug, wt);
     return wt;
   }
 
-  private async wtRun(opts: {
-    wt: Worktree;
-    model: string;
-    prompt: string;
-    output?: unknown;
-  }): Promise<RunResult> {
-    const { wt, model, prompt, output } = opts;
+  private async wtRun(opts: { wt: Worktree; model: string; prompt: string }): Promise<RunResult> {
+    const { wt, model, prompt } = opts;
     return wt.run({
-      agent: pi(model, { env: this.env }),
-      sandbox: docker({ imageName: this.config.sandbox.imageName }),
+      agent: pi(model, { env: this.piEnv }),
+      sandbox: docker({
+        imageName: this.config.sandbox.imageName,
+        ...(this.piConfigMounts.length > 0 ? { mounts: this.piConfigMounts } : {}),
+      }),
       prompt: [prompt, COMPLETE].join("\n\n"),
       maxIterations: 1,
-      ...(output !== undefined ? { output } : {}),
-    } as Parameters<typeof wt.run>[0]);
+    });
   }
 
   // ------------------------------------------------------------- stages
@@ -147,9 +287,8 @@ ${kbBlock}`;
       wt: await this.worktreeFor(req.item),
       model,
       prompt,
-      output: Output.object({ tag: "triage", schema: TriageVerdict }),
     });
-    const v = outputOf<z.infer<typeof TriageVerdict>>(result);
+    const v = parseStructured(result, "triage", TriageVerdict, this.agentText(result));
     if (v.outcome === "reject") {
       return { outcome: "reject", artifacts: [{ name: "triage-report", content: v.report }], report: v.report };
     }
@@ -187,8 +326,9 @@ ${req.kb.global || "(none)"}
 Project:
 ${req.kb.project || "(none)"}`;
 
-    const result = await this.wtRun({ wt, model, prompt, output: Output.string({ tag: "spec" }) });
-    return { outcome: "pass", artifacts: [{ name: "spec", content: outputOf<string>(result) }] };
+    const result = await this.wtRun({ wt, model, prompt });
+    const spec = parseStructuredString(result, "spec", this.agentText(result));
+    return { outcome: "pass", artifacts: [{ name: "spec", content: spec }] };
   }
 
   private async runImplement(req: StageRequest, model: string, wt: Worktree): Promise<StageResult> {
@@ -236,8 +376,8 @@ Return your verdict as JSON inside a <test>...</test> tag:
 - fix: only if you fixed something — what the fix was, generalized so a future run can learn from it
 - lesson: only if tests failed — what went wrong`;
 
-    const result = await this.wtRun({ wt, model, prompt, output: Output.object({ tag: "test", schema: TestVerdict }) });
-    const v = outputOf<z.infer<typeof TestVerdict>>(result);
+    const result = await this.wtRun({ wt, model, prompt });
+    const v = parseStructured(result, "test", TestVerdict, this.agentText(result));
     if (!v.testsPassed) {
       return {
         outcome: "gate-fail",
@@ -268,8 +408,8 @@ Return your verdict as JSON inside a <review>...</review> tag:
 - fix: only when you fail — concrete fix instructions for the implementer
 - prSummary: one line summarizing the outcome of the whole pipeline for this item`;
 
-    const result = await this.wtRun({ wt, model, prompt, output: Output.object({ tag: "review", schema: ReviewVerdict }) });
-    const v = outputOf<z.infer<typeof ReviewVerdict>>(result);
+    const result = await this.wtRun({ wt, model, prompt });
+    const v = parseStructured(result, "review", ReviewVerdict, this.agentText(result));
     if (v.verdict === "fail") {
       return {
         outcome: "gate-fail",
@@ -347,7 +487,24 @@ export class GhPrPublisher {
 }
 
 export class SandcastleCurator implements CuratorRunner {
-  constructor(private readonly deps: { config: FactoryConfig; env?: Record<string, string> }) {}
+  private readonly deps: { config: FactoryConfig; env?: Record<string, string> };
+
+  constructor(deps: { config: FactoryConfig; env?: Record<string, string> }) {
+    this.deps = deps;
+    const staged = preparePiConfigDir(deps.config.root);
+    this.piConfigMounts = staged
+      ? [
+          { hostPath: staged.agentDir, sandboxPath: "/home/agent/.pi/agent" },
+          ...(staged.npmGlobalPrefix
+            ? [{ hostPath: staged.npmGlobalPrefix, sandboxPath: NPM_GLOBAL_PREFIX }]
+            : []),
+        ]
+      : [];
+    this.env = { ...(deps.env ?? {}), ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefix }) };
+  }
+
+  private readonly piConfigMounts: { hostPath: string; sandboxPath: string; readonly?: true }[];
+  private readonly env: Record<string, string>;
 
   async propose(req: CuratorRequest): Promise<StageResult> {
     const { config } = this.deps;
@@ -389,18 +546,24 @@ ${COMPLETE}`;
 
     const result = await this.wtRunScratch({ scratch, model, prompt, mounts });
     fs.rmSync(scratch, { recursive: true, force: true });
-    return { outcome: "pass", artifacts: [{ name: "proposal", content: outputOf<string>(result) }] };
+    const stagedAgentDir = path.join(this.deps.config.root, "pi-config");
+    const text = assistantTextFromSessions(path.join(stagedAgentDir, "sessions"), Date.now() - 600_000)
+      ?? lastIterationText(result);
+    const proposal = parseStructuredString(result, "proposal", text || undefined);
+    return { outcome: "pass", artifacts: [{ name: "proposal", content: proposal }] };
   }
 
   private async wtRunScratch(opts: { scratch: string; model: string; prompt: string; mounts: { hostPath: string; sandboxPath: string; readonly: true }[] }): Promise<RunResult> {
     const { run } = await import("@ai-hero/sandcastle");
     return run({
-      agent: pi(opts.model, { env: this.deps.env ?? {} }),
-      sandbox: docker({ imageName: this.deps.config.sandbox.imageName, mounts: opts.mounts }),
+      agent: pi(opts.model, { env: this.env }),
+      sandbox: docker({
+        imageName: this.deps.config.sandbox.imageName,
+        mounts: [...this.piConfigMounts, ...opts.mounts],
+      }),
       cwd: opts.scratch,
       prompt: opts.prompt,
       maxIterations: 1,
-      output: Output.string({ tag: "proposal" }),
     });
   }
 }
@@ -412,4 +575,89 @@ export function ollamaEnv(): Record<string, string> {
     if (process.env[key]) env[key] = process.env[key]!;
   }
   return env;
+}
+
+/**
+ * pi inside the sandbox is a fresh install: no auth, no custom providers, no
+ * model catalog. Stage the host's pi config (auth.json, models.json,
+ * models-store.json) read-only inside the factory root and point the sandboxed
+ * agent at it via PI_CODING_AGENT_DIR, so it can resolve and call exactly the
+ * model the config file names. (The agent needs the key to call the model
+ * anyway — no new exposure; nothing outside the local factory root.)
+ */
+export interface PiConfigStage {
+  /** Mounted as the sandbox's ~/.pi/agent (credentials, catalog, settings). */
+  agentDir: string;
+  /** Writable npm global root mounted at NPM_GLOBAL_PREFIX, pre-seeded with pi packages. */
+  npmGlobalPrefix: string | null;
+}
+
+/**
+ * Stage the host's pi agent configuration for the sandbox. The containerized
+ * pi (a global install) treats user-scope packages as GLOBAL npm installs and
+ * writes them under the npm global root. We bind a pre-seeded, writable
+ * prefix at /home/agent/.npm-global and point npm_config_prefix at it, so the
+ * packages resolve without any in-container global install attempt.
+ * Sessions land in the factory root (durable, inspectable).
+ */
+export function preparePiConfigDir(factoryRoot: string): PiConfigStage | null {
+  const agentDir = path.join(process.env.HOME ?? "~", ".pi", "agent");
+  const files = ["auth.json", "models.json", "models-store.json", "settings.json"].filter((f) =>
+    fs.existsSync(path.join(agentDir, f)),
+  );
+  if (files.length === 0) return null;
+  const target = path.join(factoryRoot, "pi-config");
+  fs.mkdirSync(target, { recursive: true });
+  fs.mkdirSync(path.join(target, "sessions"), { recursive: true });
+  for (const f of files) {
+    fs.copyFileSync(path.join(agentDir, f), path.join(target, f));
+  }
+
+  // Pre-seed the writable npm global prefix with the packages pi's settings
+  // declare, so the sandbox never needs a global install (root-owned, fails).
+  let npmGlobalPrefix: string | null = null;
+  const settingsPath = path.join(target, "settings.json");
+  let packages: string[] = [];
+  try {
+    packages = (JSON.parse(fs.readFileSync(settingsPath, "utf8")) as { packages?: string[] }).packages ?? [];
+  } catch {
+    packages = [];
+  }
+  if (packages.length > 0) {
+    const hostNpmDir = path.join(agentDir, "npm");
+    if (fs.existsSync(path.join(hostNpmDir, "node_modules", "pi-ollama-cloud")) && hasNpmSpecFor(piOllamaSpecIn(packages))) {
+      // Install each declared package into the staged global prefix.
+      npmGlobalPrefix = path.join(target, "npm-global");
+      fs.mkdirSync(npmGlobalPrefix, { recursive: true });
+      const specs = packages
+        .map((p) => (p.startsWith("npm:") ? p.slice(4) : p))
+        .map((spec) => (spec.includes("@", 1) ? spec : `${spec}@latest`));
+      try {
+        execFileSync(
+          "npm",
+          ["install", "-g", "--prefix", npmGlobalPrefix, "--legacy-peer-deps", "--no-audit", "--no-fund", ...specs],
+          { timeout: 180_000, stdio: "pipe" },
+        );
+      } catch {
+        // Best-effort; without it pi retries a global install in-container.
+      }
+    }
+  }
+  return { agentDir: target, npmGlobalPrefix };
+}
+
+function piOllamaSpecIn(packages: string[]): boolean {
+  return packages.some((p) => p.includes("pi-ollama-cloud"));
+}
+
+function hasNpmSpecFor(_present: boolean): boolean {
+  return _present;
+}
+
+function realRepoPath(repo: string): string {
+  try {
+    return fs.realpathSync(repo);
+  } catch {
+    return repo;
+  }
 }
