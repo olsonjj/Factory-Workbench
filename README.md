@@ -16,7 +16,13 @@ Ollama Cloud.
 ```bash
 npm install
 npm run build          # tsc -> dist
+# Optional: the true global verb (spec register: `wb`)
+npm link               # exposes `wb` on your PATH
+# During development on wb itself, use `npm run wb -- run` (tsx, no rebuild).
 ```
+
+Note: `npm link` is inside your node version install (mise) — re-run it after
+upgrading Node. Without a link, invoke via `npm run wb -- <verb>`.
 
 Initialize a factory root (self-contained and movable):
 
@@ -31,7 +37,7 @@ per-project knowledge base), `proposals/`, `logs/`, and `factory.db` (SQLite).
 
 ## Usage
 
-Write a work item (see `npx wb template`):
+Write a work item (see `wb template`):
 
 ```markdown
 ---
@@ -47,13 +53,13 @@ Describe the task. This file is the item's source of truth.
 Drop it into `factory/inbox/`, then:
 
 ```bash
-npx wb run      # claim inbox + advance every actionable item one stage
-npx wb resume   # drive interrupted/human-rejected items until parked or done
-npx wb status   # everything the factory is doing, waiting on, or blocked by
-npx wb approve <id>          # release a parked approval gate
-npx wb reject <id> --reason "fix the X"   # feedback feeds the next agent run
-npx wb answer <id> -a "..."  # answer parked triage questions; triage re-runs
-npx wb curate [project]      # on-demand KB curation proposal (read-only)
+wb run      # claim inbox + advance every actionable item one stage
+wb resume   # drive interrupted/human-rejected items until parked or done
+wb status   # everything the factory is doing, waiting on, or blocked by
+wb approve <id>          # release a parked approval gate
+wb reject <id> --reason "fix the X"   # feedback feeds the next agent run
+wb answer <id> -a "..."  # answer parked triage questions; triage re-runs
+wb curate [project]      # on-demand KB curation proposal (read-only)
 ```
 
 Pipeline: **triage → spec → implement → test → review → pull-request**.
