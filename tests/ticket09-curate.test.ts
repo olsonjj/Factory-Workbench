@@ -163,6 +163,22 @@ describe("ticket 09: curator pass for the knowledge base", () => {
     expect(partial).toContain("finding from this batch");
   });
 
+  it("saving proposals never leaves temp files, and the swap is atomic over the target", async () => {
+    harness = createHarness();
+    seedWorld(harness);
+    harness.config.kb.maxGlobalChars = 400;
+    const entries = [1, 2, 3, 4]
+      .map((n) => `## 2026-10-27 — failed-gate (repo ${n})\n\n${"lesson ".repeat(40)}\n\n`)
+      .join("");
+    harness.writeFile(globalKbFile(harness.paths), entries);
+    const curator = new FakeCurator();
+    const orch = makeOrchestrator(harness, new (await import("./helpers.js")).ScriptedRunner({}), { curator });
+    await orch.curate();
+    const { readdirSync } = await import("node:fs");
+    const names = readdirSync(harness.root + "/proposals");
+    expect(names.filter((f) => f.includes(".tmp-"))).toEqual([]);
+  });
+
   it("a human applying the proposal edits KB files directly; a subsequent run uses the curated content", async () => {
     harness = createHarness();
     seedWorld(harness);

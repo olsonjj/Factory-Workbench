@@ -253,7 +253,15 @@ export class Orchestrator {
     const dir = this.paths.proposals;
     mkdirSync(dir, { recursive: true });
     const abs = path.join(dir, name);
-    const save = (content: string): void => writeFileSync(abs, content, "utf8");
+    // Save via temp-file + atomic rename: writeFileSync truncates the
+    // destination in place, so a crash or disk-full mid-save could erase the
+    // only copy of earlier batches' proposals. rename over the target is
+    // atomic — the operator's saved proposals are never half-written.
+    const tmp = `${abs}.tmp-${process.pid}`;
+    const save = (content: string): void => {
+      writeFileSync(tmp, content, "utf8");
+      renameSync(tmp, abs);
+    };
     const file = path.relative(this.paths.root, abs);
 
     if (batches === 1) {
