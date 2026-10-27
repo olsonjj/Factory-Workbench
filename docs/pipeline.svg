@@ -109,7 +109,7 @@
     <text x="847" y="129" class="n">6 · HOST</text>
     <text x="847" y="149" class="t">pull request</text>
     <text x="847" y="168" class="d">branch pushed; PR body is</text>
-    <text x="847" y="182" class="d">the item's audit trail</text>
+    <text x="847" y="182" class="d">Summary · Evidence · Merge Danger</text>
   </g>
   <rect x="835" y="268" width="150" height="20" rx="6" class="tagg"/>
   <text x="910" y="281.5" text-anchor="middle" class="greent">never merges</text>

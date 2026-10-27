@@ -10,7 +10,7 @@ I want a "software factory": a system where I drop in a markdown task file and a
 
 A small, sequentially-processing software factory built on `pi` (as the agent harness inside sandboxes) and Sandcastle (for Docker-based sandboxing, git worktrees, and branch strategy). Work is ingested by dropping markdown files into an inbox folder. Each file is the durable source of truth for a work item; a SQLite-backed state machine tracks its progress through the pipeline: **triage → spec → implement → test → review → pull request**.
 
-The factory is a local CLI with tick-based execution (`wb run` / `wb resume`), not a daemon. Agents never touch my filesystem — every stage runs in a Sandcastle Docker sandbox bound to a git worktree of the target repo, and commits land on a named branch. The final stage creates a GitHub pull request whose body is an audit trail assembled from the pipeline's artifacts; the factory never merges.
+The factory is a local CLI with tick-based execution (`wb run` / `wb resume`), not a daemon. Agents never touch my filesystem — every stage runs in a Sandcastle Docker sandbox bound to a git worktree of the target repo, and commits land on a named branch. The final stage creates a GitHub pull request whose body follows the PR-skill template (Summary, Evidence, Merge Danger); the factory never merges.
 
 Human-in-the-loop is configurable per item and per stage: as items gain my trust I remove approval gates from the front-matter, and the factory takes more of the pipeline AFK. A dated, append-only markdown knowledge base (global + per-project) lets stages learn from failed gates and rework rounds, with an on-demand curator pass to keep it from going stale.
 
@@ -44,7 +44,7 @@ Human-in-the-loop is configurable per item and per stage: as items gain my trust
 26. As a factory operator, I want to see all items and their states via a status command, so that I always know what the factory is doing, waiting on, or blocked by — including why.
 27. As a factory operator, I want to approve or reject a parked item with an optional reason, so that my decision — including feedback — drives the next stage.
 28. As a factory operator, I want a rejected/parked feedback reason to be fed into the next agent run, so that my corrections actually change behavior rather than merely halting work.
-29. As a factory operator, I want PR creation as the terminal stage, with the PR body assembled from the item's artifacts (request, spec, review verdict, rework history), so that every PR is a self-contained audit trail.
+29. As a factory operator, I want PR creation as the terminal stage, with the PR body following the PR-skill template (a Summary of what changed and why, an Evidence section with concrete facts and artifact digests, and a Merge Danger note), so that I can quickly decide whether to merge.
 30. As a factory operator, I want draft PRs for items with approval gates configured and ready-for-review PRs for fully autonomous items, so that the PR itself signals how much human oversight the item had.
 31. As a factory operator, I want the factory to never merge a PR, so that the merge decision always remains mine.
 32. As a factory operator, I want a per-stage model mapping in one config file, so that I can dial cost and quality per stage as models change.
@@ -82,7 +82,7 @@ Human-in-the-loop is configurable per item and per stage: as items gain my trust
 - Review gate covers code quality, security, and best practices in a single agent (splitting into separate security and review agents is a later addition, not a change).
 - Gate failure → feedback to prior stage → at most three total attempts per gate → exhausted budget parks the item with full failure history.
 - Transient infra failures (model errors, sandbox flakes) retry with backoff up to three attempts with a separate budget from gate judgments; exhaustion parks the item with a parked-reason.
-- The final stage pushes the item's branch and creates a GitHub PR via `gh`; draft PR when the item has approval gates configured, ready-for-review when fully autonomous. The factory never merges. PR body is assembled from item artifacts (original request, spec, review verdict, rework history, outcome summary).
+- The final stage pushes the item's branch and creates a GitHub PR via `gh`; draft PR when the item has approval gates configured, ready-for-review when fully autonomous. The factory never merges. The PR body follows the PR-skill template — Summary (spec summary + diff stat), Evidence (test/review/commit digests + artifact list), and Merge Danger (door + blast radius + artifact directory pointer).
 
 **Human-in-the-loop**
 
