@@ -249,34 +249,65 @@ export class Orchestrator {
     const batches = Math.max(globalChunks.length, projectChunks.length, 1);
     const proposalOf = (r: StageResult): string => r.artifacts[0]?.content ?? r.feedback ?? r.report ?? "(empty proposal)";
     const ts = stamp();
-    let content: string;
+    const name = `curate-${ts}${projects.length === 1 ? `-${projects[0]}` : ""}.md`;
+    const dir = this.paths.proposals;
+    mkdirSync(dir, { recursive: true });
+    const abs = path.join(dir, name);
+    const save = (content: string): void => writeFileSync(abs, content, "utf8");
+    const file = path.relative(this.paths.root, abs);
+
     if (batches === 1) {
-      const result = await this.curator.propose({ projects: wanted, kb, repoPaths });
-      content = proposalOf(result);
-    } else {
-      const sections: string[] = [];
-      for (let i = 0; i < batches; i++) {
-        const slice: KbSnapshot = {
-          global: globalChunks[i] ?? "",
-          project: projectChunks[i] ?? "",
-        };
+      // Build the request from the computed chunks even for a single batch: a
+      // lone entry larger than the budget was boundary-truncated by
+      // chunkKbLayer, and the full uncapped layer must not bypass that bound.
+      const result = await this.curator.propose({
+        projects: wanted,
+        kb: { global: globalChunks[0] ?? "", project: projectChunks[0] ?? "" },
+        repoPaths,
+      });
+      const content = proposalOf(result);
+      save(content);
+      return { file, proposal: content };
+    }
+
+    const note = (status: string): string =>
+      `> ${status} The knowledge base exceeded its prompt budget and was reviewed in ${batches} entry-aligned batches. Findings spanning batch boundaries are possible — cross-check batches 1..${batches} manually before applying.\n\n`;
+    const sections: string[] = [];
+    for (let i = 0; i < batches; i++) {
+      const slice: KbSnapshot = {
+        global: globalChunks[i] ?? "",
+        project: projectChunks[i] ?? "",
+      };
+      let proposal: string;
+      try {
         const result = await this.curator.propose({
           projects: wanted,
           kb: slice,
           repoPaths,
           batch: { index: i + 1, total: batches },
         });
-        sections.push(`# curation batch ${i + 1} of ${batches}\n\n${proposalOf(result)}`);
+        proposal = proposalOf(result);
+      } catch (err) {
+        const done = sections.length;
+        if (done > 0) {
+          // Completed batches are persisted even when a later batch fails —
+          // each is a paid agent run the operator should not have to repeat.
+          save(note(`INCOMPLETE: ${done} of ${batches} batches completed; re-run after fixing the failure.`) + sections.join("\n\n---\n\n"));
+        }
+        throw new Error(
+          `curation batch ${i + 1} of ${batches} failed: ${err instanceof Error ? err.message : String(err)}` +
+            (done > 0 ? ` — proposals from completed batches saved in ${file}` : " — no batches had completed; nothing to save"),
+        );
       }
-      const batched = sections.join("\n\n---\n\n");
-      content = `> NOTE: the knowledge base exceeded its prompt budget and was reviewed in ${batches} entry-aligned batches. Findings span batch boundaries are possible — cross-check batches 1..${batches} manually before applying.\n\n${batched}`;
+      sections.push(`# curation batch ${i + 1} of ${batches}\n\n${proposal}`);
+      if (i < batches - 1) {
+        // Incremental persistence after every batch for the same reason.
+        save(note(`PARTIAL: ${sections.length} of ${batches} batches completed so far.`) + sections.join("\n\n---\n\n"));
+      }
     }
-    const name = `curate-${ts}${projects.length === 1 ? `-${projects[0]}` : ""}.md`;
-    const dir = this.paths.proposals;
-    mkdirSync(dir, { recursive: true });
-    const abs = path.join(dir, name);
-    writeFileSync(abs, content, "utf8");
-    return { file: path.relative(this.paths.root, abs), proposal: content };
+    const content = note("NOTE") + sections.join("\n\n---\n\n");
+    save(content);
+    return { file, proposal: content };
   }
 
   /** Release runner-held resources (worktrees, mounts) before the DB closes. */
