@@ -13,23 +13,11 @@ Ollama Cloud.
 
 ## How it flows
 
-```mermaid
-flowchart LR
-    INBOX["inbox/<br>drop a .md file"] -->|"claim"| TRI{triage}
-    TRI -->|"proceed"| SPEC[spec]
-    TRI -->|"reject"| ARCH["archive/<br>resurrectable"]
-    TRI -->|"needs-human"| ANS["parked +<br>questions"]
-    ANS -->|"wb answer,<br>re-run"| TRI
-    SPEC --> IMPL[implement]
-    IMPL --> TEST[test]
-    TEST -->|"failures<br>as feedback"| IMPL
-    TEST -->|"pass"| REV{review}
-    REV -->|"findings<br>as feedback"| IMPL
-    REV -->|"pass"| PR["GitHub PR<br>body = audit trail"]
-    TEST & REV -->|"budget<br>exhausted"| PARK["parked +<br>full history"]
-    PR --> READY["ready-for-review<br>(autonomous item)"]
-    PR --> DRAFT["draft<br>(approval-gated item)"]
-```
+<p align="center">
+  <img src="docs/pipeline.svg"
+       alt="Pipeline: you drop a markdown item into the inbox; triage proceeds, archives, or parks for answers; spec, implement follow; test and review gates feed failed-gate findings back to implement (max 3 attempts per gate) and then park; the terminal stage pushes the branch and opens a GitHub PR whose body is the item's audit trail — ready-for-review for autonomous items, draft for approval-gated ones; the factory never merges"
+       width="100%">
+</p>
 
 - **Approval gates:** any stage named in the item's `approvals:` front-matter
   parks for your decision right after completing — `wb status` shows it
@@ -38,8 +26,6 @@ flowchart LR
 - **Infra failures are not gates:** model timeouts and sandbox flakes retry
   with backoff under their own budget; a flaky network never consumes a work
   item's rework rounds.
-- **The factory never merges.** PR creation is the terminal stage; the merge
-  decision is always yours.
 
 ## Prerequisites
 
