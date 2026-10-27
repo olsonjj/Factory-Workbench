@@ -34,10 +34,9 @@ wb resume  # finish the run: pushes `factory/<slug>` and opens the PR
 
 # 4. Verify
 gh pr list --repo <greeter-repo>          # PR exists, body contains:
-#   - the original request markdown
-#   - the spec artifact
-#   - the review verdict artifact
-#   - rework history ("None — first pass." for a clean run)
+#   - ## Summary (what changed and why, plus the diff stat)
+#   - ## Evidence (test/review/commit digests + artifact list)
+#   - ## Merge Danger (door, blast radius, artifacts: items/<slug>/artifacts/)
 git -C /path/to/greeter-repo log --oneline factory/<slug>   # commits on the branch
 wb status    # item is `done`; PR list shows ready-for-review (no --draft flag)
 

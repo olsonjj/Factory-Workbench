@@ -15,7 +15,7 @@ Ollama Cloud.
 
 <p align="center">
   <img src="docs/pipeline.svg"
-       alt="Pipeline: you drop a markdown item into the inbox; triage proceeds, archives, or parks for answers; spec, implement follow; test and review gates feed failed-gate findings back to implement (max 3 attempts per gate) and then park; the terminal stage pushes the branch and opens a GitHub PR whose body is the item's audit trail — ready-for-review for autonomous items, draft for approval-gated ones; the factory never merges"
+       alt="Pipeline: you drop a markdown item into the inbox; triage proceeds, archives, or parks for answers; spec, implement follow; test and review gates feed failed-gate findings back to implement (max 3 attempts per gate) and then park; the terminal stage pushes the branch and opens a GitHub PR whose body follows the PR-skill template (Summary, Evidence, Merge Danger) — ready-for-review for autonomous items, draft for approval-gated ones; the factory never merges"
        width="100%">
 </p>
 
@@ -131,9 +131,10 @@ Pipeline: **triage → spec → implement → test → review → pull-request**
   distinct reason. A flaky network never consumes rework rounds.
 - Approval-gated items produce **draft** PRs; fully autonomous items produce
   ready-for-review PRs. The factory never merges.
-- PR bodies are assembled from the item's artifacts (request, spec, review
-  verdict, rework history, artifact index) — every PR is a self-contained
-  audit trail.
+- PR bodies follow the PR-skill template — a short Summary (what changes and
+  why, plus a diff stat), an Evidence section with artifact digests, and a
+  Merge Danger note with a pointer to the item's artifact directory. The
+  stage-by-stage chronology stays in the artifacts, not the PR body.
 
 ## Configuration
 

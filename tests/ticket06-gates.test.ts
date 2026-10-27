@@ -74,7 +74,7 @@ describe("ticket 06: test stage + review gate + real rework loop", () => {
     expect(runner.stageCallCounts.get("review")).toBe(2);
   });
 
-  it("the review verdict is saved as an artifact and lands in the PR body audit trail", async () => {
+  it("the review verdict is saved as an artifact and lands in the PR body review surface", async () => {
     harness = createHarness();
     dropItem(harness);
     const publisher = (await import("./helpers.js")).FakePublisher;
@@ -86,7 +86,7 @@ describe("ticket 06: test stage + review gate + real rework loop", () => {
     await orch.resume();
     const req = fakePublisher.published[0]!;
     expect(req.body).toContain("# verdict: pass");
-    expect(req.body).toContain("## Review verdict");
+    expect(req.body).toContain("## Evidence");
   });
 
   it("both gates failing in different orders behaves deterministically (review fails, then test fails, then pass)", async () => {

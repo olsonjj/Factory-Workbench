@@ -13,7 +13,7 @@ function dropItem(h: TestHarness, frontMatter: Record<string, unknown> = {}): vo
 }
 
 describe("ticket 05: spec → implement → PR", () => {
-  it("an autonomous item ends with a ready-for-review PR whose body is the audit trail", async () => {
+  it("an autonomous item ends with a ready-for-review PR whose body follows the PR-skill template", async () => {
     harness = createHarness();
     dropItem(harness);
     const publisher = new FakePublisher();
@@ -33,14 +33,40 @@ describe("ticket 05: spec → implement → PR", () => {
     expect(req.draft).toBe(false);
     expect(req.branchName).toBe("factory/task");
     expect(req.base).toBe("main");
-    // PR body assembled from artifacts: request, spec, review, rework history
-    expect(req.body).toContain("# Ship the feature");
-    expect(req.body).toContain("Ship it.");
-    expect(req.body).toContain("## Spec");
-    expect(req.body).toContain("# spec output");
-    expect(req.body).toContain("## Review verdict");
-    expect(req.body).toContain("## Artifact index");
-    expect(req.body).toContain("None — first pass.");
+
+    const body = req.body;
+    // Three template sections, in order, no audit-trail headings
+    expect(body).toContain("## Summary");
+    expect(body).toContain("## Evidence");
+    expect(body).toContain("## Merge Danger");
+    expect(body.indexOf("## Summary")).toBeLessThan(body.indexOf("## Evidence"));
+    expect(body.indexOf("## Evidence")).toBeLessThan(body.indexOf("## Merge Danger"));
+    expect(body).not.toContain("## Request");
+    expect(body).not.toContain("## Spec");
+    expect(body).not.toContain("## Review verdict");
+    expect(body).not.toContain("## Rework history");
+    expect(body).not.toContain("## Artifact index");
+    // Summary carries the spec summary (what changes and why)
+    expect(body).toContain("spec output");
+    // Evidence references at least one artifact under the run's artifact dir
+    expect(body).toMatch(/items\/task\/artifacts\//);
+    // footer points at the artifact directory
+    expect(body).toContain("artifacts: items/task/artifacts/");
+    // no stage-by-stage chronology bullet list
+    expect(body).not.toMatch(/stage-gate-fail|stage-retry/);
+  });
+
+  it("the PR body has exactly the three template sections, in order", async () => {
+    harness = createHarness();
+    dropItem(harness);
+    const publisher = new FakePublisher();
+    const runner = new ScriptedRunner({});
+    const orch = makeOrchestrator(harness, runner, { publisher });
+    await orch.resume();
+    const body = publisher.published[0]!.body;
+    const headings = body.split("\n").filter((l) => l.startsWith("## "));
+    expect(headings).toEqual(["## Summary", "## Evidence", "## Merge Danger"]);
+    expect(body).toMatch(/items\/task\/artifacts\//);
   });
 
   it("a draft PR is created when the item has approvals front-matter; ready PR when autonomous", async () => {

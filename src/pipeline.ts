@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { mkdirSync, renameSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { ACTIONABLE_STATUSES, APPROVAL_STAGES, GATE_STAGES, STAGES, type CuratorRunner, type ItemContext, type ItemRecord, type ItemStatus, type KbSnapshot, type PrPublishResult, type StageName, type StageResult, type StageRunner } from "./types.js";
 import type { FactoryDb } from "./db.js";
 import type { FactoryPaths } from "./paths.js";
@@ -485,35 +486,56 @@ export class Orchestrator {
     const artifacts = this.db.getArtifacts(item.id);
     const read = (rel: string): string => {
       const abs = path.join(this.paths.root, rel);
-      return existsSync(abs) ? readFileSync(abs, "utf8") : "(missing)";
+      return existsSync(abs) ? readFileSync(abs, "utf8") : "";
     };
-    const find = (needle: string): string | undefined => {
-      const a = artifacts.find((x) => x.name.toLowerCase().includes(needle) || x.stage === needle);
-      return a ? read(a.path) : undefined;
+    // Exact-name structured lookups — never fuzzy substring over logs.
+    const latest = (name: string): string => {
+      const a = [...artifacts].reverse().find((x) => x.name === name);
+      return a ? read(a.path) : "";
     };
-    const request = item.sourceFile && existsSync(item.sourceFile) ? readFileSync(item.sourceFile, "utf8") : "(missing)";
-    const spec = find("spec");
-    const review = find("review");
+
+    const spec = latest("spec");
+    const testReport = latest("test-report");
+    const reviewVerdict = latest("review-verdict");
+    const implementLog = latest("implement-log");
+
+    let fallbackBody = "";
+    if (item.sourceFile && existsSync(item.sourceFile)) {
+      const parsed = parseItemMarkdown(readFileSync(item.sourceFile, "utf8"));
+      if (parsed.ok) fallbackBody = parsed.item.body;
+    }
+
+    const summary = leadParagraph(spec, fallbackBody);
+    const diffStat = computeDiffStat(resolveRepoPath(item.repo), item.base, item.branchName);
+    const artDir = `${path.relative(this.paths.root, artifactDir(this.paths, item.slug))}/`;
 
     const lines: string[] = [];
-    lines.push(`# ${item.title}`, "");
-    lines.push(`Item \`${item.slug}\` (#${item.id}) — produced by the software factory. Factory never merges: review, then merge yourself.`, "");
-    lines.push("## Request", "", "```markdown", request.trim(), "```", "");
-    if (spec) {
-      lines.push("## Spec", "", spec, "");
+    lines.push("## Summary", "");
+    lines.push(`**${item.title}** — ${summary}`, "");
+    if (diffStat) {
+      lines.push("```text", diffStat, "```", "");
+    } else {
+      lines.push("_diff stat unavailable at PR-body time (repo not reachable)._", "");
     }
-    if (review) {
-      lines.push("## Review verdict", "", review, "");
+
+    lines.push("## Evidence", "");
+    lines.push(`- Test: ${testReport ? digest(testReport) : "(no test artifact)"}`, "");
+    lines.push(`- Review: ${reviewVerdict ? digest(reviewVerdict) : "(no review artifact)"}`, "");
+    lines.push(`- Commits: ${implementLog ? digest(implementLog) : "(no implement artifact)"}`, "");
+    lines.push("Artifacts produced by this run:", "");
+    for (const a of artifacts) {
+      lines.push(`- ${a.name} — \`${a.path}\` — ${digest(read(a.path))}`);
     }
-    lines.push("## Rework history", "");
-    const history = this.db.getHistory(item.id);
-    const rework = history.filter((h) => h.event === "stage-gate-fail" || h.event === "stage-retry" || h.event === "answered" || h.event === "rejected-by-human");
-    if (rework.length === 0) lines.push("None — first pass.", "");
-    for (const h of rework) lines.push(`- ${h.ts} ${h.event}${h.stage ? ` @${h.stage}` : ""}: ${JSON.stringify(h.detail).slice(0, 200)}`);
     lines.push("");
-    lines.push("## Artifact index", "");
-    for (const a of artifacts) lines.push(`- ${a.name} — \`${a.path}\``);
-    lines.push("");
+
+    lines.push("## Merge Danger", "");
+    lines.push(
+      `- Door: two-way door from the operator's seat — the factory never merges; decline or \`git revert\` the PR (\`${item.branchName}\`) to undo.`,
+      "",
+    );
+    lines.push(`- Blast Radius: ${blastRadius(diffStat)}`, "");
+    lines.push(`artifacts: ${artDir}`, "");
+
     return lines.join("\n");
   }
 
@@ -629,6 +651,59 @@ export class Orchestrator {
 }
 
 // ---------------------------------------------------------------- helpers
+
+/** Structured diff stat for the PR body's "shape of the change" visual. */
+function computeDiffStat(repoPath: string, base: string, branchName: string): string {
+  try {
+    return execFileSync("git", ["diff", "--stat", `${base}...${branchName}`], {
+      cwd: repoPath,
+      encoding: "utf8",
+      timeout: 30_000,
+    }).trim();
+  } catch {
+    // Repo not reachable at PR-body time (e.g. hermetic tests use a fake path):
+    // the caller emits an explicit fallback line, never throws.
+    return "";
+  }
+}
+
+/** First non-heading, non-fence line of a structured artifact; else fallback. */
+function leadParagraph(text: string, fallback: string): string {
+  const fb = fallback.trim();
+  const src = (text ?? "").trim();
+  if (!src) return fb;
+  const lines = src
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("```"));
+  const prose = lines.find((l) => !l.startsWith("#"));
+  const heading = lines.find((l) => l.startsWith("#"));
+  const chosen = prose ?? (heading ? heading.replace(/^#+\s*/, "") : undefined) ?? fb;
+  return (chosen || fb).slice(0, 300);
+}
+
+/** Short content digest for an artifact: first non-empty line. */
+function digest(text: string): string {
+  const line = (text ?? "")
+    .trim()
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.length > 0);
+  if (!line) return "(empty)";
+  return line.length > 120 ? `${line.slice(0, 117)}…` : line;
+}
+
+/** Human-readable blast-radius summary derived from git's `--stat` output. */
+function blastRadius(diffStat: string): string {
+  if (!diffStat) return "unknown — diff stat unavailable";
+  const paths = diffStat
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.includes(" | "))
+    .map((l) => l.slice(0, l.indexOf(" | ")).trim());
+  const dirs = [...new Set(paths.map((p) => p.split("/")[0]).filter((d): d is string => (d?.length ?? 0) > 0))];
+  return `${paths.length} file(s) changed in ${dirs.length > 0 ? dirs.join(", ") : "the repo root"}`;
+}
 
 export function isGate(stage: StageName): boolean {
   return (GATE_STAGES as readonly string[]).includes(stage);
