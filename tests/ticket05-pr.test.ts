@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { createHarness, makeOrchestrator, claim, ScriptedRunner, pass, FakePublisher, type TestHarness } from "./helpers.js";
 import { readKbFile, projectKbFile } from "../src/kb.js";
+import { digest, leadParagraph } from "../src/pipeline.js";
 
 let harness: TestHarness;
 afterEach(() => {
@@ -67,6 +68,23 @@ describe("ticket 05: spec → implement → PR", () => {
     const headings = body.split("\n").filter((l) => l.startsWith("## "));
     expect(headings).toEqual(["## Summary", "## Evidence", "## Merge Danger"]);
     expect(body).toMatch(/items\/task\/artifacts\//);
+  });
+
+  it("digest prefers prose over a bare section label but keeps data-bearing verdict headings", () => {
+    expect(digest("# Test results\n\n80 tests passed")).toBe("80 tests passed");
+    expect(digest("# verdict: pass\nno findings")).toBe("# verdict: pass");
+    expect(digest("```\n80 ok\n```")).toBe("80 ok");
+    expect(digest("# Review notes\n\nlooks fine, one nit\n")).toBe("looks fine, one nit");
+    expect(digest("")).toBe("(empty)");
+  });
+
+  it("a missing spec cannot smuggle the request into the Summary: the fallback runs the same selection and limit", () => {
+    expect(leadParagraph("", "## Heading\n\nsome body text\nthat continues")).toBe("some body text");
+    // A heading-only primary artifact still wins over the raw request: the
+    // fallback is what gets *selected and capped*, not what gets preferred.
+    expect(leadParagraph("# Only a heading", "# Fallback heading\n\nfallback prose")).toBe("Only a heading");
+    expect(leadParagraph("", "x".repeat(400))).toHaveLength(300);
+    expect(leadParagraph("single prose line", "")).toBe("single prose line");
   });
 
   it("a draft PR is created when the item has approvals front-matter; ready PR when autonomous", async () => {

@@ -530,7 +530,7 @@ export class Orchestrator {
 
     lines.push("## Merge Danger", "");
     lines.push(
-      `- Door: two-way door from the operator's seat — the factory never merges; decline or \`git revert\` the PR (\`${item.branchName}\`) to undo.`,
+      `- Door: two-way at the branch level — discard or \`git revert\` the PR (\`${item.branchName}\`) undoes the code; the factory never merges. Lasting effects beyond the branch (migrations, published packages, external calls) are not automatically assessed — check the artifact list above before merging.`,
       "",
     );
     lines.push(`- Blast Radius: ${blastRadius(diffStat)}`, "");
@@ -667,29 +667,46 @@ function computeDiffStat(repoPath: string, base: string, branchName: string): st
   }
 }
 
-/** First non-heading, non-fence line of a structured artifact; else fallback. */
-function leadParagraph(text: string, fallback: string): string {
-  const fb = fallback.trim();
-  const src = (text ?? "").trim();
-  if (!src) return fb;
-  const lines = src
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("```"));
-  const prose = lines.find((l) => !l.startsWith("#"));
-  const heading = lines.find((l) => l.startsWith("#"));
-  const chosen = prose ?? (heading ? heading.replace(/^#+\s*/, "") : undefined) ?? fb;
-  return (chosen || fb).slice(0, 300);
-}
-
-/** Short content digest for an artifact: first non-empty line. */
-function digest(text: string): string {
-  const line = (text ?? "")
+const fenceless = (text: string): string[] =>
+  (text ?? "")
     .trim()
     .split("\n")
     .map((l) => l.trim())
-    .find((l) => l.length > 0);
-  if (!line) return "(empty)";
+    .filter((l) => l && !l.startsWith("```"));
+
+/** First line that a reader should see: prose, else a stripped first heading. */
+function firstReadableLine(text: string): string | undefined {
+  const lines = fenceless(text);
+  if (lines.length === 0) return undefined;
+  const prose = lines.find((l) => !l.startsWith("#"));
+  return prose ?? lines[0]!.replace(/^#+\s*/, "");
+}
+
+/** Lead paragraph for the Summary section: text, else fallback — both run
+ * through the same line selection and 300-char limit, so a long multiline
+ * fallback (e.g. the item request) can never reshape the PR body. */
+export function leadParagraph(text: string, fallback: string): string {
+  const chosen =
+    firstReadableLine(text) ?? firstReadableLine(fallback) ?? (fallback.trim() ? fallback.trim() : "");
+  return chosen.slice(0, 300);
+}
+
+/** Short content digest for an artifact: the first line a reader should see.
+ * A leading bare section label ("# Test results") would hide the result, so
+ * the first prose line wins — but a heading that carries the datum
+ * ("# verdict: pass") is kept (':' marks data-bearing headings). */
+export function digest(text: string): string {
+  const lines = fenceless(text);
+  if (lines.length === 0) return "(empty)";
+  const first = lines[0]!;
+  let line: string;
+  if (first.startsWith("#")) {
+    const bare = first.replace(/^#+\s*/, "");
+    const prose = lines.find((l) => !l.startsWith("#"));
+    line = bare.includes(":") || !prose ? first : prose;
+  } else {
+    line = first;
+  }
   return line.length > 120 ? `${line.slice(0, 117)}…` : line;
 }
 
