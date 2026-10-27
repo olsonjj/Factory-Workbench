@@ -44,6 +44,38 @@ export function readKbFile(kbFile: string, limitChars?: number): string {
   return `<!-- older KB content elided (${text.length - limitChars} chars) -->\n\n${text.slice(-limitChars)}`;
 }
 
+/**
+ * Split a KB layer into chunks of at most maxChars, ALWAYS at entry
+ * boundaries ("## " headers). Chunks concatenate back to the original text
+ * byte-for-byte. Only a single entry larger than the whole budget overhangs
+ * (truncated with a marker, never silently dropped). Used by the KB curator:
+ * stage prompts must stay bounded, but curation still has to inspect every
+ * entry ever appended.
+ */
+export function chunkKbLayer(text: string, maxChars: number): string[] {
+  if (text.length <= maxChars) return text.length === 0 ? [] : [text];
+  // Entry starts: offsets of "## " lines (plus offset 0 for any preamble).
+  const starts: number[] = [0];
+  let atLineStart = true;
+  for (let i = 0; i < text.length; i++) {
+    if (atLineStart && text[i] === "#" && text.startsWith("## ", i)) starts.push(i);
+    atLineStart = text[i] === "\n";
+  }
+  const marker = (withheld: number): string => `\n<!-- oversized content truncated (${withheld} chars withheld from this batch) -->`;
+  const chunks: string[] = [];
+  let from = 0;
+  for (let i = 1; i < starts.length; i++) {
+    const start = starts[i]!;
+    if (start - from < maxChars) continue;
+    const piece = text.slice(from, start);
+    chunks.push(piece.length > maxChars ? piece.slice(0, maxChars) + marker(piece.length - maxChars) : piece);
+    from = start;
+  }
+  const tail = text.slice(from);
+  chunks.push(tail.length > maxChars ? tail.slice(0, maxChars) + marker(tail.length - maxChars) : tail);
+  return chunks;
+}
+
 /** Char budget for triage's lightweight global-KB-only view. */
 export const KB_TRIAGE_LIGHT_LIMIT = 2000;
 

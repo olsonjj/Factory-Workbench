@@ -7,7 +7,7 @@ import type { FactoryPaths } from "./paths.js";
 import { artifactDir, itemDir } from "./paths.js";
 import type { FactoryConfig } from "./config.js";
 import { parseItemMarkdown } from "./frontmatter.js";
-import { appendEntry, loadKbSnapshot, projectKbFile, repoSlug } from "./kb.js";
+import { appendEntry, chunkKbLayer, globalKbFile, loadKbSnapshot, projectKbFile, readKbFile, repoSlug } from "./kb.js";
 import { stamp } from "./util.js";
 
 /** PR publication happens on the host, outside the stage seam. Never merges. */
@@ -232,7 +232,7 @@ export class Orchestrator {
     if (!this.curator) throw new Error("no curator runner configured");
     const known = this.db.knownRepos();
     const wanted = projects.length > 0 ? projects : known.map((k) => repoSlug(k.repo));
-    const kb = this.loadCurationKb(wanted);
+    const kb = this.loadFullCurationKb(wanted);
     const repoPaths: Record<string, string> = {};
     for (const project of wanted) {
       const match = known.find((k) => repoSlug(k.repo) === project);
@@ -241,13 +241,40 @@ export class Orchestrator {
         repoPaths[project] = rp;
       }
     }
-    const result = await this.curator.propose({ projects: wanted, kb, repoPaths });
+    // Curation must see every entry ever appended, but prompts must stay
+    // bounded: oversized layers are chunked at entry boundaries and reviewed
+    // in sequential batches; per-batch proposals are merged into one artifact.
+    const globalChunks = chunkKbLayer(kb.global, this.config.kb.maxGlobalChars);
+    const projectChunks = chunkKbLayer(kb.project, this.config.kb.maxProjectChars);
+    const batches = Math.max(globalChunks.length, projectChunks.length, 1);
+    const proposalOf = (r: StageResult): string => r.artifacts[0]?.content ?? r.feedback ?? r.report ?? "(empty proposal)";
     const ts = stamp();
+    let content: string;
+    if (batches === 1) {
+      const result = await this.curator.propose({ projects: wanted, kb, repoPaths });
+      content = proposalOf(result);
+    } else {
+      const sections: string[] = [];
+      for (let i = 0; i < batches; i++) {
+        const slice: KbSnapshot = {
+          global: globalChunks[i] ?? "",
+          project: projectChunks[i] ?? "",
+        };
+        const result = await this.curator.propose({
+          projects: wanted,
+          kb: slice,
+          repoPaths,
+          batch: { index: i + 1, total: batches },
+        });
+        sections.push(`# curation batch ${i + 1} of ${batches}\n\n${proposalOf(result)}`);
+      }
+      const batched = sections.join("\n\n---\n\n");
+      content = `> NOTE: the knowledge base exceeded its prompt budget and was reviewed in ${batches} entry-aligned batches. Findings span batch boundaries are possible — cross-check batches 1..${batches} manually before applying.\n\n${batched}`;
+    }
     const name = `curate-${ts}${projects.length === 1 ? `-${projects[0]}` : ""}.md`;
     const dir = this.paths.proposals;
     mkdirSync(dir, { recursive: true });
     const abs = path.join(dir, name);
-    const content = result.artifacts[0]?.content ?? result.feedback ?? result.report ?? "(empty proposal)";
     writeFileSync(abs, content, "utf8");
     return { file: path.relative(this.paths.root, abs), proposal: content };
   }
@@ -716,19 +743,17 @@ export class Orchestrator {
     this.db.addArtifact(item.id, "triage", "triage-questions", path.relative(this.paths.root, abs));
   }
 
-  private loadCurationKb(projects: string[]): KbSnapshot {
-    const global = loadKbSnapshot(this.paths, undefined, {
-      maxGlobalChars: this.config.kb.maxGlobalChars,
-      maxProjectChars: this.config.kb.maxProjectChars,
-    }).global;
+  /** Curation reads the FULL layers, uncapped — unlike stage prompts, the
+   * curator must see older entries to judge contradictions, staleness, and
+   * merge candidates. Bounded prompts are preserved by batch slicing in
+   * curate(). */
+  private loadFullCurationKb(projects: string[]): KbSnapshot {
+    const global = readKbFile(globalKbFile(this.paths));
     const parts: string[] = [];
     for (const project of projects) {
       const repo = this.resolveProjectRepo(project);
       if (repo) {
-        parts.push(loadKbSnapshot(this.paths, repo, {
-          maxGlobalChars: this.config.kb.maxGlobalChars,
-          maxProjectChars: this.config.kb.maxProjectChars,
-        }).project);
+        parts.push(readKbFile(projectKbFile(this.paths, repo)));
       }
     }
     return { global, project: parts.join("\n") };

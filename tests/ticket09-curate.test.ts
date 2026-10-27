@@ -87,6 +87,36 @@ describe("ticket 09: curator pass for the knowledge base", () => {
     expect(req.repoPaths["repo"]).toBe(path.resolve("/tmp/repo"));
   });
 
+  it("an oversized KB is reviewed in entry-aligned batches; per-batch proposals merge into one artifact", async () => {
+    harness = createHarness();
+    seedWorld(harness);
+    // Shrink the curation budget so the seeded global layer must be batched.
+    harness.config.kb.maxGlobalChars = 400;
+    const entries = [1, 2, 3, 4]
+      .map((n) => `## 2026-10-27 — failed-gate (repo ${n})\n\n${"lesson ".repeat(40)}\n\n`)
+      .join("");
+    harness.writeFile(globalKbFile(harness.paths), entries);
+    const curator = new FakeCurator();
+    const orch = makeOrchestrator(harness, new (await import("./helpers.js")).ScriptedRunner({}), { curator });
+
+    const { file, proposal } = await orch.curate();
+    // Every appended entry was offered to some batch — none silently elided.
+    const offered = curator.received.map((r) => r.kb.global).join("");
+    expect(offered).toContain("(repo 1)");
+    expect(offered).toContain("(repo 4)");
+    expect(curator.received.length).toBeGreaterThanOrEqual(2);
+    // Each batch stays near the budget and carries its batch marker.
+    curator.received.forEach((r, i) => {
+      expect(r.kb.global.length).toBeLessThanOrEqual(400 + 500); // at most one oversized-entry overhang
+      expect(r.batch).toEqual({ index: i + 1, total: curator.received.length });
+    });
+    // One merged proposal artifact.
+    const abs = path.join(harness.root, file);
+    expect(existsSync(abs)).toBe(true);
+    expect(readFileSync(abs, "utf8")).toContain("curation batch 1 of");
+    expect(proposal).toContain("Curation proposal");
+  });
+
   it("a human applying the proposal edits KB files directly; a subsequent run uses the curated content", async () => {
     harness = createHarness();
     seedWorld(harness);

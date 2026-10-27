@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import * as os from "node:os";
 import * as path from "node:path";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { acquireFactoryLock, FactoryBusyError } from "../src/lock.js";
 import { FactoryDb } from "../src/db.js";
 
@@ -62,8 +62,22 @@ describe("P1-4: process lock + sqlite busy timeout", () => {
   it("a lock with a live PID is not treated as stale", () => {
     const root = tmpRoot();
     const lockPath = path.join(root, "factory.lock");
-    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, ts: Date.now() }), "utf8");
+    const fresh = JSON.stringify({ pid: process.pid, ts: Date.now(), id: "live-owner" }, null, 2);
+    writeFileSync(lockPath, fresh, "utf8");
     expect(() => acquireFactoryLock(root)).toThrow(FactoryBusyError);
+    // The sweep-then-inspect path must have restored the fresh lock's bytes
+    // untouched — a busy loser never consumes a live owner's lock.
+    expect(existsSync(lockPath)).toBe(true);
+    expect(readFileSync(lockPath, "utf8").startsWith(fresh)).toBe(true);
+  });
+
+  it("no .stale sweep leftovers remain after a busy attempt on a fresh lock", () => {
+    const root = tmpRoot();
+    const lockPath = path.join(root, "factory.lock");
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, ts: Date.now(), id: "live-owner" }), "utf8");
+    expect(() => acquireFactoryLock(root)).toThrow(FactoryBusyError);
+    const leftovers = readdirSync(root).filter((f) => f.includes(".stale"));
+    expect(leftovers).toEqual([]);
   });
 
   it("FactoryDb sets a sqlite busy_timeout", () => {

@@ -38,32 +38,55 @@ type LockPayload = { pid: number; ts: number; id: string };
 export function acquireFactoryLock(root: string): () => void {
   mkdirSync(root, { recursive: true });
   const lockPath = path.join(root, "factory.lock");
-  // Stale-lock recovery must itself be exclusive. rmSync + create has a
-  // TOCTOU window: two concurrent acquirers can both clear the stale lock
-  // before either recreates it, and each "owner" then deletes the other's
-  // fresh lock on release. Atomic rename closes the window — rename()
-  // succeeds for exactly one caller (the loser gets ENOENT and then hits
-  // EEXIST on wx, i.e. the normal busy path). The renamed file is swept up
-  // once we own the fresh lock.
-  const staleSweep = `${lockPath}.${process.pid}.${randomUUID()}.stale`;
-  if (existsSync(lockPath) && lockStale(lockPath)) {
-    try {
-      renameSync(lockPath, staleSweep);
-    } catch {
-      /* lost the race to another acquirer — fall through to wx */
-    }
-  }
   const id = randomUUID();
-  try {
-    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, ts: Date.now(), id } satisfies LockPayload), {
-      encoding: "utf8",
-      flag: "wx",
-    });
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new FactoryBusyError(lockPath);
-    throw err;
+  const token: LockPayload = { pid: process.pid, ts: Date.now(), id };
+  for (;;) {
+    // 1. Try to create the lock exclusively — the common path, no window.
+    try {
+      writeFileSync(lockPath, JSON.stringify(token), { encoding: "utf8", flag: "wx" });
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    // 2. Something sits at the path. Take atomic ownership of whatever bytes
+    //    are there NOW — rename() moves the whole file for exactly one
+    //    racing acquirer, so recovery is itself exclusive. Staleness is then
+    //    decided on the swept snapshot (which only we hold), never on the
+    //    live path — there is no check→remove gap for a rival to slip into.
+    const sweep = `${lockPath}.${process.pid}.${randomUUID()}.stale`;
+    let swept = false;
+    try {
+      renameSync(lockPath, sweep);
+      swept = true;
+    } catch {
+      /* gone — another acquirer moved it; loop and wx-create */
+    }
+    if (!swept) continue;
+    if (lockStale(sweep)) {
+      // Provably stale under our exclusive control: discard and re-create.
+      rmSync(sweep, { force: true });
+      continue;
+    }
+    // Fresh lock: not ours to take. Restore the snapshot untouched and yield.
+    // (If a third acquirer created a lock in this few-µs window, leave its
+    // bytes alone rather than clobbering them — yield busy either way.)
+    if (!existsSync(lockPath)) {
+      try {
+        renameSync(sweep, lockPath);
+        throw new FactoryBusyError(lockPath);
+      } catch (err) {
+        if (err instanceof FactoryBusyError) throw err;
+        /* original owner removed it mid-flight — treat as gone, retry */
+      }
+      continue;
+    }
+    rmSync(sweep, { force: true });
+    throw new FactoryBusyError(lockPath);
   }
-  rmSync(staleSweep, { force: true });
+  return ownershipCheckedRelease(lockPath, id);
+}
+
+function ownershipCheckedRelease(lockPath: string, id: string): () => void {
   // Ownership-checked release: never delete a lock we don't own (a fresh
   // owner may have taken over after we were orphaned by stale recovery).
   return () => {

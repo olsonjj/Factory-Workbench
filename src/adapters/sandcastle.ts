@@ -560,7 +560,10 @@ export class SandcastleCurator implements CuratorRunner {
       const repoGuidance = Object.entries(req.repoPaths)
         .map(([slug, rp]) => `- ${slug}: mounted read-only at repos/${path.basename(rp)}`)
         .join("\n");
-      const prompt = `You are the knowledge-base curator for a software factory. Read the KB layers below${Object.keys(req.repoPaths).length ? " and the mounted repositories" : ""} and write a curation PROPOSAL. You must not change anything — your only output is the proposal.
+      const batchNote = req.batch
+        ? `\nThe KB was too large for one pass and has been split into ${req.batch.total} entry-aligned batches; you are reviewing batch ${req.batch.index}. Focus on the entries provided; cross-batch findings are handled by the operator comparing batch proposals.`
+        : "";
+      const prompt = `You are the knowledge-base curator for a software factory. Read the KB layers below${Object.keys(req.repoPaths).length ? " and the mounted repositories" : ""} and write a curation PROPOSAL. You must not change anything — your only output is the proposal.${batchNote}
 
 Your proposal must list, each citing the entries and repo evidence involved:
 - contradictions between entries
