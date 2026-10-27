@@ -278,4 +278,21 @@ export class FactoryDb {
       .all() as { repo: string; count: number }[];
     return rows;
   }
+
+  /**
+   * Distinct target repos from the item store, newest item first. Excludes the
+   * "(unknown)" placeholder that scanInbox records for malformed items.
+   */
+  knownReposNewestFirst(): { repo: string; count: number }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT repo, COUNT(*) AS count, MAX(id) AS latest_id
+         FROM items
+         WHERE repo <> '(unknown)'
+         GROUP BY repo
+         ORDER BY latest_id DESC, repo ASC`,
+      )
+      .all() as { repo: string; count: number; latest_id: number }[];
+    return rows.map((r) => ({ repo: r.repo, count: r.count }));
+  }
 }

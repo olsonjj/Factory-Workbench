@@ -8,6 +8,8 @@ import { makePaths, ensureLayout } from "../paths.js";
 import { FactoryDb } from "../db.js";
 import { scanInbox } from "../inbox.js";
 import { ITEM_TEMPLATE } from "../frontmatter.js";
+import { authorItem, type NewOptions } from "../new.js";
+import { makeRealIO } from "../prompt.js";
 import { Orchestrator } from "../pipeline.js";
 import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, ollamaEnv } from "../adapters/sandcastle.js";
 import { sleep } from "../util.js";
@@ -38,6 +40,22 @@ function openFactory(rootOverride?: string): {
     sleep,
   });
   return { root, paths, db, orch, claimReport };
+}
+
+/**
+ * Light factory open for `wb new`: only paths + item store are needed (the repo
+ * default comes from the store). No runner/curator/publisher.
+ */
+function openAuthoringRoot(rootOverride?: string): {
+  root: string;
+  paths: ReturnType<typeof makePaths>;
+  db: FactoryDb;
+} {
+  const { config, root } = loadConfig(rootOverride);
+  ensureConfigFile(root);
+  const paths = makePaths(root);
+  ensureLayout(paths);
+  return { root, paths, db: new FactoryDb(root) };
 }
 
 /** Shared command scaffold: open factory, run the body, always close the db. */
@@ -105,6 +123,29 @@ program
   .description("Print a work-item markdown template to stdout")
   .action(() => {
     console.log(ITEM_TEMPLATE);
+  });
+
+program
+  .command("new [description]")
+  .description("Interactively author a work item and write it into the factory inbox")
+  .option("--root <dir>", "factory root directory")
+  .option("--title <title>", "item title (skip the prompt)")
+  .option("--repo <path>", "target repository (skip the prompt)")
+  .option("--base <branch>", "base branch (default: main)")
+  .option("--approvals <stages>", "comma-separated approval stages, e.g. spec,review")
+  .option("--description-file <path>", "read the description from a file")
+  .action(async (description: string | undefined, opts: NewOptions & { root?: string }) => {
+    const { paths, db } = openAuthoringRoot(opts.root);
+    try {
+      const result = await authorItem({ ...opts, description }, db, paths, makeRealIO());
+      if (!result.ok) {
+        console.error(result.aborted ? `aborted: ${result.reason}` : `factory: ${result.reason}`);
+        nodeProcess.exit(1);
+      }
+      console.log(`Wrote ${result.file} — next: \`wb run\``);
+    } finally {
+      db.close();
+    }
   });
 
 program

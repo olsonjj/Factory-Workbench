@@ -166,7 +166,7 @@ export class Orchestrator {
       const match = known.find((k) => repoSlug(k.repo) === project);
       if (match) {
         const rp = resolveRepoPath(match.repo);
-        if (existsSync(rp)) repoPaths[project] = rp;
+        repoPaths[project] = rp;
       }
     }
     const result = await this.curator.propose({ projects: wanted, kb, repoPaths });

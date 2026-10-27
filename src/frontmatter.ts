@@ -80,6 +80,75 @@ export function parseItemMarkdown(raw: string): ParseResult {
   };
 }
 
+export interface ItemDraft {
+  title: string;
+  repo: string;
+  base: string;
+  approvals: StageName[];
+  body: string;
+}
+
+/**
+ * Slug for a work item authored from a title. Applied twice so the result is
+ * a fixed point of slugify(); scanInbox re-derives slugify(basename) and must
+ * arrive at the identical value (see §6).
+ */
+export function slugForTitle(title: string): string {
+  return slugify(slugify(title));
+}
+
+export function parseApprovalsInput(raw: string):
+  | { ok: true; approvals: StageName[] }
+  | { ok: false; reason: string } {
+  const tokens = raw.split(",").map((t) => t.trim()).filter((t) => t.length > 0);
+  if (tokens.length === 0) return { ok: true, approvals: [] };
+  const seen = new Set<StageName>();
+  const approvals: StageName[] = [];
+  for (const token of tokens) {
+    if (!isStageName(token)) {
+      return {
+        ok: false,
+        reason: `unknown approval stage "${token}" (allowed: ${APPROVAL_STAGES.join(", ")})`,
+      };
+    }
+    if (!seen.has(token)) { seen.add(token); approvals.push(token); }
+  }
+  return { ok: true, approvals };
+}
+
+/** Serialize a draft to markdown via gray-matter (same lib that parses). */
+export function serializeItemMarkdown(draft: ItemDraft): string {
+  const data = {
+    title: draft.title,
+    repo: draft.repo,
+    base: draft.base,
+    approvals: draft.approvals,
+  };
+  return matter.stringify(draft.body, data as Record<string, unknown>);
+}
+
+export type DraftValidation =
+  | { ok: true; markdown: string; parsed: ParsedItem }
+  | { ok: false; reason: string };
+
+/** Reuse the existing parser to prove the bytes we will write are valid. */
+export function validateItemDraft(draft: ItemDraft): DraftValidation {
+  const markdown = serializeItemMarkdown(draft);
+  const parsed = parseItemMarkdown(markdown);
+  if (!parsed.ok) return { ok: false, reason: parsed.reason };
+  const p = parsed.item;
+  if (
+    p.title !== draft.title ||
+    p.repo !== draft.repo ||
+    p.base !== draft.base ||
+    p.approvals.length !== draft.approvals.length ||
+    p.approvals.some((a, i) => a !== draft.approvals[i])
+  ) {
+    return { ok: false, reason: "serialized item did not round-trip through front-matter parsing" };
+  }
+  return { ok: true, markdown, parsed: p };
+}
+
 export const ITEM_TEMPLATE = `---
 title: Implement the thing
 repo: /path/to/target/repo
