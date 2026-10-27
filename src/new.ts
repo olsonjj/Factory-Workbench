@@ -61,14 +61,16 @@ export function buildEditorTemplate(d: { title: string; repo: string; base: stri
 /** Strip only the generated instruction block (an HTML comment), never user content. */
 export function stripEditorComments(text: string): string {
   const lines = text.split("\n");
-  // The generated block opens the file. The closer must be a bare "-->" line —
-  // a title-interpolated "-->" (e.g. "Convert A --> B") mid-line never matches.
-  if (!lines[0]!.trimStart().startsWith("<!--")) {
-    return text.trim(); // operator deleted the generated block entirely
+  // Tolerate leading blank lines before the generated block.
+  let open = 0;
+  while (open < lines.length && lines[open]!.trim() === "") open++;
+  if (lines[open]?.trimStart().startsWith("<!--")) {
+    // The closer must be a bare "-->" line — a title-interpolated "-->"
+    // (e.g. "Convert A --> B") mid-line never matches.
+    const close = lines.findIndex((l, i) => i > open && l.trim() === "-->");
+    if (close !== -1) return lines.slice(close + 1).join("\n").trim();
   }
-  const close = lines.findIndex((l, i) => i > 0 && l.trim() === "-->");
-  if (close === -1) return text.trim();
-  return lines.slice(close + 1).join("\n").trim();
+  return text.trim(); // generated block was deleted or not opened
 }
 
 export async function authorItem(opts: NewOptions, db: FactoryDb, paths: FactoryPaths, io: AuthoringIO): Promise<NewResult> {

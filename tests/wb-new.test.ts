@@ -336,6 +336,14 @@ describe("wb new", () => {
     expect(stripEditorComments("\nBody only.\n")).toBe("Body only.");
   });
 
+  it("leading blank lines before the generated block do not defeat stripping", () => {
+    const template = buildEditorTemplate({ title: "T", repo: "/r", base: "main", approvals: [] });
+    const authored = "\n\n" + template + "Body text.\n";
+    expect(stripEditorComments(authored)).toBe("Body text.");
+    // And empty-with-leading-blanks still aborts:
+    expect(stripEditorComments("\n" + template)).toBe("");
+  });
+
   it("a title containing '-->' cannot hijack the generated block's closing marker", () => {
     const template = buildEditorTemplate({ title: "Convert A --> B", repo: "/r", base: "main", approvals: [] });
     const authored = template + "## Requirements\n\nConvert A --> B, safely.\n";
