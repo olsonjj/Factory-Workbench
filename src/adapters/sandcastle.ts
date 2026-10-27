@@ -20,25 +20,28 @@ import type { ItemContext, KbSnapshot, StageRequest, StageResult, StageRunner, C
  * git worktree of the target repo. Nothing above the seam knows any of this.
  */
 
-const TriageVerdict = z.object({
+export const TriageVerdict = z.object({
   outcome: z.enum(["proceed", "reject", "needs-human"]),
   report: z.string(),
-  questions: z.array(z.string()).optional(),
+  // Agents may null this when there are no questions — accept null (same dogfood finding as lesson/fix).
+  questions: z.array(z.string()).nullish(),
 });
 
-const TestVerdict = z.object({
+export const TestVerdict = z.object({
   testsPassed: z.boolean(),
   report: z.string(),
-  lesson: z.string().optional(),
-  fix: z.string().optional(),
+  // Agents null these on a clean run ("lesson: only if tests failed") —
+  // accept explicit null, not just field-absence (2026-10-27 dogfood finding).
+  lesson: z.string().nullish(),
+  fix: z.string().nullish(),
 });
 
-const ReviewVerdict = z.object({
+export const ReviewVerdict = z.object({
   verdict: z.enum(["pass", "fail"]),
   findings: z.string(),
-  lesson: z.string().optional(),
-  fix: z.string().optional(),
-  prSummary: z.string().optional(),
+  lesson: z.string().nullish(),
+  fix: z.string().nullish(),
+  prSummary: z.string().nullish(),
 });
 
 const COMPLETE = "When you are done, emit `<promise>COMPLETE</promise>` as the final line of your output.";
@@ -385,10 +388,10 @@ Return your verdict as JSON inside a <test>...</test> tag:
         report: v.report,
         feedback: v.report,
         lesson: v.lesson ?? v.report,
-        fix: v.fix,
+        fix: v.fix ?? undefined,
       };
     }
-    return { outcome: "pass", artifacts: [{ name: "test-report", content: v.report }], fix: v.fix };
+    return { outcome: "pass", artifacts: [{ name: "test-report", content: v.report }], fix: v.fix ?? undefined };
   }
 
   private async runReview(req: StageRequest, model: string, wt: Worktree): Promise<StageResult> {
@@ -417,13 +420,13 @@ Return your verdict as JSON inside a <review>...</review> tag:
         report: v.findings,
         feedback: v.fix ?? v.findings,
         lesson: v.lesson ?? v.findings,
-        fix: v.fix,
+        fix: v.fix ?? undefined,
       };
     }
     return {
       outcome: "pass",
       artifacts: [{ name: "review-verdict", content: v.findings }],
-      prSummary: v.prSummary,
+      prSummary: v.prSummary ?? undefined,
     };
   }
 
