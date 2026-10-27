@@ -60,10 +60,15 @@ export function buildEditorTemplate(d: { title: string; repo: string; base: stri
 
 /** Strip only the generated instruction block (an HTML comment), never user content. */
 export function stripEditorComments(text: string): string {
-  const start = text.indexOf("<!--");
-  const end = text.indexOf("-->");
-  if (start === -1 || end === -1 || end < start) return text.trim();
-  return (text.slice(0, start) + text.slice(end + 3)).trim();
+  const lines = text.split("\n");
+  // The generated block opens the file. The closer must be a bare "-->" line —
+  // a title-interpolated "-->" (e.g. "Convert A --> B") mid-line never matches.
+  if (!lines[0]!.trimStart().startsWith("<!--")) {
+    return text.trim(); // operator deleted the generated block entirely
+  }
+  const close = lines.findIndex((l, i) => i > 0 && l.trim() === "-->");
+  if (close === -1) return text.trim();
+  return lines.slice(close + 1).join("\n").trim();
 }
 
 export async function authorItem(opts: NewOptions, db: FactoryDb, paths: FactoryPaths, io: AuthoringIO): Promise<NewResult> {

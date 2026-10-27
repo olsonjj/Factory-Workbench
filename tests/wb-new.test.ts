@@ -336,6 +336,15 @@ describe("wb new", () => {
     expect(stripEditorComments("\nBody only.\n")).toBe("Body only.");
   });
 
+  it("a title containing '-->' cannot hijack the generated block's closing marker", () => {
+    const template = buildEditorTemplate({ title: "Convert A --> B", repo: "/r", base: "main", approvals: [] });
+    const authored = template + "## Requirements\n\nConvert A --> B, safely.\n";
+    const stripped = stripEditorComments(authored);
+    expect(stripped).toBe("## Requirements\n\nConvert A --> B, safely.");
+    // An empty body still aborts even when the title contains '-->':
+    expect(stripEditorComments(template)).toBe("");
+  });
+
   it("splitEditorCommand honors quoted EDITOR paths and arguments", () => {
     expect(splitCommand('"/opt/My Editor/bin/editor" --wait')).toEqual(["/opt/My Editor/bin/editor", "--wait"]);
     expect(splitCommand("code -w")).toEqual(["code", "-w"]);
