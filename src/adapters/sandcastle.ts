@@ -259,6 +259,20 @@ export class SandcastleStageRunner implements StageRunner {
         imageName: this.config.sandbox.imageName,
         ...(piConfigMounts.length > 0 ? { mounts: piConfigMounts } : {}),
       }),
+      // Install dependencies before the agent starts: a fresh git worktree has
+      // no node_modules (gitignored), and the sandbox image is bare. npm install
+      // (not npm ci) because the worktree is bind-mounted, so node_modules
+      // installed by an earlier stage of the same item persists — subsequent
+      // runs are incremental. Lockfile still governs; --no-audit/--no-fund
+      // keep the cold install fast. Timeout raised well above the 60s default:
+      // a cold install (native module prebuilds for better-sqlite3) can be
+      // slow. A hook failure aborts the run as an infra-class failure, which
+      // the factory's maxInfraRetries budget already covers.
+      hooks: {
+        sandbox: {
+          onSandboxReady: [{ command: "npm install --no-audit --no-fund", timeoutMs: 300_000 }],
+        },
+      },
       prompt: [prompt, COMPLETE].join("\n\n"),
       maxIterations: 1,
     });
@@ -609,6 +623,10 @@ ${COMPLETE}`;
         ]
       : [];
     const env = { ...(this.deps.env ?? {}), ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefix }) };
+    // Deliberately NO hooks.sandbox.onSandboxReady here (unlike wtRun): the
+    // scratch cwd has no package.json (it only hosts read-only KB mounts), so
+    // an npm install would fail and abort the run. Skipping is the designed
+    // behavior — scratch runs make no code changes that need dependencies.
     return run({
       agent: pi(opts.model, { env }),
       sandbox: docker({
