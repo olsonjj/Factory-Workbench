@@ -87,7 +87,9 @@ const configSchema = z.object({
   }),
   budgets: z.object({
     maxGateAttempts: z.number().int().positive(),
-    maxInfraRetries: z.number().int().positive(),
+    // nonnegative (not positive): 0 is a legitimate way to disable automatic
+    // retries, and loadConfig must not reject it at startup.
+    maxInfraRetries: z.number().int().nonnegative(),
     retryBackoffMs: z.number().int().nonnegative(),
   }),
   sandbox: z.object({ imageName: z.string().min(1) }),

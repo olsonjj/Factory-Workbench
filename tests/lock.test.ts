@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import * as os from "node:os";
 import * as path from "node:path";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { acquireFactoryLock, FactoryBusyError } from "../src/lock.js";
 import { FactoryDb } from "../src/db.js";
 
@@ -32,6 +32,31 @@ describe("P1-4: process lock + sqlite busy timeout", () => {
     writeFileSync(lockPath, JSON.stringify({ pid: 999999, ts: Date.now() }), "utf8");
     const release = acquireFactoryLock(root); // must clear the stale lock, not throw
     expect(() => release()).not.toThrow();
+  });
+
+  it("stale-lock recovery is atomic: no sweep files remain after acquiring over a stale lock", () => {
+    const root = tmpRoot();
+    const lockPath = path.join(root, "factory.lock");
+    writeFileSync(lockPath, JSON.stringify({ pid: 999999, ts: Date.now() }), "utf8");
+    const release = acquireFactoryLock(root);
+    try {
+      const leftovers = readdirSync(root).filter((f) => f.includes(".stale"));
+      expect(leftovers).toEqual([]);
+    } finally {
+      release();
+    }
+  });
+
+  it("release is ownership-checked: an orphaned release does not delete a fresh owner's lock", () => {
+    const root = tmpRoot();
+    const lockPath = path.join(root, "factory.lock");
+    const release = acquireFactoryLock(root);
+    // Simulate takeover: another process swept our (orphaned) lock and wrote
+    // its own fresh lock under the same path.
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, ts: Date.now(), id: "fresh-owner" }), "utf8");
+    release(); // must NOT delete the fresh owner's lock
+    expect(existsSync(lockPath)).toBe(true);
+    expect(() => acquireFactoryLock(root)).toThrow(FactoryBusyError);
   });
 
   it("a lock with a live PID is not treated as stale", () => {

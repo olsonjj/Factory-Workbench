@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 
 export class FactoryBusyError extends Error {
   constructor(lockPath: string) {
@@ -32,18 +33,43 @@ function lockStale(lockPath: string): boolean {
   }
 }
 
+type LockPayload = { pid: number; ts: number; id: string };
+
 export function acquireFactoryLock(root: string): () => void {
   mkdirSync(root, { recursive: true });
   const lockPath = path.join(root, "factory.lock");
-  if (existsSync(lockPath) && lockStale(lockPath)) rmSync(lockPath, { force: true });
+  // Stale-lock recovery must itself be exclusive. rmSync + create has a
+  // TOCTOU window: two concurrent acquirers can both clear the stale lock
+  // before either recreates it, and each "owner" then deletes the other's
+  // fresh lock on release. Atomic rename closes the window — rename()
+  // succeeds for exactly one caller (the loser gets ENOENT and then hits
+  // EEXIST on wx, i.e. the normal busy path). The renamed file is swept up
+  // once we own the fresh lock.
+  const staleSweep = `${lockPath}.${process.pid}.${randomUUID()}.stale`;
+  if (existsSync(lockPath) && lockStale(lockPath)) {
+    try {
+      renameSync(lockPath, staleSweep);
+    } catch {
+      /* lost the race to another acquirer — fall through to wx */
+    }
+  }
+  const id = randomUUID();
   try {
-    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, ts: Date.now() }), { encoding: "utf8", flag: "wx" });
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, ts: Date.now(), id } satisfies LockPayload), {
+      encoding: "utf8",
+      flag: "wx",
+    });
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new FactoryBusyError(lockPath);
     throw err;
   }
+  rmSync(staleSweep, { force: true });
+  // Ownership-checked release: never delete a lock we don't own (a fresh
+  // owner may have taken over after we were orphaned by stale recovery).
   return () => {
     try {
+      const current = JSON.parse(readFileSync(lockPath, "utf8")) as LockPayload;
+      if (current?.id !== id) return;
       rmSync(lockPath, { force: true });
     } catch {
       /* already gone */

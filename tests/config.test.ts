@@ -60,4 +60,16 @@ describe("P1-5: config validation", () => {
     expect(config.budgets.maxGateAttempts).toBe(3);
     expect(config.kb).toEqual({ maxGlobalChars: 24000, maxProjectChars: 24000 });
   });
+
+  it("maxInfraRetries 0 is valid (retries disabled), not rejected at startup", () => {
+    const root = tmpRoot();
+    const configFile = path.join(root, CONFIG_FILE_NAME);
+    writeFileSync(
+      configFile,
+      JSON.stringify({ budgets: { maxGateAttempts: 1, maxInfraRetries: 0, retryBackoffMs: 0 } }),
+      "utf8",
+    );
+    const { config } = loadConfig(root);
+    expect(config.budgets.maxInfraRetries).toBe(0);
+  });
 });

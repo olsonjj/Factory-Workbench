@@ -284,8 +284,10 @@ program
         console.error(`expected ${questions.length} answer(s); pass -a "..." for each question`);
         nodeProcess.exit(1);
       }
-      const answers = matchAnswers(questions, raw);
-      const out = orch.answer(id, answers);
+      // Free-form feedback for items parked without questions must not go
+      // through matchAnswers (an answer/question count mismatch throws).
+      const answers = questions.length > 0 ? matchAnswers(questions, raw) : [];
+      const out = orch.answer(id, answers, questions.length === 0 ? raw.join("\n") : undefined);
       console.log(`Answers recorded for ${out.slug}. Triage will re-run with them.`);
     });
   });
