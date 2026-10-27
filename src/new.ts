@@ -40,27 +40,30 @@ export function validateRepoPath(repo: string): { ok: true } | { ok: false; reas
 
 export function buildEditorTemplate(d: { title: string; repo: string; base: string; approvals: StageName[] }): string {
   return [
-    "# Write the work-item description below this line. The description is the",
-    "# item's source of truth. Lines starting with '#' are comments and ignored.",
-    "#",
-    "# Front-matter that will be generated from your answers:",
-    `#   title: ${d.title}`,
-    `#   repo: ${d.repo}`,
-    `#   base: ${d.base}`,
-    `#   approvals: [${d.approvals.join(", ")}]`,
-    "#",
-    "# Leaving this file empty (or only comments) aborts: nothing is written.",
+    "<!--",
+    "Write the work-item description below the closing marker. The description",
+    "is the item's source of truth; this generated block is stripped on save",
+    "(your own markdown — including '#'-prefixed lines — inside it is kept).",
+    "",
+    "Front-matter generated from your answers:",
+    `  title: ${d.title}`,
+    `  repo: ${d.repo}`,
+    `  base: ${d.base}`,
+    `  approvals: [${d.approvals.join(", ")}]`,
+    "",
+    "Leaving an empty body aborts: nothing is written.",
+    "-->",
     "",
     "",
   ].join("\n");
 }
 
+/** Strip only the generated instruction block (an HTML comment), never user content. */
 export function stripEditorComments(text: string): string {
-  return text
-    .split("\n")
-    .filter((line) => !line.trimStart().startsWith("#"))
-    .join("\n")
-    .trim();
+  const start = text.indexOf("<!--");
+  const end = text.indexOf("-->");
+  if (start === -1 || end === -1 || end < start) return text.trim();
+  return (text.slice(0, start) + text.slice(end + 3)).trim();
 }
 
 export async function authorItem(opts: NewOptions, db: FactoryDb, paths: FactoryPaths, io: AuthoringIO): Promise<NewResult> {
@@ -74,13 +77,16 @@ export async function authorItem(opts: NewOptions, db: FactoryDb, paths: Factory
     if (!title) return fail("title is required");
   }
 
-  // 2. repo — prompt with known-repos default, or validate --repo once
+  // 2. repo — prompt with known-repos default, or validate --repo once.
+  // Persist the absolute path: a relative path would otherwise be resolved
+  // against whatever CWD the `wb run` happens to have later.
   const known = db.knownReposNewestFirst();
   let repo = (opts.repo ?? "").trim();
   if (!repo) {
     if (!canPrompt) return fail("--repo is required when stdin is not a TTY");
     repo = await promptRepo(io, known);
   } else {
+    repo = path.resolve(repo);
     const v = validateRepoPath(repo);
     if (!v.ok) return fail(`--repo ${repo}: ${v.reason}`);
   }
@@ -116,12 +122,31 @@ export async function authorItem(opts: NewOptions, db: FactoryDb, paths: Factory
   const v = validateItemDraft(draft);
   if (!v.ok) return fail(`refusing to write: ${v.reason}`);
 
-  const dest = path.join(paths.inbox, fileName);
-  if (existsSync(dest)) {
-    return fail(`inbox already has ${fileName} — run \`wb run\` to claim it first`);
+  // A claimed/rejected item's inbox file is gone, so the inbox-file check
+  // alone cannot catch a title whose slug is already taken: the re-dropped
+  // file would then sit in the inbox skipped by every future scan. Check the
+  // stored slugs too. (A *rejected* item is allowed: writing its file again
+  // is the documented resurrect-by-re-drop flow.)
+  const existing = db.findBySlug(slug);
+  if (existing && existing.status !== "rejected") {
+    return fail(
+      `slug "${slug}" is already held by item #${existing.id} (${existing.status}) — ` +
+      "pick a different title, or edit the existing item",
+    );
   }
+
+  const dest = path.join(paths.inbox, fileName);
   mkdirSync(paths.inbox, { recursive: true });
-  writeFileSync(dest, v.markdown, "utf8");
+  // Exclusive create: a concurrent `wb new` with the same title loses
+  // cleanly instead of silently clobbering the first item's content.
+  try {
+    writeFileSync(dest, v.markdown, { encoding: "utf8", flag: "wx" });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      return fail(`inbox already has ${fileName} — run \`wb run\` to claim it first`);
+    }
+    throw err;
+  }
   return { ok: true, file: path.relative(paths.root, dest), slug, markdown: v.markdown };
 }
 
@@ -148,9 +173,9 @@ async function promptRepo(io: AuthoringIO, known: { repo: string; count: number 
       io.err("No known repo to default to — enter a repository path.");
       continue;
     }
-    const v = validateRepoPath(candidate);
+    const v = validateRepoPath(path.resolve(candidate));
     if (!v.ok) { io.err(`${v.reason} — try again.`); continue; }
-    return candidate;
+    return path.resolve(candidate);
   }
 }
 

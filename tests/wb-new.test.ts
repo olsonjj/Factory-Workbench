@@ -9,7 +9,8 @@ import {
   slugForTitle,
   validateItemDraft,
 } from "../src/frontmatter.js";
-import { authorItem, type AuthoringIO } from "../src/new.js";
+import { authorItem, buildEditorTemplate, stripEditorComments, type AuthoringIO } from "../src/new.js";
+import { splitCommand } from "../src/prompt.js";
 
 class ScriptedIO implements AuthoringIO {
   readonly prompts: string[];
@@ -251,5 +252,94 @@ describe("wb new", () => {
     expect(repos[0]!.count).toBe(1);
     expect(repos[1]!.count).toBe(1);
     expect(repos.some((r) => r.repo === "(unknown)")).toBe(false);
+  });
+
+  it("a title whose slug is already claimed fails clearly instead of dead-dropping in the inbox", async () => {
+    const harness = newHarness();
+    harness.db.insertItem({
+      slug: "add-dark-mode", title: "Add dark mode", repo: "/repo/X", base: "main",
+      approvals: [], stage: "pr", status: "done",
+    });
+
+    const result = await authorItem(
+      { title: "Add dark mode", repo: makeRepo(), description: "Different task, same title." },
+      harness.db, harness.paths, new ScriptedIO({ isInteractive: false }),
+    );
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toContain("add-dark-mode");
+    expect(result.reason).toContain("different title");
+    expect(readdirSync(harness.paths.inbox)).toHaveLength(0);
+  });
+
+  it("a title whose slug is held by a *rejected* item is allowed (resurrect-by-re-drop)", async () => {
+    const harness = newHarness();
+    const repo = makeRepo();
+    harness.db.insertItem({
+      slug: "add-dark-mode", title: "Add dark mode", repo, base: "main",
+      approvals: [], stage: "triage", status: "rejected",
+    });
+
+    const result = await authorItem(
+      { title: "Add dark mode", repo, description: "Re-worded after triage rejection." },
+      harness.db, harness.paths, new ScriptedIO({ isInteractive: false }),
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it("a relative repo path is stored as an absolute path", async () => {
+    const harness = newHarness();
+    const repo = makeRepo();
+    const relative = path.relative(process.cwd(), repo);
+
+    const result = await authorItem(
+      { title: "T", repo: relative, description: "Body." },
+      harness.db, harness.paths, new ScriptedIO({ isInteractive: false }),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.markdown).toContain(`repo: ${repo}\n`);
+  });
+
+  it("concurrent same-title creation is exclusive: existing inbox file aborts, never clobbers", async () => {
+    const harness = newHarness();
+    const repo = makeRepo();
+    const dest = path.join(harness.paths.inbox, "add-dark-mode.md");
+    harness.writeFile(dest, "---\ntitle: Pre-existing\nrepo: /x\nbase: main\napprovals: []\n---\n\nfirst\n");
+
+    const result = await authorItem(
+      { title: "Add dark mode", repo, description: "Second, later write." },
+      harness.db, harness.paths, new ScriptedIO({ isInteractive: false }),
+    );
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toContain("inbox already has");
+    // The first item's content survives untouched.
+    expect(harness.readFile(dest)).toContain("first");
+  });
+
+  it("editor comment stripping removes only the generated block; user markdown (incl. '#' lines) survives", () => {
+    const template = buildEditorTemplate({ title: "T", repo: "/r", base: "main", approvals: [] });
+    expect(template.startsWith("<!--")).toBe(true);
+    expect(template.trimEnd().endsWith("-->")).toBe(true);
+
+    const authored = template + "## Requirements\n\n- treat `-` and `_` alike\n# a lone markdown line\n";
+    const stripped = stripEditorComments(authored);
+
+    expect(stripped).toBe("## Requirements\n\n- treat `-` and `_` alike\n# a lone markdown line");
+  });
+
+  it("stripEditorComments tolerates a deleted instruction block", () => {
+    expect(stripEditorComments("\nBody only.\n")).toBe("Body only.");
+  });
+
+  it("splitEditorCommand honors quoted EDITOR paths and arguments", () => {
+    expect(splitCommand('"/opt/My Editor/bin/editor" --wait')).toEqual(["/opt/My Editor/bin/editor", "--wait"]);
+    expect(splitCommand("code -w")).toEqual(["code", "-w"]);
+    expect(splitCommand("vi")).toEqual(["vi"]);
+    expect(splitCommand("emacs -nw -f 'my fun func'")).toEqual(["emacs", "-nw", "-f", "my fun func"]);
   });
 });

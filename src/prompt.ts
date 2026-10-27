@@ -21,12 +21,45 @@ async function readPipedStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/**
+ * Split an EDITOR string into words, honoring single/double quotes
+ * (`EDITOR='"/opt/My Editor/bin/editor" --wait'` keeps the quoted path whole).
+ */
+export function splitCommand(cmd: string): string[] {
+  const parts: string[] = [];
+  let cur = "";
+  let have = false;
+  let quote: '"' | "'" | null = null;
+  for (const ch of cmd) {
+    if (quote) {
+      if (ch === quote) quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      have = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (have) parts.push(cur);
+      cur = "";
+      have = false;
+      continue;
+    }
+    cur += ch;
+    have = true;
+  }
+  if (have) parts.push(cur);
+  return parts;
+}
+
 async function openEditor(template: string): Promise<string> {
   const editor = process.env.EDITOR ?? process.env.VISUAL ?? "vi";
   const tmp = path.join(os.tmpdir(), `wb-new-${stamp()}.md`);
   writeFileSync(tmp, template, "utf8");
   try {
-    const parts = editor.split(/\s+/).filter(Boolean);
+    const parts = splitCommand(editor);
     const bin = parts[0];
     if (!bin) throw new Error("editor command is empty");
     const args = parts.slice(1);
