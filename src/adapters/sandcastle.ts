@@ -510,8 +510,18 @@ export class SandcastleCurator implements CuratorRunner {
     const { config } = this.deps;
     const model = modelFor(config.models, "curate");
     // A scratch git repo anchors the sandbox; everything real is read-only.
+    // Sandcastle's run() resolves HEAD in its cwd repo (git rev-parse), so the
+    // scratch must contain a real initial commit — a bare `git init` leaves
+    // HEAD unborn and the run aborts with "ambiguous argument 'HEAD'".
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "factory-curate-"));
     execFileSync("git", ["init", "-q"], { cwd: scratch });
+    fs.writeFileSync(path.join(scratch, "README.md"), "# scratch dir anchoring the curator sandbox (read-only mounts carry the real repos)\n");
+    execFileSync("git", ["add", "-A"], { cwd: scratch });
+    execFileSync(
+      "git",
+      ["-c", "user.name=wb", "-c", "user.email=wb@factory.workbench", "commit", "-q", "-m", "scratch anchor"],
+      { cwd: scratch },
+    );
     const mounts = Object.values(req.repoPaths).map(
       (rp): { hostPath: string; sandboxPath: string; readonly: true } => ({
         hostPath: rp,
