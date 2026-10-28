@@ -139,7 +139,7 @@ Truncation helpers use the repo's established idiom (`src/kb.ts` line 124, `src/
 ```ts
 ellipsize = (s, max) => s.length > max ? `${s.slice(0, max - 1)}…` : s
 ```
-(i.e. total length ≤ max **including** the `…`). Parked feedback/reason/note texts: `ellipsize(x, 60)`. Card content lines: `ellipsize(line, 80)`.
+(i.e. total length ≤ max **including** the `…`). Parked feedback/reason/note texts: `ellipsize(x, 60)`. Card content lines: `ellipsize(line, 78)` (content only, before the two-space indent — so the full printed line is ≤ 80 columns).
 
 ## 3. CLI wiring (`src/cli/index.ts`)
 
@@ -182,16 +182,16 @@ No factory lock is taken anywhere in this path. `maxGateAttempts = config.budget
 - After event lines, if the current items snapshot produces a card ≠ `state.lastCard`, append the card lines and update `lastCard`; otherwise append nothing. The card block is:
   ```
   ──────────────────────────────────────────────────
-    RUN: <#id slug stage> · <#id slug stage> · …
-    PARKED: <#id slug (reason)> · <#id slug (reason)> · …
+    RUN (n): <#id slug stage> · <#id slug stage> · …
+    PARKED (n): <#id slug (reason)> · <#id slug (reason)> · …
   ──────────────────────────────────────────────────
   ```
   - Separators: exactly 50 `─` characters (U+2500), matching the task's rule line.
   - Content lines are indented with exactly two leading spaces (as in the task's block).
-  - `RUN:` lists items with status `queued` or `running` (matches the literal statuses; equals `ACTIONABLE_STATUSES` in `src/types.ts` — may reference the constant, but note `pollOnce` receives plain rows so either import the constants or hardcode the two strings; importing `ACTIONABLE_STATUSES` from `src/types.js` is preferred), ordered by item id.
-  - `PARKED:` lists items whose status is any of: `awaiting-approval`, `needs-human`, `exhausted-rework`, `infrastructure-failure`, `human-rejected`, `malformed` — i.e. all `ItemStatus` values except `queued`, `running`, `done`, `rejected` (terminal, `TERMINAL_STATUSES` in `src/types.ts`). Empty → `  PARKED: none` (two leading spaces).
+  - `RUN (n):` lists items with status `queued` or `running` (matches the literal statuses; equals `ACTIONABLE_STATUSES` in `src/types.ts` — may reference the constant, but note `pollOnce` receives plain rows so either import the constants or hardcode the two strings; importing `ACTIONABLE_STATUSES` from `src/types.js` is preferred), ordered by item id. `n` is the live entry count (`run.length`). Empty → `  RUN (0): none` (two leading spaces). The live count makes the truncated line prefix change whenever the underlying set changes (see the truncation bullet below), so the change-detection diff can never go blind on appends past the truncation point.
+  - `PARKED (n):` lists items whose status is any of: `awaiting-approval`, `needs-human`, `exhausted-rework`, `infrastructure-failure`, `human-rejected`, `malformed` — i.e. all `ItemStatus` values except `queued`, `running`, `done`, `rejected` (terminal, `TERMINAL_STATUSES` in `src/types.ts`). Empty → `  PARKED (0): none` (two leading spaces). `n` is the live entry count (`parked.length`).
   - Entry format: `#<id> <slug>` for RUN; `#<id> <slug> (<reason>)` for PARKED, where `<reason>` = `ellipsize(item.parkedReason ?? "?", 60)` (short reason string, as the task says; malformed items will show `malformed front-matter: …` truncated).
-  - Each content line (the `RUN: …` / `PARKED: …` text **without** the two-space indent, so the full printed line is ≤ 82 chars) is truncated with `ellipsize(line, 80)` before indenting. Entries are joined with ` · `.
+  - Each content line (the `RUN (n): …` / `PARKED (n): …` text **without** the two-space indent, so the full printed line is ≤ 80 chars including the two-space indent) is truncated with `ellipsize(line, 78)` before indenting. Entries are joined with ` · `.
 - Card comparison is on the full rendered block string (all lines joined with `\n`), never identical twice in a row.
 
 ### 4.3 Event line rendering
@@ -268,7 +268,7 @@ Non-parked example:
 ## 7. Tests (vitest; follow `tests/watch.test.ts` + `tests/watch-integration.test.ts`; no real timers, no real OS spawns)
 
 1. **Event formatting** (`tests/watch.test.ts`): build synthetic `WatchEventRow[]` + `WatchItem` with a locally-constructed ts (see §4.3) and a fixed `maxGateAttempts` (3). Cover: claimed; resurrected; stage-start attempt 1 (no gate suffix), attempt 2 (` (gate 2/3)`); stage-pass with nextStage; stage-pass with nextStage + rounds (`(r2)`); parked `awaiting-approval` → `wb approve <slug>` hint, `⚠`, `(!)`, bell; parked `needs-human` → `wb answer <slug>`; parked `exhausted-rework` → `wb retry <slug>`; parked malformed (`detail.reason` plain, `parkedReason` starting `malformed front-matter`) → `wb retry <slug>  # fix front-matter first`; parked with null stage (omits `at <stage>`); pr-created (url from detail); answered; rejected-by-human with >60-char feedback (verify `…` at position 60); unknown event with stage and detail keys (`stage-retry test (attempt, backoffMs, error)` unknown-form example) and unknown event with null stage + empty detail; truncation of unparked feedback to 60 chars.
-2. **Card logic**: `renderCard` → `PARKED: none` variant and parked variant; truncation of a long RUN line at 80 (`…` present, length ≤ 82 incl. indent); `runWatchOnce` second-call comparison: unchanged state → `outcome.lines` empty (no card), changed parked_reason → card printed.
+2. **Card logic**: `renderCard` → counted headers (`RUN (n):` / `PARKED (n):`, zero-count `none` variants, e.g. `RUN (0): none`) and parked variant; truncation of a long RUN line at 78 content chars (`…` present, full printed line ≤ 80 chars incl. the two-space indent); `runWatchOnce` second-call comparison: unchanged state → `outcome.lines` empty (no card), changed parked_reason → card printed; regression for the truncation blind spot: a second item parking with a byte-identical 80-char-prefix reason (counted header 1→2) must still produce a reprint.
 3. **Polling/diff**: consecutive `runWatchOnce` calls — call with rows 1–3 then rows 3–10 and assert ids 1–3 are consumed only once (`state.lastEventId` advances 3 → 10; duplicate row ids produce no lines).
 4. **Interval parsing**: `parseIntervalSeconds(undefined) === 5`; `"0" → 1`; `"-3" → 1`; `"2.7" → 2`; `"abc" → 1`.
 5. **Notification**: fake `spawnFn = (cmd, args, opts) => recorded.push({cmd, args, opts})`; assert darwin call is `osascript` with one `-e` arg containing `display notification "#1 s parked at triage — needs-human" with title "Workbench"`; linux call is `notify-send` with `["-t", "5000", "Workbench", "<text>"]`; `stdio: "ignore"` and `detached: true` in opts; a throwing `spawnFn` doesn't propagate. AppleScript escaping: a text containing `"`, `\\` and a newline (e.g. a `do shell script` injection attempt) must produce an `-e` source with the quote escaped as `\"`, the backslash as `\\\\`, no raw newline, and the payload unable to terminate the string literal.
