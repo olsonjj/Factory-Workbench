@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { z } from "zod";
 import { createWorktree, pi } from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
-import type { Worktree, RunResult } from "@ai-hero/sandcastle";
+import type { Worktree, RunResult, SandboxHooks } from "@ai-hero/sandcastle";
 
 /** Read a structured-output payload from a run result. */
 function outputOf<T>(result: RunResult): T {
@@ -252,6 +252,9 @@ export class SandcastleStageRunner implements StageRunner {
             : []),
         ]
       : [];
+    // Dependency install before the agent starts — Node projects only; see
+    // sandboxReadyHooksFor() for the rationale and the non-Node skip.
+    const hooks = sandboxReadyHooksFor(wt.worktreePath);
     const piEnv = { ...this.env, ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefix }) };
     return wt.run({
       agent: pi(model, { env: piEnv }),
@@ -259,6 +262,7 @@ export class SandcastleStageRunner implements StageRunner {
         imageName: this.config.sandbox.imageName,
         ...(piConfigMounts.length > 0 ? { mounts: piConfigMounts } : {}),
       }),
+      ...(hooks ? { hooks } : {}),
       prompt: [prompt, COMPLETE].join("\n\n"),
       maxIterations: 1,
     });
@@ -609,6 +613,10 @@ ${COMPLETE}`;
         ]
       : [];
     const env = { ...(this.deps.env ?? {}), ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefix }) };
+    // Deliberately NO hooks.sandbox.onSandboxReady here (unlike wtRun): the
+    // scratch cwd has no package.json (it only hosts read-only KB mounts), so
+    // an npm install would fail and abort the run. Skipping is the designed
+    // behavior — scratch runs make no code changes that need dependencies.
     return run({
       agent: pi(opts.model, { env }),
       sandbox: docker({
@@ -620,6 +628,32 @@ ${COMPLETE}`;
       maxIterations: 1,
     });
   }
+}
+
+/**
+ * Hook payload for worktree-backed runs. Node-only: fresh git worktrees have no
+ * node_modules (gitignored) and the sandbox image is bare, so agent stages of a
+ * Node project would otherwise fail with `tsc: not found` / `vitest: not found`.
+ * Skipped for repos with no root package.json — a hook failure aborts the whole
+ * run (non-zero exit → ExecError), and the pipeline explicitly supports non-Node
+ * targets (the test stage checks package.json / Makefile / CI config), so an
+ * unconditional npm install would make every non-Node repo unprocessible.
+ * (Future polyglot support — pip/uv, go mod, etc. — can extend this selector.)
+ */
+export function sandboxReadyHooksFor(worktreePath: string): SandboxHooks | undefined {
+  if (!fs.existsSync(path.join(worktreePath, "package.json"))) return undefined;
+  // npm install (not npm ci): the worktree is bind-mounted, so node_modules
+  // installed by an earlier stage of the same item persists — subsequent runs
+  // are incremental. Lockfile still governs; --no-audit/--no-fund keep the
+  // cold install fast. Timeout raised well above the 60s default: a cold
+  // install (native module prebuilds for better-sqlite3) can be slow. A hook
+  // failure aborts the run as an infra-class failure, covered by the
+  // factory's maxInfraRetries budget.
+  return {
+    sandbox: {
+      onSandboxReady: [{ command: "npm install --no-audit --no-fund", timeoutMs: 300_000 }],
+    },
+  };
 }
 
 /** Host-side env passthrough for Ollama Cloud credentials. */
