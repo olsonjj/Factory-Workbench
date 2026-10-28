@@ -134,6 +134,27 @@ describe("kbDigestIndex (curator cross-batch digest)", () => {
     expect(linesCommented[0]).not.toContain("now wrong");
   });
 
+  it("first prose line keeps prose around INLINE comment spans, not just after closers", () => {
+    // Greptile PR #6 follow-up: strip inline spans, never drop the whole line.
+    const inline = "## 2026-10-27 — lesson (repo 3)\n\nUse vitest <!-- updated after migration -->\n\n";
+    const line = kbDigestIndex(inline, 10_000).text.split("\n")[0];
+    expect(line).toContain("Use vitest");
+    expect(line).not.toContain("updated after migration");
+
+    const around = "## 2026-10-27 — lesson (repo 4)\n\nruns tests locally <!-- scratch --><!-- old note --> before pushing\n\n";
+    const lineAround = kbDigestIndex(around, 10_000).text.split("\n")[0];
+    expect(lineAround).toContain("runs tests locally");
+    expect(lineAround).toContain("before pushing");
+
+    const closerProse = "## 2026-10-27 — lesson (repo 5)\n\n<!-- block --> the lesson: gate before push\n\n";
+    const lineCloser = kbDigestIndex(closerProse, 10_000).text.split("\n")[0];
+    expect(lineCloser).not.toContain("block");
+    expect(lineCloser).toContain("the lesson: gate before push");
+
+    const onlyComment = "## 2026-10-27 — lesson (repo 6)\n\n<!-- no prose at all -->\n\n";
+    expect(kbDigestIndex(onlyComment, 10_000).text.split("\n")[0]!.endsWith("batch 1/1")).toBe(true); // empty summary line, still one line per entry
+  });
+
   it("empty and headerless layers produce an empty, non-truncated index", () => {
     expect(kbDigestIndex("", 1000)).toEqual({ text: "", truncated: false });
     expect(kbDigestIndex("no headers, just a blob".repeat(100), 500)).toEqual({ text: "", truncated: false });

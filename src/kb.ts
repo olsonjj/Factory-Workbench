@@ -112,32 +112,49 @@ export interface KbDigestIndex {
 const INDEX_PROSE_LIMIT = 100;
 
 /** First prose line of an entry body: skips blanks, headings, code fences
- * (including their contents) and HTML comments (including multiline ones);
- * bounded to INDEX_PROSE_LIMIT chars. "Inside a fence" means between an open
- * and a close ``` line, and "inside a comment" means between an unterminated
- * `<!--` line and a `-->` line — content there is an artifact of recording,
- * not a lesson. */
+ * (including the lines inside them) and HTML comments (including multiline
+ * ones — a lesson embedded in prose after the closer is found; inline comment
+ * spans are STRIPPED so prose around them survives); bounded to
+ * INDEX_PROSE_LIMIT chars. "Inside a fence" means between an open and a close
+ * ``` line, and "inside a comment" means between an unterminated `<!--` line
+ * and a `-->` line — content there is an artifact of recording, not a
+ * lesson. */
 function firstProseLine(body: string): string {
-  let inFence = false;
+  const bound = (s: string): string => (s.length > INDEX_PROSE_LIMIT ? `${s.slice(0, INDEX_PROSE_LIMIT - 1)}…` : s);
+  let inCodeFence = false;
   let inComment = false;
   for (const raw of body.split("\n")) {
     const l = raw.trim();
-    if (inComment) {
-      if (l.includes("-->")) inComment = false;
+    if (inCodeFence) {
+      if (l.startsWith("```")) inCodeFence = false;
       continue;
     }
-    if (inFence) {
-      if (l.startsWith("```")) inFence = false;
-      continue;
-    }
-    if (!l || l.startsWith("#")) continue;
-    if (l.startsWith("```")) { inFence = true; continue; }
+    // Strip completed inline comment spans FIRST, so prose around them
+    // survives (an earlier version dropped the whole line and lost lessons
+    // like "Use vitest <!-- updated after migration -->" — Greptile PR #6).
+    let opensWithoutCloser = false;
+    let candidate = l;
     if (l.includes("<!--")) {
-      if (l.includes("-->")) continue; // single-line comment: skip the line
+      const stripped = l.replace(/<!--[\s\S]*?-->/g, " ");
+      if (stripped.includes("<!--")) opensWithoutCloser = true; // unterminated inline opener
+      candidate = stripped;
+    }
+    if (inComment) {
+      if (!candidate.includes("-->")) continue;
+      inComment = false;
+      const after = candidate.slice(candidate.indexOf("-->") + 3).trim();
+      if (after) return bound(after); // prose following the closer
+      continue;
+    }
+    if (!candidate || candidate.startsWith("#")) continue;
+    if (candidate.startsWith("```")) { inCodeFence = true; continue; }
+    if (opensWithoutCloser) {
+      const before = candidate.slice(0, candidate.indexOf("<!--")).replace(/\s+/g, " ").trim();
+      if (before) return bound(before); // prose before the unterminated opener
       inComment = true;
       continue;
     }
-    return l.length > INDEX_PROSE_LIMIT ? `${l.slice(0, INDEX_PROSE_LIMIT - 1)}…` : l;
+    if (candidate) return bound(candidate);
   }
   return "";
 }
