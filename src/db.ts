@@ -42,6 +42,13 @@ export interface HistoryFeedRow {
   detail: Record<string, unknown>;
 }
 
+/** Consistent read snapshot for read-only consumers like `wb watch`. */
+export interface WatchSnapshot {
+  items: ItemRecord[];
+  maxHistoryId: number | null;
+  historySince: HistoryFeedRow[];
+}
+
 /** Detail JSON is always stringified by `appendHistory`, but parse defensively. */
 function parseHistoryDetail(raw: string): Record<string, unknown> {
   try {
@@ -302,6 +309,22 @@ export class FactoryDb {
       | { maxId: number | null }
       | undefined;
     return row?.maxId ?? null;
+  }
+
+  /**
+   * Read-only snapshot for `wb watch`: all items plus history rows after
+   * `afterId` (when non-null), taken inside a single read transaction so the
+   * event feed and item state cannot interleave with a concurrent `wb run`.
+   * Never acquires the factory lock.
+   */
+  getWatchSnapshot(afterId: number | null): WatchSnapshot {
+    const read = this.db.transaction(() => {
+      const items = this.listItems();
+      const maxHistoryId = this.getMaxHistoryId();
+      const historySince = afterId === null ? [] : this.getHistorySince(afterId);
+      return { items, maxHistoryId, historySince };
+    });
+    return read();
   }
 
   addArtifact(itemId: number, stage: StageName | null, name: string, absPath: string): ArtifactRecord {

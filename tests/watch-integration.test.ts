@@ -89,19 +89,59 @@ describe("wb watch (integration)", () => {
     expect(existsSync(path.join(h.root, "factory.lock"))).toBe(false);
   });
 
+  it("renders events from the same snapshot as the card (single read transaction)", () => {
+    // Regression: pollOnce must consume one consistent snapshot, not separate
+    // item/history reads. Here the history row is generic (no detail reason)
+    // and the *snapshot's* item carries the malformed parked_reason — the fix
+    // hint must come from that item, proving event/item pairing.
+    const ts = "2026-10-28T10:00:00.000Z";
+    const snapshot = (afterId: number | null) => ({
+      items: [
+        {
+          id: 1,
+          slug: "fix-bugs",
+          title: "Fix bugs",
+          repo: "/tmp/repo",
+          base: "main",
+          stage: null,
+          status: "malformed",
+          parkedReason: "malformed front-matter: repo: missing",
+          parkedDetail: null,
+          feedback: null,
+          answers: null,
+          sourceFile: null,
+          branchName: null,
+          createdAt: ts,
+          updatedAt: ts,
+          gateAttempts: {},
+          infraAttempts: 0,
+        },
+      ],
+      // The prime poll establishes lastEventId=0, then the second poll sees
+      // the parked history row with the snapshot's (stale-proof) item data.
+      maxHistoryId: afterId === null ? 0 : 1,
+      historySince: afterId === null
+        ? []
+        : [{ id: 1, item_id: 1, ts, event: "parked", stage: null, detail: {} }],
+    });
+    const fake = {
+      getWatchSnapshot: snapshot,
+    } as unknown as FactoryDb;
+
+    const primed = pollOnce(fake, initialState(), 3);
+    expect(primed.lines).toEqual([]); // first poll only primes
+    const outcome = pollOnce(fake, primed.state, 3);
+    expect(outcome.lines[0]).toContain("#1 fix-bugs parked");
+    expect(outcome.lines[0]).toContain("`wb retry fix-bugs  # fix front-matter first`");
+  });
+
   it("tolerates repeated DB read failures without crashing or printing early", () => {
     const h = makeHarness();
     h.inboxFile("add-dark-mode", FM, "Body.");
     claim(h);
 
     const bad = {
-      listItems: () => {
-        throw new Error("boom");
-      },
-      getMaxHistoryId: () => {
-        throw new Error("boom");
-      },
-      getHistorySince: () => {
+      getWatchSnapshot: () => {
         throw new Error("boom");
       },
     } as unknown as FactoryDb;

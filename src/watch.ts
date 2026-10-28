@@ -293,14 +293,18 @@ function toWatchEventRow(r: HistoryFeedRow): WatchEventRow {
  */
 export function pollOnce(db: FactoryDb, state: WatchState, maxGateAttempts: number | null): WatchOutcome {
   try {
-    const items = db.listItems().map(toWatchItem);
+    // One consistent snapshot: items and history must match, otherwise an
+    // event racing a concurrent `wb run` would render with stale item data
+    // (e.g. a wrong parked fix hint that never gets corrected).
+    const snap = db.getWatchSnapshot(state.first ? null : state.lastEventId);
+    const items = snap.items.map(toWatchItem);
     if (state.first) {
-      // Prime to the current max id so nothing existing is printed.
-      const maxId = db.getMaxHistoryId() ?? 0;
+      // Prime to the snapshot's max history id so nothing existing is printed.
+      const maxId = snap.maxHistoryId ?? 0;
       const outcome = runWatchOnce([], items, { ...state, lastEventId: maxId }, maxGateAttempts);
       return { ...outcome, state: { ...outcome.state, consecutiveReadFailures: 0 } };
     }
-    const rows = db.getHistorySince(state.lastEventId).map(toWatchEventRow);
+    const rows = snap.historySince.map(toWatchEventRow);
     const outcome = runWatchOnce(rows, items, state, maxGateAttempts);
     return { ...outcome, state: { ...outcome.state, consecutiveReadFailures: 0 } };
   } catch {
