@@ -6,6 +6,13 @@ import type { FactoryPaths } from "./paths.js";
 import { itemDir, itemFile } from "./paths.js";
 import type { ItemRecord } from "./types.js";
 
+/** Sorted list of claim-candidate markdown files in the inbox. Shared by
+ *  `scanInbox` (mutating) and `wb status`'s read-only preview so the two
+ *  iterate the inbox identically. */
+export function listInboxFiles(inboxDir: string): string[] {
+  return readdirSync(inboxDir).filter((f) => f.toLowerCase().endsWith(".md")).sort();
+}
+
 /** Whether an item found at a claimed slug blocks a new claim. The single
  *  source of truth shared by `scanInbox` (mutating) and `wb status`'s
  *  read-only inbox preview — they must never diverge. Type-guard so callers
@@ -31,7 +38,7 @@ export function scanInbox(p: FactoryPaths, db: FactoryDb): InboxReport {
   const report: InboxReport = { claimed: [], malformed: [], resurrected: [], skipped: [] };
   if (!existsSync(p.inbox)) return report;
 
-  for (const fileName of readdirSync(p.inbox).filter((f) => f.toLowerCase().endsWith(".md")).sort()) {
+  for (const fileName of listInboxFiles(p.inbox)) {
     const filePath = path.join(p.inbox, fileName);
     const raw = readFileSafe(filePath);
     const baseSlug = slugify(path.basename(fileName));

@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import * as path from "node:path";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import nodeProcess from "node:process";
 
 import { loadConfig, ensureConfigFile } from "../config.js";
 import { makePaths, ensureLayout } from "../paths.js";
 import { FactoryDb } from "../db.js";
 import { acquireFactoryLock, lockHolderAlive, readLockInfo, STALE_LOCK_MS } from "../lock.js";
-import { scanInbox, claimBlocked } from "../inbox.js";
+import { scanInbox, claimBlocked, listInboxFiles } from "../inbox.js";
 import { ITEM_TEMPLATE, slugify } from "../frontmatter.js";
 import type { ItemRecord } from "../types.js";
 import { authorItem, type NewOptions } from "../new.js";
@@ -122,8 +122,8 @@ function logClaimReport(report: ReturnType<typeof scanInbox>): void {
 interface StatusFlags { all?: boolean }
 
 /** Classify unclaimed inbox files without mutating anything (read-only peer of `scanInbox`).
- *  Matches scanInbox's skip rule via the shared `claimsNewWork` predicate so
- *  "awaiting claim" means `wb run` will actually claim it. */
+ *  Matches scanInbox's skip rule via the shared `claimBlocked` predicate and
+ *  shares `listInboxFiles`, so "awaiting claim" means `wb run` will actually claim it. */
 function classifyInbox(db: FactoryDb, inboxDir: string): {
   claimable: string[];
   alreadyClaimed: { file: string; item: ItemRecord }[];
@@ -131,11 +131,11 @@ function classifyInbox(db: FactoryDb, inboxDir: string): {
 } {
   let files: string[];
   try {
-    if (!existsSync(inboxDir)) return { claimable: [], alreadyClaimed: [], error: null };
-    files = readdirSync(inboxDir).filter((f) => f.toLowerCase().endsWith(".md"));
+    // listInboxFiles throws ENOENT when the inbox doesn't exist yet — a normal
+    // settled state. Any other read error must surface, otherwise status makes
+    // an unreadable inbox look empty.
+    files = listInboxFiles(inboxDir);
   } catch (err) {
-    // Missing dir is a normal settled state; any other read error must surface,
-    // otherwise status makes an unreadable inbox look empty.
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       return { claimable: [], alreadyClaimed: [], error: null };
     }
@@ -143,7 +143,7 @@ function classifyInbox(db: FactoryDb, inboxDir: string): {
   }
   const claimable: string[] = [];
   const alreadyClaimed: { file: string; item: ItemRecord }[] = [];
-  for (const fileName of files.sort()) {
+  for (const fileName of files) {
     const existing = db.findBySlug(slugify(path.basename(fileName)));
     if (claimBlocked(existing)) {
       alreadyClaimed.push({ file: fileName, item: existing });
@@ -276,7 +276,7 @@ program
     // WAL-mode readers never block the writer or vice versa.
     const { root } = loadConfig(opts.root);
     if (!existsSync(path.join(root, "factory.db"))) {
-      console.log(`no factory.db in ${root} yet — it is created by the first write command (\`wb new\` or \`wb run\`)`);
+      console.log(`no factory.db in ${root} yet — it is created by any write command (e.g. \`wb new\` or \`wb run\`)`);
       return;
     }
     const db = FactoryDb.openReadonly(root);

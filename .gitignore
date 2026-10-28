@@ -1,9 +1,9 @@
 # NOTE: plain `node_modules` (no trailing slash) is required so this ignores
 # node_modules SYMLINKS too — `node_modules/` only matches directories.
 node_modules
-node_modules/
 dist/
 factory/
+# `*.tsbuildinfo` must not end in `/`: it matches a FILE, not a directory.
 *.tsbuildinfo
-.sandcastle/
 pi-config/
+.sandcastle/
