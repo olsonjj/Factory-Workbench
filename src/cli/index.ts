@@ -7,8 +7,8 @@ import nodeProcess from "node:process";
 import { loadConfig, ensureConfigFile } from "../config.js";
 import { makePaths, ensureLayout } from "../paths.js";
 import { FactoryDb } from "../db.js";
-import { acquireFactoryLock, lockHolderAlive, readLockInfo } from "../lock.js";
-import { scanInbox } from "../inbox.js";
+import { acquireFactoryLock, lockHolderAlive, readLockInfo, STALE_LOCK_MS } from "../lock.js";
+import { scanInbox, claimBlocked } from "../inbox.js";
 import { ITEM_TEMPLATE, slugify } from "../frontmatter.js";
 import type { ItemRecord } from "../types.js";
 import { authorItem, type NewOptions } from "../new.js";
@@ -122,7 +122,8 @@ function logClaimReport(report: ReturnType<typeof scanInbox>): void {
 interface StatusFlags { all?: boolean }
 
 /** Classify unclaimed inbox files without mutating anything (read-only peer of `scanInbox`).
- *  Matches scanInbox's skip rule so "awaiting claim" means `wb run` will actually claim it. */
+ *  Matches scanInbox's skip rule via the shared `claimsNewWork` predicate so
+ *  "awaiting claim" means `wb run` will actually claim it. */
 function classifyInbox(db: FactoryDb, inboxDir: string): {
   claimable: string[];
   alreadyClaimed: { file: string; item: ItemRecord }[];
@@ -144,7 +145,7 @@ function classifyInbox(db: FactoryDb, inboxDir: string): {
   const alreadyClaimed: { file: string; item: ItemRecord }[] = [];
   for (const fileName of files.sort()) {
     const existing = db.findBySlug(slugify(path.basename(fileName)));
-    if (existing && existing.status !== "rejected") {
+    if (claimBlocked(existing)) {
       alreadyClaimed.push({ file: fileName, item: existing });
     } else {
       claimable.push(fileName);
@@ -158,8 +159,6 @@ function formatAge(ms: number): string {
   if (ms < 60_000) return "just started";
   return `${Math.round(ms / 60_000)} min ago`;
 }
-
-const STALE_LOCK_MS = 10 * 60 * 1000;
 
 /** Shared item listing used by `wb status` (read-only, no lock needed). */
 function printStatusItems(db: FactoryDb, opts: StatusFlags): void {
@@ -275,7 +274,7 @@ program
     // Read-only status: takes no factory lock, claims nothing from the inbox,
     // and writes nothing (incl. schema). Safe to run while `wb run` is active;
     // WAL-mode readers never block the writer or vice versa.
-    const { config: _config, root } = loadConfig(opts.root);
+    const { root } = loadConfig(opts.root);
     if (!existsSync(path.join(root, "factory.db"))) {
       console.log(`no factory.db in ${root} yet — it is created by the first write command (\`wb new\` or \`wb run\`)`);
       return;
@@ -288,9 +287,8 @@ program
       if (lock) {
         const age = Date.now() - lock.ts;
         if (lockHolderAlive(lock)) {
-          const started = age < 60_000 ? "just started" : `started ${new Date(lock.ts).toLocaleTimeString()}`;
           const stale = age > STALE_LOCK_MS ? " (possibly stale)" : "";
-          console.log(`factory command in progress (pid ${lock.pid}, ${started}, ${formatAge(age)})${stale}`);
+          console.log(`factory command in progress (pid ${lock.pid}, ${formatAge(age)})${stale}`);
         } else {
           console.log(
             `stale factory lock (pid ${lock.pid}, ${formatAge(age)}) — holder is not running; ` +

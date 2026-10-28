@@ -4,6 +4,15 @@ import { parseItemMarkdown, slugify } from "./frontmatter.js";
 import type { FactoryDb } from "./db.js";
 import type { FactoryPaths } from "./paths.js";
 import { itemDir, itemFile } from "./paths.js";
+import type { ItemRecord } from "./types.js";
+
+/** Whether an item found at a claimed slug blocks a new claim. The single
+ *  source of truth shared by `scanInbox` (mutating) and `wb status`'s
+ *  read-only inbox preview — they must never diverge. Type-guard so callers
+ *  get narrowing. */
+export function claimBlocked(existing: ItemRecord | undefined): existing is ItemRecord {
+  return existing !== undefined && existing.status !== "rejected";
+}
 
 export interface InboxReport {
   claimed: { slug: string; file: string }[];
@@ -28,7 +37,7 @@ export function scanInbox(p: FactoryPaths, db: FactoryDb): InboxReport {
     const baseSlug = slugify(path.basename(fileName));
     const existing = db.findBySlug(baseSlug);
 
-    if (existing && existing.status !== "rejected") {
+    if (claimBlocked(existing)) {
       report.skipped.push({ slug: baseSlug, file: filePath, reason: `slug already claimed (item #${existing.id}, ${existing.status})` });
       continue;
     }

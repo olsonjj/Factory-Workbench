@@ -18,17 +18,25 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-export type LockInfo = { pid: number; ts: number; id: string };
+export type LockPayload = { pid: number; ts: number; id: string };
 
-/** Read the current lock holder, or null if no (parseable) lock exists. */
-export function readLockInfo(root: string): LockInfo | null {
+/** Age past which an unreleased lock is presumed dead (staleness heuristic). */
+export const STALE_LOCK_MS = 10 * 60 * 1000;
+
+/** Parse a lock file at an exact path; null if missing or shape-invalid. */
+function parseLock(lockPath: string): LockPayload | null {
   try {
-    const raw = JSON.parse(readFileSync(path.join(root, "factory.lock"), "utf8")) as LockInfo;
+    const raw = JSON.parse(readFileSync(lockPath, "utf8")) as LockPayload;
     if (Number.isInteger(raw?.pid) && raw.pid > 0 && typeof raw.ts === "number") return raw;
     return null;
   } catch {
     return null;
   }
+}
+
+/** Read the current lock holder, or null if no (parseable) lock exists. */
+export function readLockInfo(root: string): LockInfo | null {
+  return parseLock(path.join(root, "factory.lock"));
 }
 
 /** Whether the process recorded in the lock is still alive. */
@@ -37,21 +45,16 @@ export function lockHolderAlive(info: LockInfo): boolean {
 }
 
 function lockStale(lockPath: string): boolean {
+  const holder = parseLock(lockPath);
+  if (holder) return !pidAlive(holder.pid);
   try {
-    const raw = JSON.parse(readFileSync(lockPath, "utf8")) as { pid?: unknown };
-    const pid = Number(raw.pid);
-    if (Number.isInteger(pid) && pid > 0) return !pidAlive(pid);
-  } catch {
-    /* unparseable — fall through to age */
-  }
-  try {
-    return Date.now() - statSync(lockPath).mtimeMs > 10 * 60 * 1000;
+    return Date.now() - statSync(lockPath).mtimeMs > STALE_LOCK_MS;
   } catch {
     return false;
   }
 }
 
-type LockPayload = { pid: number; ts: number; id: string };
+export type LockInfo = LockPayload;
 
 export function acquireFactoryLock(root: string): () => void {
   mkdirSync(root, { recursive: true });
