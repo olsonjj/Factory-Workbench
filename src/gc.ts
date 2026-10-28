@@ -45,8 +45,12 @@ export interface GcFinding {
   headSha: string | null;
   /** Recursive du-style sum, approximate. */
   sizeBytes: number | null;
-  /** `git status --porcelain` non-empty (same probe as sandcastle); null = unknown/not probed. */
+  /** `git status --porcelain` non-empty (same probe as sandcastle); false = provably clean (or the
+   *  worktree dir is gone — nothing to lose); null = probe failed on an existing dir (unknown,
+   *  holds the reap like dirty). */
   dirty: boolean | null;
+  /** Admin-locked (`git worktree lock`) — operator-retained; never reaped, reported as kept. */
+  locked: boolean;
   openPr: { number: number; url: string; draft: boolean } | null | "unknown";
   /** `git merge-base --is-ancestor <branch> <item.base>`; null when unprobeable. */
   mergedIntoBase: boolean | null;
@@ -162,6 +166,7 @@ export function makeGcFinding(
     headSha: null,
     sizeBytes: null,
     dirty: null,
+    locked: false,
     openPr: null,
     mergedIntoBase: null,
     orphan: false,
@@ -198,6 +203,18 @@ function exitCodeOf(err: unknown): number | null {
 function errText(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
   return msg.split("\n")[0] ?? msg;
+}
+
+/** Same probe as sandcastle's `hasUncommittedChanges` (§ spec 1.2) so gc's
+ *  dirty classification matches sandcastle's worktree-reuse behavior.
+ *  Fact semantics are conservative: a *missing* worktree dir is false
+ *  (nothing to lose — the reaper can only prune the registration); a failed
+ *  probe on an *existing* dir is null — unknown holds the reap like dirty
+ *  (AC: never reap without `--force-dirty` unless provably clean). */
+function dirtyProbe(worktreePath: string): boolean | null {
+  if (!fs.existsSync(worktreePath)) return false;
+  const status = statusPorcelain(worktreePath);
+  return status === null ? null : status.trim() !== "";
 }
 
 /** Same probe as sandcastle's `hasUncommittedChanges` (§ spec 1.2) so gc's
@@ -341,6 +358,8 @@ interface WtBlock {
   path: string;
   head: string | null;
   branch: string | null;
+  /** `git worktree lock` — operator-retained; gc never unlocks or reaps. */
+  locked: boolean;
 }
 
 function parseWorktreePorcelain(out: string): WtBlock[] {
@@ -349,12 +368,14 @@ function parseWorktreePorcelain(out: string): WtBlock[] {
   for (const line of out.split("\n")) {
     if (line.startsWith("worktree ")) {
       if (cur) blocks.push(cur);
-      cur = { path: line.slice("worktree ".length).trim(), head: null, branch: null };
+      cur = { path: line.slice("worktree ".length).trim(), head: null, branch: null, locked: false };
     } else if (cur && line.startsWith("HEAD ")) {
       cur.head = line.slice("HEAD ".length).trim();
     } else if (cur && line.startsWith("branch ")) {
       const ref = line.slice("branch ".length).trim();
       cur.branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : null;
+    } else if (cur && line.startsWith("locked")) {
+      cur.locked = true;
     }
   }
   if (cur) blocks.push(cur);
@@ -410,7 +431,6 @@ export class GitGcScanner implements GcScanner {
     for (const item of sorted) {
       const holder = linked.find((b) => b.branch === item.branchName);
       if (!holder) continue;
-      const status = statusPorcelain(holder.path);
       findings.push(
         makeGcFinding({
           kind: "worktree",
@@ -423,7 +443,8 @@ export class GitGcScanner implements GcScanner {
           branch: holder.branch,
           headSha: holder.head,
           sizeBytes: dirSize(holder.path),
-          dirty: status === null ? null : status.trim() !== "",
+          dirty: dirtyProbe(holder.path),
+          locked: holder.locked,
           mergedIntoBase: mergeBaseProbe(repo, item.branchName, item.base),
           openPr: null,
           orphan: false,
@@ -466,7 +487,6 @@ export class GitGcScanner implements GcScanner {
     for (const b of linked) {
       if (!b.branch || !b.branch.startsWith("factory/")) continue;
       if (byBranch.has(b.branch)) continue;
-      const status = statusPorcelain(b.path);
       findings.push(
         makeGcFinding({
           kind: "worktree",
@@ -475,7 +495,8 @@ export class GitGcScanner implements GcScanner {
           branch: b.branch,
           headSha: b.head,
           sizeBytes: dirSize(b.path),
-          dirty: status === null ? null : status.trim() !== "",
+          dirty: dirtyProbe(b.path),
+          locked: b.locked,
           orphan: true,
         }),
       );
@@ -531,9 +552,10 @@ export class GitGcScanner implements GcScanner {
 
 // ---------------------------------------------------------------- reaper
 
-/** Real reaper: `git worktree remove --force` (after a best-effort unlock for
- *  admin-locked worktrees), `git branch -D`, `fs.rmSync` for bare leftover
- *  dirs. Safety is owned by the planner's merge-base check, hence `-D`. */
+/** Real reaper: `git worktree remove --force` (locked worktrees never reach
+ *  the reaper — classifyFinding keeps them out of the plan set), `git branch -D`,
+ *  `fs.rmSync` for bare leftover dirs. Safety is owned by the planner's
+ *  merge-base check, hence `-D`. */
 export class GitGcReaper implements GcReaper {
   async reap(plan: GcReapPlan): Promise<{ statusPorcelain: string; detail: string }> {
     const f = plan.finding;
@@ -562,11 +584,6 @@ export class GitGcReaper implements GcReaper {
         /* best effort */
       }
       return { statusPorcelain: status, detail: `worktree ${p} already gone (pruned registration)` };
-    }
-    try {
-      execFileSync("git", ["-C", f.repo, "worktree", "unlock", p], { encoding: "utf8", timeout: 30_000, stdio: ["ignore", "pipe", "pipe"] });
-    } catch {
-      /* not locked — fine */
     }
     execFileSync("git", ["-C", f.repo, "worktree", "remove", "--force", p], {
       encoding: "utf8",
@@ -624,6 +641,14 @@ export function classifyFinding(
       : { action: "report-only", requiresFlag: "--force-orphans", reason: "orphan leftover dir — needs --force-orphans" };
   }
   // kind === "worktree"
+  // Locked worktrees are operator-retained — never reaped, never unlocked.
+  if (f.locked) {
+    return { action: "keep", requiresFlag: null, reason: "admin-locked — skipped" };
+  }
+  // Conservative dirty handling (AC: never reap unless provably clean or
+  // --force-dirty): unknown (null) holds like dirty — the scanner marks a
+  // *missing* worktree dir false (nothing to lose; prune-only path).
+  const heldDirty = f.dirty !== false;
   const dirty = f.dirty === true;
   if (f.orphan || f.itemId === null) {
     // Rule 3: report-only by default — after `wb init` a rebuilt DB makes
@@ -631,8 +656,8 @@ export function classifyFinding(
     if (!flags.forceOrphans) {
       return { action: "report-only", requiresFlag: "--force-orphans", reason: "orphan — no item row; needs --force-orphans" };
     }
-    if (dirty && !flags.forceDirty) {
-      return { action: "report-only", requiresFlag: "--force-dirty", reason: "orphan — dirty; needs --force-dirty" };
+    if (heldDirty && !flags.forceDirty) {
+      return { action: "report-only", requiresFlag: "--force-dirty", reason: dirty ? "orphan — dirty" : "orphan — dirty state unknown" };
     }
     return {
       action: "remove",
@@ -641,8 +666,8 @@ export function classifyFinding(
     };
   }
   if (terminal) {
-    if (dirty && !flags.forceDirty) {
-      return { action: "remove", requiresFlag: "--force-dirty", reason: "terminal item — dirty; needs --force-dirty" };
+    if (heldDirty && !flags.forceDirty) {
+      return { action: "remove", requiresFlag: "--force-dirty", reason: dirty ? "terminal item — dirty" : "terminal item — dirty state unknown" };
     }
     return {
       action: "remove",
@@ -653,11 +678,11 @@ export function classifyFinding(
   // Rule 5 (the crash-recovery repair): a worktree holding a non-terminal
   // item's branch is stale by construction under the gc lock; reap it (dirty
   // gated) while keeping the branch — the item is resumable on its branch.
-  if (dirty && !flags.forceDirty) {
+  if (heldDirty && !flags.forceDirty) {
     return {
       action: "remove",
       requiresFlag: "--force-dirty",
-      reason: "stale — dirty; branch protected: item non-terminal",
+      reason: dirty ? "stale — dirty" : "stale — dirty state unknown",
     };
   }
   return {
@@ -936,7 +961,8 @@ export function renderGcHuman(result: GcResult): string {
     }
     for (const [itemId, list] of [...byItem.entries()].sort((a, b) => a[0] - b[0])) {
       const first = list[0]!;
-      lines.push(`#${itemId} ${first.slug} [${first.itemStatus}] repo=${r.repo}`);
+      const updated = first.itemUpdatedAt ? ` updated=${first.itemUpdatedAt}` : "";
+      lines.push(`#${itemId} ${first.slug} [${first.itemStatus}] repo=${r.repo}${updated}`);
       for (const f of list) {
         if (f.kind === "worktree") {
           const nonTerminal = !isTerminal(f.itemStatus);

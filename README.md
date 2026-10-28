@@ -121,7 +121,9 @@ of any dirty reap is recorded into the item's artifacts first, behind
 only what is provably merged into the recorded base (local `merge-base`;
 squash/rebase merges need `--force-branches` after a probe confirms no open
 PR). Orphans (worktrees no item row references) are report-only unless
-`--force-orphans` — a rebuilt DB never triggers mass deletion.
+`--force-orphans` — a rebuilt DB never triggers mass deletion. An unknown
+dirty state (a failed probe) holds like dirty, and admin-locked worktrees
+(`git worktree lock`) are reported as kept and never unlocked or reaped.
 
 What the operator sees — `wb status` shows every item's state, including *why*
 anything is parked:

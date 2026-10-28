@@ -83,7 +83,16 @@
    on `--apply` as the rule-5 stale-branch repair — this is the narrow
    exception that fixes the crash-recovery critical path (a leaked worktree
    holding `factory/<slug>` blocks `createWorktree` on resume/retry). Dirty
-   worktrees require `--force-dirty`.
+   worktrees require `--force-dirty`. An **unknown** dirty state (`git status
+   --porcelain` failing on an existing dir) holds like dirty — the scanner
+   marks a *missing* worktree dir false (nothing to lose; the reaper can only
+   prune the registration), so unknown means probe-failure only.
+
+   **Admin-locked worktrees** (`git worktree lock`) are operator-retained:
+   reported as `keep (admin-locked — skipped)`, never unlocked and never reaped.
+   (The first implementation best-effort-unlocked before remove; review
+   flagged the bypass and it was removed — a lock is the operator saying
+   "don't touch this worktree".)
    *(Delta vs. the ticket's rule-2 phrasing "never reap their worktree": the
    ticket's own example output — `#9 bad-spec [exhausted-rework] … worktree:
    → remove` — and its end-to-end acceptance criterion (a `queued` item's
@@ -109,6 +118,8 @@
    branch count, orphan factory branches (no item row, no worktree),
    `.sandcastle/.env` presence, `.sandcastle/logs` file count. Never touched
    by any flag; factory-root `logs/`/`proposals/` retention is out of scope.
+   *(The `.env`/logs lines are an implementation extra beyond the ticket's
+   rule 6 — report-only and harmless; kept for completeness.)*
 
 ### 2.2 History events
 
@@ -134,7 +145,8 @@ convention) per affected item-bound finding:
 | worktree of non-terminal item, clean | remove (branch protected: item non-terminal) | remove (rule-5 repair) | — |
 | worktree of non-terminal item, dirty | remove (needs --force-dirty) | hold | `--force-dirty` |
 | branch of non-terminal item | keep — live — protected | keep | never deleted |
-| orphan worktree / prunable dir | report (needs --force-orphans) | hold | `--force-orphans` |
+| orphan worktree / prunable dir | report (needs --force-orphans) | hold | `--force-orphans` (a dirty orphan additionally requires `--force-dirty` — the ticket's dirty AC applies to every reap) |
+| admin-locked worktree | keep (admin-locked — skipped) | keep | — (never unlocked) |
 | unreachable repo | repo-level note | nothing | — |
 
 ## 3. Module and seam

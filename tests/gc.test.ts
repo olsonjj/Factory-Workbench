@@ -14,6 +14,7 @@ import {
   GitGcScanner,
   GitGcReaper,
   ZERO_GC_FLAGS,
+  renderGcHuman,
   type GcFlags,
   type GcFinding,
   type GcReapPlan,
@@ -108,8 +109,7 @@ function addManagedWorktree(repo: GitRepo, branch: string): string {
   return wt;
 }
 
-function commitFile(repo: GitRepo, cwd: string, file: string, content: string): void {
-  void repo;
+function commitFile(cwd: string, file: string, content: string): void {
   fs.writeFileSync(path.join(cwd, file), content);
   execFileSync(
     "git",
@@ -128,7 +128,15 @@ function worktreePaths(repo: GitRepo): string[] {
     .git(["worktree", "list", "--porcelain"])
     .split("\n")
     .filter((l) => l.startsWith("worktree "))
-    .map((l) => l.slice("worktree ".length));
+    .map((l) => l.slice("worktree ".length))
+    .map((p) => {
+      // git realpaths worktree paths; macOS hosts sit under symlinked /var|/tmp.
+      try {
+        return fs.realpathSync(p);
+      } catch {
+        return p;
+      }
+    });
 }
 
 function branchExists(repo: GitRepo, branch: string): boolean {
@@ -265,6 +273,37 @@ describe("planGc (pure decision matrix)", () => {
     const br = branchFinding({ itemId: 1, slug: "a", itemStatus: "done", branch: "factory/a", mergedIntoBase: true });
     const plans = planGc(report(wt, br), flags({ apply: true, deleteBranches: true }));
     expect(ops(plans)).toEqual(["remove-worktree", "delete-branch"]);
+  });
+
+  it("holds an UNKNOWN dirty state (probe failed) like dirty, in every reap path", () => {
+    // dirty: null = probe failed on an existing dir — never reap without
+    // --force-dirty (AC: no reap of uncommitted changes without the flag).
+    const terminal = worktreeFinding({ itemId: 1, slug: "a", itemStatus: "done", branch: "factory/a", dirty: null });
+    expect(classifyFinding(terminal, APPLY)).toMatchObject({ action: "remove", requiresFlag: "--force-dirty" });
+    expect(ops(planGc(report(terminal), APPLY))).toEqual([]);
+    expect(ops(planGc(report(terminal), flags({ apply: true, forceDirty: true })))).toEqual(["remove-worktree"]);
+
+    const stale = worktreeFinding({ itemId: 9, slug: "b", itemStatus: "infrastructure-failure", branch: "factory/b", dirty: null });
+    expect(ops(planGc(report(stale), APPLY))).toEqual([]);
+    expect(ops(planGc(report(stale), flags({ apply: true, forceDirty: true })))).toEqual(["remove-worktree"]);
+
+    const orphan = worktreeFinding({ branch: "factory/gone", orphan: true, dirty: null });
+    expect(classifyFinding(orphan, flags({ apply: true, forceOrphans: true }))).toMatchObject({
+      action: "report-only",
+      requiresFlag: "--force-dirty",
+    });
+    expect(ops(planGc(report(orphan), flags({ apply: true, forceOrphans: true })))).toEqual([]);
+  });
+
+  it("keeps an admin-locked worktree and shields its branch from deletion", () => {
+    const wt = worktreeFinding({ itemId: 1, slug: "a", itemStatus: "done", branch: "factory/a", dirty: false, locked: true });
+    expect(classifyFinding(wt, flags({ apply: true, forceDirty: true, forceOrphans: true }))).toMatchObject({
+      action: "keep",
+      reason: "admin-locked — skipped",
+    });
+    const br = branchFinding({ itemId: 1, slug: "a", itemStatus: "done", branch: "factory/a", mergedIntoBase: true });
+    // The worktree is kept, so even a merge-base-provable branch stays.
+    expect(ops(planGc(report(wt, br), flags({ apply: true, deleteBranches: true })))).toEqual([]);
   });
 });
 
@@ -404,6 +443,43 @@ describe("runGc (fake scanner + spy reaper + real FactoryDb)", () => {
   });
 });
 
+describe("renderGcHuman (ticket output shape)", () => {
+  const repo = "/repos/watchdog";
+  function worktreeFinding(over: Partial<GcFinding> = {}): GcFinding {
+    return makeGcFinding({ kind: "worktree", repo, path: path.join(repo, ".sandcastle/worktrees/factory-x"), ...over });
+  }
+  function report(...findings: GcFinding[]): RepoReport[] {
+    return [{ repo, reachable: true, findings, housekeeping: { repo, reachable: true, prunableDirs: [], factoryBranchCount: 0, factoryBranchOrphans: [], sandcastleAdjacents: { envDotFile: false, logFiles: 0 } } }];
+  }
+  function renderReport(findings: GcFinding[]): string {
+    return renderGcHuman({
+      generatedAt: "2026-10-28T00:00:00.000Z",
+      reportOnly: true,
+      flags: { apply: false, deleteBranches: false, forceBranches: false, forceDirty: false, forceOrphans: false },
+      reports: report(...findings),
+      reaped: [],
+      errors: [],
+      summary: { worktreesReapable: 0, worktreeBytes: 0, branchesDeletable: 0, branchesKeepUnmerged: 0, orphans: 0 },
+    });
+  }
+
+  it("prints the item header with last activity (itemUpdatedAt)", () => {
+    const f = worktreeFinding({
+      itemId: 1,
+      slug: "a",
+      itemStatus: "done",
+      itemUpdatedAt: "2026-10-28T13:00:00.000Z",
+      branch: "factory/a",
+      dirty: false,
+      action: "remove",
+      requiresFlag: null,
+      reason: "terminal item",
+    });
+    const out = renderReport([f]);
+    expect(out).toContain("#1 a [done] repo=/repos/watchdog updated=2026-10-28T13:00:00.000Z");
+  });
+});
+
 // ---------------------------------------------------------------- real-git scanner tests
 
 describe("GitGcScanner / GitGcReaper (real git, temp repos)", () => {
@@ -429,7 +505,7 @@ describe("GitGcScanner / GitGcReaper (real git, temp repos)", () => {
     const h = makeHarness();
     const item = insertItem(h, { slug: "fix-flaky", repo: repo.dir, status: "done" });
     const wt = addManagedWorktree(repo, item.branchName);
-    commitFile(repo, wt, "src.ts", "export const x = 1;\n");
+    commitFile(wt, "src.ts", "export const x = 1;\n");
 
     const report = await new GitGcScanner().scanTarget(fs.realpathSync(repo.dir), [item]);
     expect(report.reachable).toBe(true);
@@ -463,7 +539,8 @@ describe("GitGcScanner / GitGcReaper (real git, temp repos)", () => {
     const repo = makeRepo();
     const h = makeHarness();
     addManagedWorktree(repo, "factory/gone-item"); // no DB row for it
-    const leftover = path.join(repo.dir, ".sandcastle", "worktrees", "factory-crash-leftover");
+    const repoReal = fs.realpathSync(repo.dir);
+    const leftover = path.join(repoReal, ".sandcastle", "worktrees", "factory-crash-leftover");
     fs.mkdirSync(leftover, { recursive: true });
     fs.writeFileSync(path.join(leftover, "half-written.txt"), "x");
 
@@ -480,12 +557,34 @@ describe("GitGcScanner / GitGcReaper (real git, temp repos)", () => {
     expect(report.housekeeping.factoryBranchOrphans).toEqual([]); // factory/gone-item is held by a worktree
   });
 
+  it("never reaps or unlocks an admin-locked worktree (scan + apply)", async () => {
+    const repo = makeRepo();
+    const h = makeHarness();
+    const item = insertItem(h, { slug: "locked-item", repo: repo.dir, status: "done" });
+    const wt = addManagedWorktree(repo, item.branchName);
+    repo.git(["worktree", "lock", wt]);
+
+    const scan = await new GitGcScanner().scanTarget(repo.dir, [item]);
+    const f = scan.findings.find((x) => x.kind === "worktree")!;
+    expect(f.locked).toBe(true);
+    expect(f.action).toBe("keep");
+    expect(f.reason).toBe("admin-locked — skipped");
+
+    const result = await runGc(
+      { db: h.db, paths: h.paths, scanner: new GitGcScanner(), reaper: new GitGcReaper() },
+      flags({ apply: true, forceDirty: true, forceOrphans: true }),
+    );
+    expect(result.errors).toEqual([]);
+    expect(fs.existsSync(wt)).toBe(true); // untouched
+    expect(h.db.getHistory(item.id).some((r) => r.event === "gc")).toBe(false);
+  });
+
   it("probes merge-base for merged vs unmerged branches", async () => {
     const repo = makeRepo();
     const h = makeHarness();
     const item = insertItem(h, { slug: "merged-item", repo: repo.dir, status: "done" });
     const wt = addManagedWorktree(repo, item.branchName);
-    commitFile(repo, wt, "feature.txt", "done\n");
+    commitFile(wt, "feature.txt", "done\n");
     execFileSync("git", ["-C", repo.dir, "merge", "--ff-only", item.branchName], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 
     const report = await new GitGcScanner().scanTarget(repo.dir, [item]);
@@ -508,7 +607,7 @@ describe("GitGcScanner / GitGcReaper (real git, temp repos)", () => {
     const h = makeHarness();
     const item = insertItem(h, { slug: "reap-me", repo: repo.dir, status: "done" });
     const wt = addManagedWorktree(repo, item.branchName);
-    commitFile(repo, wt, "feature.txt", "done\n");
+    commitFile(wt, "feature.txt", "done\n");
     execFileSync("git", ["-C", repo.dir, "merge", "--ff-only", item.branchName], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 
     const result = await runGc(
@@ -516,7 +615,7 @@ describe("GitGcScanner / GitGcReaper (real git, temp repos)", () => {
       flags({ apply: true, deleteBranches: true }),
     );
     expect(result.errors).toEqual([]);
-    expect(worktreePaths(repo)).toEqual([repo.dir]);
+    expect(worktreePaths(repo)).toEqual([fs.realpathSync(repo.dir)]);
     expect(fs.existsSync(wt)).toBe(false);
     expect(branchExists(repo, item.branchName)).toBe(false);
     const gcRows = h.db.getHistory(item.id).filter((r) => r.event === "gc");
@@ -558,7 +657,8 @@ describe("GitGcScanner / GitGcReaper (real git, temp repos)", () => {
     // this item's branch is unrelated to the orphan below.
     insertItem(h, { slug: "unrelated", repo: repo.dir, status: "done" });
     const orphanWt = addManagedWorktree(repo, "factory/gone-item");
-    const leftover = path.join(repo.dir, ".sandcastle", "worktrees", "factory-crash-leftover");
+    const repoReal = fs.realpathSync(repo.dir);
+    const leftover = path.join(repoReal, ".sandcastle", "worktrees", "factory-crash-leftover");
     fs.mkdirSync(leftover, { recursive: true });
 
     const held = await runGc(
@@ -618,7 +718,7 @@ describe("crash-recovery E2E (real git + real sandcastle createWorktree)", () =>
 
     // The leaked worktree is gone; the branch (the item's only work) survives.
     expect(fs.existsSync(leaked)).toBe(false);
-    expect(worktreePaths(repo)).toEqual([repo.dir]);
+    expect(worktreePaths(repo)).toEqual([fs.realpathSync(repo.dir)]);
     expect(branchExists(repo, item.branchName)).toBe(true);
     const gcRow = h.db.getHistory(item.id).find((r) => r.event === "gc")!;
     expect(gcRow.detail).toMatchObject({ reason: "stale-branch-conflict-repair" });
@@ -632,3 +732,4 @@ describe("crash-recovery E2E (real git + real sandcastle createWorktree)", () =>
     }
   }, 120_000);
 });
+
