@@ -25,6 +25,11 @@ describe("getPiConfigStage", () => {
   });
 
   const factoryRoot = (): string => fs.mkdtempSync(path.join(os.tmpdir(), "factory-pi-stage-"));
+  /** Give the fixture host the minimal pi config file (only auth.json today). */
+  const giveHostAuth = (): void => {
+    fs.mkdirSync(path.join(homeFixture, ".pi", "agent"), { recursive: true });
+    fs.writeFileSync(path.join(homeFixture, ".pi", "agent", "auth.json"), '{"key":"k"}');
+  };
 
   it("returns null (and stages nothing) when the host has no pi config files", () => {
     const root = factoryRoot();
@@ -33,8 +38,7 @@ describe("getPiConfigStage", () => {
   });
 
   it("stages the host config files into <factoryRoot>/pi-config", () => {
-    fs.mkdirSync(path.join(homeFixture, ".pi", "agent"), { recursive: true });
-    fs.writeFileSync(path.join(homeFixture, ".pi", "agent", "auth.json"), '{"key":"k"}');
+    giveHostAuth();
     const root = factoryRoot();
     const staged = getPiConfigStage(root);
     expect(staged).not.toBeNull();
@@ -44,8 +48,7 @@ describe("getPiConfigStage", () => {
   });
 
   it("caches the stage while its directory exists", () => {
-    fs.mkdirSync(path.join(homeFixture, ".pi", "agent"), { recursive: true });
-    fs.writeFileSync(path.join(homeFixture, ".pi", "agent", "auth.json"), '{"key":"k"}');
+    giveHostAuth();
     const root = factoryRoot();
     const first = getPiConfigStage(root);
     // Mutate the staged copy; the cache must keep returning the SAME stage.
@@ -56,8 +59,7 @@ describe("getPiConfigStage", () => {
   });
 
   it("self-heals: re-stages when the staged directory was deleted", () => {
-    fs.mkdirSync(path.join(homeFixture, ".pi", "agent"), { recursive: true });
-    fs.writeFileSync(path.join(homeFixture, ".pi", "agent", "auth.json"), '{"key":"k"}');
+    giveHostAuth();
     const root = factoryRoot();
     expect(getPiConfigStage(root)).not.toBeNull();
     // Factory root rebuilt (e.g. harness cleanup between suites, operator wipe).
@@ -73,8 +75,7 @@ describe("getPiConfigStage", () => {
     expect(getPiConfigStage(root)).toBeNull();
     // Host config appears afterwards — the latest call must pick it up rather
     // than returning the stale null forever.
-    fs.mkdirSync(path.join(homeFixture, ".pi", "agent"), { recursive: true });
-    fs.writeFileSync(path.join(homeFixture, ".pi", "agent", "auth.json"), '{"key":"k"}');
+    giveHostAuth();
     expect(getPiConfigStage(root)).not.toBeNull();
   });
 });
