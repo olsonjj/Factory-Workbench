@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import * as path from "node:path";
+import { existsSync, readdirSync } from "node:fs";
 import nodeProcess from "node:process";
 
 import { loadConfig, ensureConfigFile } from "../config.js";
 import { makePaths, ensureLayout } from "../paths.js";
 import { FactoryDb } from "../db.js";
-import { acquireFactoryLock } from "../lock.js";
+import { acquireFactoryLock, lockHolderAlive, readLockInfo } from "../lock.js";
 import { scanInbox } from "../inbox.js";
 import { ITEM_TEMPLATE } from "../frontmatter.js";
 import { authorItem, type NewOptions } from "../new.js";
@@ -119,6 +120,51 @@ function logClaimReport(report: ReturnType<typeof scanInbox>): void {
 
 interface StatusFlags { all?: boolean }
 
+/** List the unclaimed markdown files still sitting in the inbox (non-mutating). */
+function inboxPendingFiles(inboxDir: string): string[] {
+  try {
+    if (!existsSync(inboxDir)) return [];
+    return readdirSync(inboxDir).filter((f) => f.toLowerCase().endsWith(".md"));
+  } catch {
+    return [];
+  }
+}
+
+/** Shared item listing used by `wb status` (read-only, no lock needed). */
+function printStatusItems(db: FactoryDb, opts: StatusFlags): void {
+  const items = db.listItems().filter((i) => opts.all || i.status !== "done");
+  if (items.length === 0) {
+    console.log("No items. Drop a markdown file in the inbox: `wb template`");
+  }
+  for (const item of items) {
+    console.log(`#${item.id} ${item.slug} [${item.status}] stage=${item.stage} repo=${item.repo}`);
+    console.log(`    title: ${item.title}`);
+    if (item.sourceFile) console.log(`    source: ${item.sourceFile}`);
+    if (item.parkedReason) console.log(`    parked: ${item.parkedReason}`);
+    if (item.parkedDetail) {
+      const d = item.parkedDetail;
+      if (Array.isArray(d.questions) && d.questions.length > 0) {
+        console.log("    questions:");
+        for (const q of d.questions as string[]) console.log(`      - ${q}`);
+      }
+      if (typeof d.stage === "string" && d.stage !== item.stage) {
+        console.log(`    completed stage: ${d.stage}`);
+      }
+      if (item.parkedReason === "awaiting-approval") {
+        const artifacts = db.getArtifacts(item.id).filter((a) => a.stage === d.stage);
+        if (artifacts.length > 0) {
+          console.log(`    artifact from ${d.stage}: ` + artifacts.map((a) => a.path).join(", "));
+        }
+      }
+    }
+    const attempts = Object.entries(item.gateAttempts);
+    if (attempts.length > 0) {
+      console.log(`    gate attempts: ${attempts.map(([s, n]) => `${s}=${n}`).join(", ")}`);
+    }
+    if (item.infraAttempts > 0) console.log(`    infra retries so far: ${item.infraAttempts}`);
+  }
+}
+
 program
   .name("wb")
   .description("A small, sequentially-processing software factory: markdown inbox in, reviewed pull request out.");
@@ -195,40 +241,25 @@ program
   .option("--root <dir>", "factory root directory")
   .option("--all", "also show finished/archived items")
   .action(async (opts: { root?: string } & StatusFlags) => {
-    await withFactory(opts.root, ({ db, claimReport }) => {
-      logClaimReport(claimReport);
-      const items = db.listItems().filter((i) => opts.all || i.status !== "done");
-      if (items.length === 0) {
-        console.log("No items. Drop a markdown file in the inbox: `wb template`");
+    // Read-only status: takes no factory lock, claims nothing from the inbox,
+    // and writes nothing (incl. schema). Safe to run while `wb run` is active;
+    // WAL-mode readers never block the writer or vice versa.
+    const { config: _config, root } = loadConfig(opts.root);
+    const db = FactoryDb.openReadonly(root);
+    try {
+      const lock = readLockInfo(root);
+      if (lock && lockHolderAlive(lock)) {
+        const started = new Date(lock.ts);
+        console.log(`run in progress (pid ${lock.pid}, started ${started.toLocaleTimeString()}, ${Math.max(1, Math.round((Date.now() - lock.ts) / 60_000))} min ago)`);
       }
-      for (const item of items) {
-        console.log(`#${item.id} ${item.slug} [${item.status}] stage=${item.stage} repo=${item.repo}`);
-        console.log(`    title: ${item.title}`);
-        if (item.sourceFile) console.log(`    source: ${item.sourceFile}`);
-      if (item.parkedReason) console.log(`    parked: ${item.parkedReason}`);
-      if (item.parkedDetail) {
-        const d = item.parkedDetail;
-        if (Array.isArray(d.questions) && d.questions.length > 0) {
-          console.log("    questions:");
-          for (const q of d.questions as string[]) console.log(`      - ${q}`);
-        }
-        if (typeof d.stage === "string" && d.stage !== item.stage) {
-          console.log(`    completed stage: ${d.stage}`);
-        }
-        if (item.parkedReason === "awaiting-approval") {
-          const artifacts = db.getArtifacts(item.id).filter((a) => a.stage === d.stage);
-          if (artifacts.length > 0) {
-            console.log(`    artifact from ${d.stage}: ` + artifacts.map((a) => a.path).join(", "));
-          }
-        }
+      const pending = inboxPendingFiles(makePaths(root).inbox);
+      if (pending.length > 0) {
+        console.log(`inbox: ${pending.length} file(s) awaiting claim (claiming happens in \`wb run\`)`);
       }
-      const attempts = Object.entries(item.gateAttempts);
-      if (attempts.length > 0) {
-        console.log(`    gate attempts: ${attempts.map(([s, n]) => `${s}=${n}`).join(", ")}`);
-      }
-      if (item.infraAttempts > 0) console.log(`    infra retries so far: ${item.infraAttempts}`);
-      }
-    });
+      printStatusItems(db, opts);
+    } finally {
+      db.close();
+    }
   });
 
 program

@@ -18,6 +18,24 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+export type LockInfo = { pid: number; ts: number; id: string };
+
+/** Read the current lock holder, or null if no (parseable) lock exists. */
+export function readLockInfo(root: string): LockInfo | null {
+  try {
+    const raw = JSON.parse(readFileSync(path.join(root, "factory.lock"), "utf8")) as LockInfo;
+    if (Number.isInteger(raw?.pid) && raw.pid > 0 && typeof raw.ts === "number") return raw;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether the process recorded in the lock is still alive. */
+export function lockHolderAlive(info: LockInfo): boolean {
+  return pidAlive(info.pid);
+}
+
 function lockStale(lockPath: string): boolean {
   try {
     const raw = JSON.parse(readFileSync(lockPath, "utf8")) as { pid?: unknown };
