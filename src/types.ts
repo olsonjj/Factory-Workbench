@@ -159,7 +159,8 @@ export type HistoryEvent =
   | "approved"
   | "rejected-by-human"
   | "pr-created"
-  | "resurrected";
+  | "resurrected"
+  | "gc";
 
 export interface HistoryRecord {
   ts: string;
