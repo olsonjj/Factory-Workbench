@@ -63,13 +63,26 @@ function toItem(row: ItemRow): ItemRecord {
 export class FactoryDb {
   readonly db: Database.Database;
 
-  constructor(root: string) {
-    mkdirSync(root, { recursive: true });
-    this.db = new Database(path.join(root, "factory.db"));
-    this.db.pragma("journal_mode = WAL");
+  constructor(root: string, options: { readonly?: boolean } = {}) {
+    const dbPath = path.join(root, "factory.db");
+    if (options.readonly) {
+      // A read-only connection never blocks a writer (WAL mode) and never
+      // writes itself: no mkdir, no schema migration. Used by `wb status`
+      // so state inspection works while `wb run` holds the factory lock.
+      this.db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    } else {
+      mkdirSync(root, { recursive: true });
+      this.db = new Database(dbPath);
+      this.db.pragma("journal_mode = WAL");
+      this.migrate();
+    }
     this.db.pragma("busy_timeout = 5000");
     this.db.pragma("foreign_keys = ON");
-    this.migrate();
+  }
+
+  /** Read-only handle for inspection commands (`wb status`). */
+  static openReadonly(root: string): FactoryDb {
+    return new FactoryDb(root, { readonly: true });
   }
 
   private migrate(): void {

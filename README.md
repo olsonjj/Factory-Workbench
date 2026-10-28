@@ -102,6 +102,11 @@ wb retry <id>            # re-queue a malformed / infra-failed / exhausted-rewor
 wb curate [project]      # on-demand KB curation proposal (read-only)
 ```
 
+`wb status` is always read-only: it takes no factory lock, claims nothing,
+and writes nothing, so it works while `wb run` (or any other wb command) is
+active — it reports the lock holder (`factory command in progress (pid …)`)
+and any inbox files still awaiting claim instead of failing.
+
 What the operator sees — `wb status` shows every item's state, including *why*
 anything is parked:
 
