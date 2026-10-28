@@ -45,7 +45,7 @@ describe("wb watch (integration)", () => {
     expect(first.state.first).toBe(false);
     expect(first.state.lastEventId).toBeGreaterThan(0);
     expect(first.state.lastCard).toBe(
-      [RULE, "  RUN: #1 add-dark-mode triage", "  PARKED: none", RULE].join("\n"),
+      [RULE, "  RUN (1): #1 add-dark-mode triage", "  PARKED (0): none", RULE].join("\n"),
     );
 
     // Seed activity: a gate-retry start, a pass, and a parking (mirroring what
@@ -66,7 +66,7 @@ describe("wb watch (integration)", () => {
       /^⚠ \[\d{2}:\d{2}:\d{2}\] \(!\) #1 add-dark-mode parked at review — awaiting-approval → `wb approve add-dark-mode`\x07$/,
     );
     expect(second.lines[3]).toBe(
-      [RULE, "  RUN: none", "  PARKED: #1 add-dark-mode (awaiting-approval)", RULE].join("\n"),
+      [RULE, "  RUN (0): none", "  PARKED (1): #1 add-dark-mode (awaiting-approval)", RULE].join("\n"),
     );
     expect(second.notificationTexts).toEqual(["#1 add-dark-mode parked at review — awaiting-approval"]);
     expect(second.state.lastEventId).toBe(first.state.lastEventId + 3);
@@ -83,7 +83,7 @@ describe("wb watch (integration)", () => {
     const fourth = pollOnce(watchDb, third.state, 3);
     expect(fourth.lines).toHaveLength(2);
     expect(fourth.lines[0]).toMatch(/^\[\d{2}:\d{2}:\d{2}\] #1 add-dark-mode unparked → review \(retry: approved offline\)$/);
-    expect(fourth.lines[1]).toBe([RULE, "  RUN: #1 add-dark-mode review", "  PARKED: none", RULE].join("\n"));
+    expect(fourth.lines[1]).toBe([RULE, "  RUN (1): #1 add-dark-mode review", "  PARKED (0): none", RULE].join("\n"));
 
     // Watch is read-only: no factory lock was ever created.
     expect(existsSync(path.join(h.root, "factory.lock"))).toBe(false);
@@ -108,7 +108,7 @@ describe("wb watch (integration)", () => {
     expect(second.lines[1]).toMatch(
       /^⚠ \[\d{2}:\d{2}:\d{2}\] \(!\) #1 broken parked at triage — front-matter must include a non-empty `title` → `wb retry broken  # fix front-matter first`\x07$/,
     );
-    expect(second.lines[2]).toContain("PARKED: #1 broken (malformed front-matter:");
+    expect(second.lines[2]).toContain("PARKED (1): #1 broken (malformed front-matter:");
     expect(second.notificationTexts).toEqual([
       "#1 broken parked at triage — front-matter must include a non-empty `title`",
     ]);
