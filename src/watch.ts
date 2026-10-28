@@ -235,9 +235,13 @@ export function renderCard(items: WatchItem[]): string {
         !(TERMINAL_STATUSES as readonly string[]).includes(i.status),
     )
     .map((i) => `#${i.id} ${i.slug} (${ellipsize(i.parkedReason ?? "?", 60)})`);
-  const runLine = run.length > 0 ? `RUN: ${run.join(" · ")}` : "RUN: none";
-  const parkedLine = parked.length > 0 ? `PARKED: ${parked.join(" · ")}` : "PARKED: none";
-  return [CARD_RULE, `  ${ellipsize(runLine, 80)}`, `  ${ellipsize(parkedLine, 80)}`, CARD_RULE].join("\n");
+  // Live counts in the headers make the truncated prefix change whenever the
+  // underlying set changes (appends past the truncation point would otherwise
+  // produce a byte-identical card and no reprint). Width 78 = 80 columns
+  // total including the two-space indent.
+  const runLine = run.length > 0 ? `RUN (${run.length}): ${run.join(" · ")}` : "RUN (0): none";
+  const parkedLine = parked.length > 0 ? `PARKED (${parked.length}): ${parked.join(" · ")}` : "PARKED (0): none";
+  return [CARD_RULE, `  ${ellipsize(runLine, 78)}`, `  ${ellipsize(parkedLine, 78)}`, CARD_RULE].join("\n");
 }
 
 /**

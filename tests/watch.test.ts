@@ -237,20 +237,20 @@ describe("event formatting", () => {
 
 describe("card logic", () => {
   it("renders none-lines when empty and parked entries with reasons", () => {
-    expect(renderCard([])).toBe([RULE, "  RUN: none", "  PARKED: none", RULE].join("\n"));
+    expect(renderCard([])).toBe([RULE, "  RUN (0): none", "  PARKED (0): none", RULE].join("\n"));
     const items: WatchItem[] = [
       item({ id: 1, slug: "fix-bugs", stage: "test", status: "running" }),
       item({ id: 2, slug: "add-dark-mode", stage: "triage", status: "needs-human", parkedReason: "needs-human" }),
     ];
     expect(renderCard(items)).toBe(
-      [RULE, "  RUN: #1 fix-bugs test", "  PARKED: #2 add-dark-mode (needs-human)", RULE].join("\n"),
+      [RULE, "  RUN (1): #1 fix-bugs test", "  PARKED (1): #2 add-dark-mode (needs-human)", RULE].join("\n"),
     );
     // Missing parked reason renders the "?" placeholder.
     const odd = item({ id: 3, slug: "odd", status: "malformed", parkedReason: null });
-    expect(renderCard([odd])).toContain("PARKED: #3 odd (?)");
+    expect(renderCard([odd])).toContain("PARKED (1): #3 odd (?)");
   });
 
-  it("truncates long content lines at 80 chars plus the two-space indent", () => {
+  it("truncates long content lines at 80 columns total including the two-space indent", () => {
     const items: WatchItem[] = Array.from({ length: 10 }, (_, i) =>
       item({ id: i + 1, slug: `very-long-slug-number-${i + 1}`, stage: "implement", status: "running" }),
     );
@@ -260,10 +260,29 @@ describe("card logic", () => {
     expect(lines[0]).toBe(RULE);
     expect(lines[3]).toBe(RULE);
     const runLine = lines[1]!;
-    expect(runLine.length).toBeLessThanOrEqual(82); // 2-space indent + 80
-    expect(runLine.startsWith("  RUN: ")).toBe(true);
+    expect(runLine.length).toBe(80); // 2-space indent + 78 content
+    expect(runLine.startsWith("  RUN (10): ")).toBe(true);
     expect(runLine.endsWith("…")).toBe(true);
-    expect(lines[2]).toBe("  PARKED: none");
+    expect(lines[2]).toBe("  PARKED (0): none");
+  });
+
+  it("reprints when a second item parks with a byte-identical 80-char-prefix reason", () => {
+    const reason = "malformed front-matter: " + "x".repeat(46);
+    const one = item({ id: 1, slug: "a", status: "malformed", parkedReason: reason });
+    const two = item({ id: 2, slug: "b", status: "malformed", parkedReason: reason });
+    // Sanity guard, documents the pre-fix blind spot: under the old uncounted
+    // format, both parked lines ellipsized at 80 chars were byte-identical, so
+    // the second park produced no reprint.
+    const oldOne = `PARKED: #1 a (${reason})`;
+    const oldTwo = `PARKED: #1 a (${reason}) · #2 b (${reason})`;
+    expect(oldOne.length).toBeGreaterThan(78);
+    expect(ellipsize(oldOne, 80)).toBe(ellipsize(oldTwo, 80));
+    // With the live count, the cards differ and the second park reprints.
+    expect(renderCard([one])).not.toBe(renderCard([one, two]));
+    const state: WatchState = { lastEventId: 5, lastCard: renderCard([one]), first: false };
+    const outcome = runWatchOnce([], [one, two], state, MAX);
+    expect(outcome.lines).toEqual([renderCard([one, two])]);
+    expect(outcome.state.lastCard).toBe(renderCard([one, two]));
   });
 
   it("does not reprint the card when nothing changed and prints it on a parked-reason change", () => {
