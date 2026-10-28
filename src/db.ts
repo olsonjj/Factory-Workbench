@@ -32,6 +32,28 @@ export type ItemRow = {
   updated_at: string;
 };
 
+/** Global history row (all items) for read-only consumers like `wb watch`. */
+export interface HistoryFeedRow {
+  id: number;
+  item_id: number;
+  ts: string;
+  event: string;
+  stage: string | null;
+  detail: Record<string, unknown>;
+}
+
+/** Detail JSON is always stringified by `appendHistory`, but parse defensively. */
+function parseHistoryDetail(raw: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 function toItem(row: ItemRow): ItemRecord {
   return {
     id: row.id,
@@ -257,6 +279,29 @@ export class FactoryDb {
       stage: (r.stage as StageName | null) ?? null,
       detail: JSON.parse(r.detail) as Record<string, unknown>,
     }));
+  }
+
+  /** History rows after `afterId`, across all items, in id order. Read-only. */
+  getHistorySince(afterId: number): HistoryFeedRow[] {
+    const rows = this.db
+      .prepare("SELECT id, item_id, ts, event, stage, detail FROM history WHERE id > ? ORDER BY id")
+      .all(afterId) as { id: number; item_id: number; ts: string; event: string; stage: string | null; detail: string }[];
+    return rows.map((r) => ({
+      id: r.id,
+      item_id: r.item_id,
+      ts: r.ts,
+      event: r.event,
+      stage: r.stage,
+      detail: parseHistoryDetail(r.detail),
+    }));
+  }
+
+  /** Highest history row id (null when the history table is empty). */
+  getMaxHistoryId(): number | null {
+    const row = this.db.prepare("SELECT MAX(id) AS maxId FROM history").get() as
+      | { maxId: number | null }
+      | undefined;
+    return row?.maxId ?? null;
   }
 
   addArtifact(itemId: number, stage: StageName | null, name: string, absPath: string): ArtifactRecord {

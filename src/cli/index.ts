@@ -15,6 +15,7 @@ import { authorItem, type NewOptions } from "../new.js";
 import { makeRealIO } from "../prompt.js";
 import { Orchestrator, matchAnswers } from "../pipeline.js";
 import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, ollamaEnv } from "../adapters/sandcastle.js";
+import { parseIntervalSeconds, startWatch, type WatchState } from "../watch.js";
 import { sleep } from "../util.js";
 
 const program = new Command("wb");
@@ -311,6 +312,31 @@ program
     } finally {
       db.close();
     }
+  });
+
+program
+  .command("watch")
+  .description("Watch the factory live: print changes and OS-notify when items park")
+  .option("--root <dir>", "factory root directory")
+  .option("--interval <seconds>", "seconds between DB polls", "5")
+  .action((opts: { root?: string; interval?: string }) => {
+    const intervalSec = parseIntervalSeconds(opts.interval);
+    const { config, root } = loadConfig(opts.root);
+    if (!existsSync(path.join(root, "factory.db"))) {
+      console.log(`no factory.db in ${root} yet — it is created by any write command (e.g. \`wb new\` or \`wb run\`)`);
+      return;
+    }
+    // Read-only like `wb status`: open the DB read-only, never take the
+    // factory lock, never claim from the inbox, never write anywhere. The
+    // poll loop keeps the process alive; Ctrl+C exits cleanly with 0.
+    const db = FactoryDb.openReadonly(root);
+    nodeProcess.on("SIGINT", () => {
+      db.close();
+      nodeProcess.exit(0);
+    });
+    console.log(`wb watch — polling every ${intervalSec}s · quit with Ctrl+C`);
+    const state: WatchState = { lastEventId: 0, lastCard: null, first: true };
+    startWatch(db, state, config.budgets.maxGateAttempts, intervalSec);
   });
 
 program
