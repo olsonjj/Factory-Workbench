@@ -59,6 +59,13 @@ describe("ticket 01: factory skeleton + inbox ingest", () => {
     expect(item.parkedReason).toContain("malformed front-matter");
     expect(item.parkedReason).toContain("title");
     expect(() => harness.readFile(file)).toThrow(); // still claimed, out of the inbox
+
+    // History: claim row followed by a `parked` row, so `wb watch` renders the
+    // parked line, fix hint, and notification (item.stage = "triage").
+    const hist = harness.db.getHistory(item.id);
+    expect(hist.map((r) => r.event)).toEqual(["claimed", "parked"]);
+    expect(hist[1]!.stage).toBe("triage");
+    expect((hist[1]!.detail.reason as string)).toContain("title");
   });
 
   it("rescanning (fresh db instance) never duplicates items", () => {

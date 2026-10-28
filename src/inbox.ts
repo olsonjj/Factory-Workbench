@@ -68,6 +68,10 @@ export function scanInbox(p: FactoryPaths, db: FactoryDb): InboxReport {
         parkedReason: `malformed front-matter: ${parsed.reason}`,
       });
       db.appendHistory(item.id, "claimed", null, { file: fileName, malformed: parsed.reason });
+      // Emit a `parked` row too, so `wb watch` renders the parked line, fix
+      // hint, and OS notification for malformed items (same shape as other
+      // parks; stage is the triage stage the item was inserted with).
+      db.appendHistory(item.id, "parked", item.stage, { reason: parsed.reason });
       report.malformed.push({ slug, file: dest, reason: parsed.reason });
       continue;
     }
