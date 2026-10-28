@@ -112,6 +112,12 @@ export interface CuratorRequest {
    * bounded, entry-aligned slices. The curator focuses on its slice; the
    * orchestrator merges per-slice proposals into one artifact. */
   batch?: { index: number; total: number };
+  /** Compact one-line-per-entry digest index of every KB entry under curation
+   * (ticket 10). `global`/`project` mirror `kb`; each is bounded to the same
+   * per-layer char budget as its KB layer (possibly truncated with a marker).
+   * Multi-batch runs always receive it; a single-batch run receives it only
+   * when it fits untruncated. */
+  index?: KbSnapshot;
 }
 
 /**

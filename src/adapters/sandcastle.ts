@@ -565,9 +565,12 @@ export class SandcastleCurator implements CuratorRunner {
         .map(([slug, rp]) => `- ${slug}: mounted read-only at repos/${path.basename(rp)}`)
         .join("\n");
       const batchNote = req.batch
-        ? `\nThe KB was too large for one pass and has been split into ${req.batch.total} entry-aligned batches; you are reviewing batch ${req.batch.index}. Focus on the entries provided; cross-batch findings are handled by the operator comparing batch proposals.`
+        ? `\nThe KB was too large for one pass and has been split into ${req.batch.total} entry-aligned batches; you are reviewing batch ${req.batch.index} (its full text is in the KB sections below).`
         : "";
-      const prompt = `You are the knowledge-base curator for a software factory. Read the KB layers below${Object.keys(req.repoPaths).length ? " and the mounted repositories" : ""} and write a curation PROPOSAL. You must not change anything — your only output is the proposal.${batchNote}
+      const indexNote = req.index && (req.index.global || req.index.project)
+        ? `\nA digest index of every KB entry is included below. Use it to flag cross-batch contradictions and merge candidates: an index line is lossy, so when you spot one, name the batch whose full text must be checked, and cite the index line.`
+        : "";
+      const prompt = `You are the knowledge-base curator for a software factory. Read the KB layers below${Object.keys(req.repoPaths).length ? " and the mounted repositories" : ""} and write a curation PROPOSAL. You must not change anything — your only output is the proposal.${batchNote}${indexNote}
 
 Your proposal must list, each citing the entries and repo evidence involved:
 - contradictions between entries
@@ -577,7 +580,7 @@ Your proposal must list, each citing the entries and repo evidence involved:
 
 Projects in scope: ${req.projects.length ? req.projects.join(", ") : "(all)"}${repoGuidance ? `\nRepositories:\n${repoGuidance}` : ""}
 
-## Global KB
+${req.index?.global ? `## Global KB digest index\n\n${req.index.global}\n\n` : ""}${req.index?.project ? `## Project KB digest index\n\n${req.index.project}\n\n` : ""}## Global KB
 
 ${req.kb.global || "(empty)"}
 

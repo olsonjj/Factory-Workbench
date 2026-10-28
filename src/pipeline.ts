@@ -7,7 +7,7 @@ import type { FactoryPaths } from "./paths.js";
 import { artifactDir, itemDir } from "./paths.js";
 import type { FactoryConfig } from "./config.js";
 import { parseItemMarkdown } from "./frontmatter.js";
-import { appendEntry, chunkKbLayer, globalKbFile, loadKbSnapshot, projectKbFile, readKbFile, repoSlug } from "./kb.js";
+import { appendEntry, chunkKbLayer, globalKbFile, kbDigestIndex, loadKbSnapshot, projectKbFile, readKbFile, repoSlug, type KbDigestIndex } from "./kb.js";
 import { stamp } from "./util.js";
 
 /** PR publication happens on the host, outside the stage seam. Never merges. */
@@ -247,6 +247,15 @@ export class Orchestrator {
     const globalChunks = chunkKbLayer(kb.global, this.config.kb.maxGlobalChars);
     const projectChunks = chunkKbLayer(kb.project, this.config.kb.maxProjectChars);
     const batches = Math.max(globalChunks.length, projectChunks.length, 1);
+    const globalIndex = kbDigestIndex(kb.global, this.config.kb.maxGlobalChars, batches);
+    const projectIndex = kbDigestIndex(kb.project, this.config.kb.maxProjectChars, batches);
+    // Single-batch runs only get the index when it fits untruncated; multi-batch
+    // runs always get it (it is budget-bounded either way).
+    const indexFits = !globalIndex.truncated && !projectIndex.truncated;
+    const index: KbSnapshot | undefined =
+      globalIndex.text || projectIndex.text
+        ? { global: globalIndex.text, project: projectIndex.text }
+        : undefined;
     const proposalOf = (r: StageResult): string => r.artifacts[0]?.content ?? r.feedback ?? r.report ?? "(empty proposal)";
     const ts = stamp();
     const name = `curate-${ts}${projects.length === 1 ? `-${projects[0]}` : ""}.md`;
@@ -272,6 +281,7 @@ export class Orchestrator {
         projects: wanted,
         kb: { global: globalChunks[0] ?? "", project: projectChunks[0] ?? "" },
         repoPaths,
+        ...(index && indexFits ? { index } : {}),
       });
       const content = proposalOf(result);
       save(content);
@@ -279,7 +289,7 @@ export class Orchestrator {
     }
 
     const note = (status: string): string =>
-      `> ${status} The knowledge base exceeded its prompt budget and was reviewed in ${batches} entry-aligned batches. Findings spanning batch boundaries are possible — cross-check batches 1..${batches} manually before applying.\n\n`;
+      `> ${status} The knowledge base exceeded its prompt budget and was reviewed in ${batches} entry-aligned batches. Each batch also received a digest index of every KB entry (date, scope, first line, batch) and was asked to flag cross-batch contradictions and merge candidates against it, naming the batch whose full text to check. The index is lossy, so findings spanning batch boundaries are still possible — cross-check batches 1..${batches} manually before applying.\n\n`;
     const sections: string[] = [];
     for (let i = 0; i < batches; i++) {
       const slice: KbSnapshot = {
@@ -293,6 +303,7 @@ export class Orchestrator {
           kb: slice,
           repoPaths,
           batch: { index: i + 1, total: batches },
+          ...(index ? { index } : {}),
         });
         proposal = proposalOf(result);
       } catch (err) {

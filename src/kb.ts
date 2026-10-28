@@ -76,6 +76,70 @@ export function chunkKbLayer(text: string, maxChars: number): string[] {
   return chunks;
 }
 
+/** One compact line per entry: `date — scope | first prose line | batch i/N`.
+ * Cross-batch digest for the KB curator (ticket 10): when a layer's full text
+ * exceeds the prompt budget, this still fits (one short line per entry), so
+ * every batch sees all entries lossily and can flag cross-batch findings. */
+export interface KbDigestIndex {
+  /** One line per entry; if the whole index exceeded `maxChars`, it is cut and
+   * a trailing marker records the withheld chars. */
+  text: string;
+  /** True when `text` was cut to fit `maxChars`. */
+  truncated: boolean;
+}
+
+const INDEX_PROSE_LIMIT = 100;
+
+/** First prose line of an entry body: skips blanks, code fences, HTML comments
+ * and headings; bounded to INDEX_PROSE_LIMIT chars. */
+function firstProseLine(body: string): string {
+  const line = body
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l && !l.startsWith("```") && !l.startsWith("<!--") && !l.startsWith("#")) ?? "";
+  return line.length > INDEX_PROSE_LIMIT ? `${line.slice(0, INDEX_PROSE_LIMIT - 1)}…` : line;
+}
+
+/** Split one chunk into entries. Chunks begin at entry boundaries, so every
+ * `## ` header inside a chunk starts an entry; text before the first header is
+ * preamble and skipped. */
+function splitChunkEntries(chunk: string): { header: string; body: string }[] {
+  const entries: { header: string; body: string }[] = [];
+  for (const part of chunk.split(/\n(?=## )/)) {
+    const nl = part.indexOf("\n");
+    const header = nl < 0 ? part : part.slice(0, nl);
+    if (!header.startsWith("## ")) continue;
+    entries.push({ header, body: nl < 0 ? "" : part.slice(nl + 1) });
+  }
+  return entries;
+}
+
+/**
+ * Build the cross-batch digest index for one KB layer. `totalBatches` is the
+ * unified curator-invocation count (max of both layers' chunk counts); when
+ * omitted, the layer's own chunk count is the denominator. The result is
+ * always bounded: at most `maxChars` plus a short truncation marker, so index
+ * construction can never unbound a curator prompt.
+ */
+export function kbDigestIndex(text: string, maxChars: number, totalBatches?: number): KbDigestIndex {
+  const chunks = chunkKbLayer(text, maxChars);
+  const batches = totalBatches ?? Math.max(chunks.length, 1);
+  const lines: string[] = [];
+  chunks.forEach((chunk, i) => {
+    for (const e of splitChunkEntries(chunk)) {
+      const head = e.header.replace(/^##\s+/, "").trim();
+      const sep = head.indexOf(" — ");
+      const date = sep >= 0 ? head.slice(0, sep) : "";
+      const scope = sep >= 0 ? head.slice(sep + 3) : head;
+      lines.push(`${date} — ${scope} | ${firstProseLine(e.body)} | batch ${i + 1}/${batches}`);
+    }
+  });
+  const joined = lines.join("\n");
+  if (joined.length <= maxChars) return { text: joined, truncated: false };
+  const withheld = joined.length - maxChars;
+  return { text: `${joined.slice(0, maxChars)}\n<!-- digest index truncated (${withheld} chars withheld) -->`, truncated: true };
+}
+
 /** Char budget for triage's lightweight global-KB-only view. */
 export const KB_TRIAGE_LIGHT_LIMIT = 2000;
 

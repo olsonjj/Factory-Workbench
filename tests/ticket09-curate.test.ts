@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import * as path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { createHarness, claim, makeOrchestrator, type TestHarness } from "./helpers.js";
-import { readKbFile, projectKbFile, globalKbFile } from "../src/kb.js";
+import { readKbFile, projectKbFile, globalKbFile, chunkKbLayer, kbDigestIndex } from "../src/kb.js";
 import type { CuratorRequest, CuratorRunner, StageResult } from "../src/types.js";
 
 let harness: TestHarness;
@@ -93,7 +93,7 @@ describe("ticket 09: curator pass for the knowledge base", () => {
     // Shrink the curation budget so the seeded global layer must be batched.
     harness.config.kb.maxGlobalChars = 400;
     const entries = [1, 2, 3, 4]
-      .map((n) => `## 2026-10-27 — failed-gate (repo ${n})\n\n${"lesson ".repeat(40)}\n\n`)
+      .map((n) => `## 2026-10-27 — failed-gate (repo ${n})\n\nshort lesson ${n}\n${"lesson ".repeat(40)}\n\n`)
       .join("");
     harness.writeFile(globalKbFile(harness.paths), entries);
     const curator = new FakeCurator();
@@ -109,12 +109,96 @@ describe("ticket 09: curator pass for the knowledge base", () => {
     curator.received.forEach((r, i) => {
       expect(r.kb.global.length).toBeLessThanOrEqual(400 + 500); // at most one oversized-entry overhang
       expect(r.batch).toEqual({ index: i + 1, total: curator.received.length });
+      // Every batch also receives the (budget-bounded) digest index.
+      expect(r.index).toBeDefined();
+      expect(r.index!.global).toContain("(repo 1)");
+      expect(r.index!.global).toContain("(repo 4)");
+      expect(r.index!.global.length).toBeLessThanOrEqual(400 + 200);
+      expect(r.index!.project).toBe("");
+      expect(r.index!.global).toMatch(/batch \d+\//);
     });
+    const firstIndex = curator.received[0]!.index;
+    curator.received.forEach((r) => expect(r.index).toEqual(firstIndex));
     // One merged proposal artifact.
     const abs = path.join(harness.root, file);
     expect(existsSync(abs)).toBe(true);
     expect(readFileSync(abs, "utf8")).toContain("curation batch 1 of");
     expect(proposal).toContain("Curation proposal");
+  });
+
+  it("a contradicting pair seeded into two different batches yields a finding that names the other batch", async () => {
+    harness = createHarness();
+    seedWorld(harness);
+    harness.config.kb.maxGlobalChars = 400;
+    // Short first prose line + long padding: entries are big enough to force
+    // batching, but the digest index stays compact (fits the budget).
+    const e = (n: number, first: string): string =>
+      `## 2026-10-27 — failed-gate (repo ${n})\n\n${first}\n${"x".repeat(200)}\n\n`;
+    harness.writeFile(
+      globalKbFile(harness.paths),
+      e(1, "tests run via jest") + e(2, "some other fact") + e(3, "tests run via vitest") + e(4, "another fact"),
+    );
+
+    class IndexAwareCurator implements CuratorRunner {
+      readonly received: CuratorRequest[] = [];
+      async propose(req: CuratorRequest): Promise<StageResult> {
+        this.received.push(req);
+        const index = req.index?.global ?? "";
+        const jestBatch = /jest.*?batch (\d+)\//.exec(index)?.[1];
+        const vitestBatch = /vitest.*?batch (\d+)\//.exec(index)?.[1];
+        const finding =
+          jestBatch && vitestBatch && jestBatch !== vitestBatch
+            ? `- contradiction: tests via jest (batch ${jestBatch}) vs tests via vitest (batch ${vitestBatch}) — check batch ${vitestBatch}\n`
+            : "- nothing\n";
+        return { outcome: "pass", artifacts: [{ name: "proposal", content: `# Curation proposal\n\n${finding}` }] };
+      }
+    }
+
+    const curator = new IndexAwareCurator();
+    const orch = makeOrchestrator(harness, new (await import("./helpers.js")).ScriptedRunner({}), { curator });
+    const { proposal } = await orch.curate();
+
+    // Both contradicting entries were offered to the index with DIFFERENT batches.
+    expect(curator.received.length).toBeGreaterThanOrEqual(2);
+    expect(curator.received[0]!.index!.global).toContain("tests run via jest");
+    expect(curator.received[0]!.index!.global).toContain("tests run via vitest");
+    // The finding names the other batch.
+    expect(proposal).toContain("contradiction");
+    expect(proposal).toMatch(/check batch \d+/);
+    expect(proposal).toContain("batch 2");
+  });
+
+  it("a single-batch run receives the index when it fits", async () => {
+    harness = createHarness();
+    seedWorld(harness);
+    harness.writeFile(globalKbFile(harness.paths), "## 2026-10-27 — failed-gate (repo 1)\n\nsome lesson\n\n");
+    const curator = new FakeCurator();
+    const orch = makeOrchestrator(harness, new (await import("./helpers.js")).ScriptedRunner({}), { curator });
+    await orch.curate();
+    expect(curator.received.length).toBe(1);
+    expect(curator.received[0]!.batch).toBeUndefined();
+    expect(curator.received[0]!.index).toBeDefined();
+    expect(curator.received[0]!.index!.global).toContain("(repo 1)");
+  });
+
+  it("a single-batch run omits the index when it would not fit (truncated), leaving the path otherwise unchanged", async () => {
+    harness = createHarness();
+    seedWorld(harness);
+    harness.config.kb.maxGlobalChars = 5000;
+    // Many tiny entries: the full layer stays a single batch, but the one-line
+    // index would exceed the budget (and thus be truncated).
+    const entries = Array.from({ length: 110 }, (_, n) => `## 2026-10-27 — failed-gate (repo ${n})\n\nx\n\n`).join("");
+    // Pin the precondition before running the pipeline.
+    expect(chunkKbLayer(entries, 5000).length).toBe(1);
+    expect(kbDigestIndex(entries, 5000).truncated).toBe(true);
+    harness.writeFile(globalKbFile(harness.paths), entries);
+
+    const curator = new FakeCurator();
+    const orch = makeOrchestrator(harness, new (await import("./helpers.js")).ScriptedRunner({}), { curator });
+    await orch.curate();
+    expect(curator.received.length).toBe(1);
+    expect(curator.received[0]!.index).toBeUndefined();
+    expect(curator.received[0]!.kb.global).toBe(entries); // full layer, unchanged
   });
 
   it("a single batch still respects the budget: a lone oversized entry is sent truncated, not full", async () => {
