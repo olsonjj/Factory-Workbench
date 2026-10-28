@@ -4,7 +4,9 @@
 
 **Blocked by:** 01: Factory skeleton + inbox ingest.
 
-**Status:** ready-for-agent
+**Status:** done — all acceptance criteria checked
+
+**Shipped:** merged to main (see `git log` and item archives in `factory/items/archive/`)
 
 - [x] The orchestrator depends on a single StageRunner-style port (stage + item in → stage result out with pass/fail, artifacts, feedback); no stage logic above the seam knows about sandboxes, git, or models
 - [x] `wb run` advances an item one actionable step at a time; repeated invocations walk the stub pipeline to its terminal step

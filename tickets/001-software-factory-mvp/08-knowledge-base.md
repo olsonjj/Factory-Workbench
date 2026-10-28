@@ -4,7 +4,9 @@
 
 **Blocked by:** 05: Spec → implement → PR via Sandcastle; 06: Test stage + review gate + real rework loop.
 
-**Status:** ready-for-agent
+**Status:** done — all acceptance criteria checked
+
+**Shipped:** merged to main (see `git log` and item archives in `factory/items/archive/`)
 
 - [x] KB exists in the factory root with global and per-project layers; every entry carries a date and a scope
 - [x] Stage prompts contain their designated KB layers (verified: spec sees project entries from the target repo, triage sees only the lightweight global layer)

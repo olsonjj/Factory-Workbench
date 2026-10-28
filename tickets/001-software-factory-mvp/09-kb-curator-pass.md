@@ -4,7 +4,9 @@
 
 **Blocked by:** 08: Knowledge base write-moments + loading.
 
-**Status:** ready-for-agent
+**Status:** done — all acceptance criteria checked
+
+**Shipped:** merged to main (see `git log` and item archives in `factory/items/archive/`)
 
 - [x] `wb curate` (optionally scoped to one project) produces a proposal file in the factory root listing concrete, actionable findings — each citing the entries and repo evidence involved
 - [x] Contradictory entries and repo-mismatched facts are detected against the actual repositories, not just the KB text

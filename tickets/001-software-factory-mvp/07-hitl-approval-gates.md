@@ -4,7 +4,9 @@
 
 **Blocked by:** 05: Spec → implement → PR via Sandcastle.
 
-**Status:** ready-for-agent
+**Status:** done — all acceptance criteria checked
+
+**Shipped:** merged to main (see `git log` and item archives in `factory/items/archive/`)
 
 - [x] An item with `approvals:` listing a stage parks after completing that stage; `wb status` shows it awaiting approval with the stage's artifact available to read
 - [x] `wb approve <id>` resumes the item from the parked stage's next step; no approval-gated stage behavior changes for items without the flag

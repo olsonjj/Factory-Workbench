@@ -4,7 +4,9 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** done — all acceptance criteria checked
+
+**Shipped:** merged to main (see `git log` and item archives in `factory/items/archive/`)
 
 - [x] Dropping a well-formed markdown file into the inbox and running the status command shows it as a claimed item with an id/slug, its stage, and its source file location
 - [x] The claimed file has been moved out of the inbox into the item store; the inbox no longer contains it

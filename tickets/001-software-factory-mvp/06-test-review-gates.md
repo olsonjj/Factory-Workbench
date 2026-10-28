@@ -4,7 +4,9 @@
 
 **Blocked by:** 05: Spec → implement → PR via Sandcastle.
 
-**Status:** ready-for-agent
+**Status:** done — all acceptance criteria checked
+
+**Shipped:** merged to main (see `git log` and item archives in `factory/items/archive/`)
 
 - [x] An item whose implementation breaks tests is caught in the test stage, fixed via rework feedback to implement, and only then proceeds
 - [x] An implementation that passes tests but fails review (e.g. missing input validation, security smell) is reworked with the review's reasons as feedback, up to the budget, then proceeds or parks with the full history

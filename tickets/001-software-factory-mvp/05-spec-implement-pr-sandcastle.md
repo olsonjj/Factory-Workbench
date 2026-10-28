@@ -4,7 +4,9 @@
 
 **Blocked by:** 04: Triage stage.
 
-**Status:** ready-for-agent
+**Status:** done — all acceptance criteria checked
+
+**Shipped:** merged to main (see `git log` and item archives in `factory/items/archive/`)
 
 - [x] A fully autonomous item (no approvals front-matter, well-formed description targeting a real local repo) produces a GitHub PR whose diff matches a reasonable reading of the item request — without any command other than `wb run`/`wb resume`
 - [x] Spec is saved as an item artifact and its content is grounded in the actual repo (agent works in a worktree, never the host working copy)

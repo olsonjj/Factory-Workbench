@@ -16,10 +16,10 @@
 
 **Blocked by:** 09: Curator pass (shipped — chunking, batching, incremental persistence, and the caveat header all exist).
 
-**Status:** ready-for-agent (2026-10-28: option 1 chosen — digest index pre-pass; recorded here per the checklist. Rationale: cross-batch detection with zero additional agent invocations; lossiness accepted, caveat stays as backstop.)
+**Status:** done (2026-10-28, PR #6 — option 1 implemented: digest index pre-pass; cross-batch detection with zero additional agent invocations; lossiness accepted, caveat stays as backstop. Three Greptile review rounds hardened the implementation: whole-entry chunk boundaries, original-text digest parsing, and fence/comment-aware prose selection.)
 
 - [x] Option chosen and recorded (option 1: digest index pre-pass)
-- [ ] Cross-batch finding classes are covered by test: a contradicting pair seeded into two different batches yields a finding (or the chosen option's documented limitation is test-pinned)
-- [ ] Prompt budget is still respected for every curator invocation (existing `chunkKbLayer` tests extended)
-- [ ] The artifact batch header no longer relies on manual cross-checking alone (or, for option 4, states it as the only mechanism)
-- [ ] Cost note: for option 2, a run's expected agent-pass count is stated in the artifact/KB entry so operators aren't surprised by the extra invocation
+- [x] Cross-batch finding classes are covered by test: a contradicting pair seeded into two different batches yields a finding (`tests/ticket09-curate.test.ts`: "a contradicting pair seeded into two different batches yields a finding that names the other batch")
+- [x] Prompt budget is still respected for every curator invocation (`tests/kb-chunk.test.ts`: digest bounded to `maxChars` + marker; whole-entry boundaries with byte-exact concat)
+- [x] The artifact batch header no longer relies on manual cross-checking alone (`src/pipeline.ts` batch note names the digest index as the cross-batch aid; the caveat remains as backstop per the design)
+- [x] Cost note: N/A — option 1 was chosen, which adds zero agent invocations (this box applies only to option 2)

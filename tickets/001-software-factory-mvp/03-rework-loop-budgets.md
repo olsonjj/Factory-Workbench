@@ -4,7 +4,9 @@
 
 **Blocked by:** 02: Stage state machine + run/resume.
 
-**Status:** ready-for-agent
+**Status:** done — all acceptance criteria checked
+
+**Shipped:** merged to main (see `git log` and item archives in `factory/items/archive/`)
 
 - [x] A gate failure records the failure report, routes feedback to the previous stage, and re-runs it; the loop is visible in the item's history
 - [x] After the configured number of total gate attempts (default 3), the item parks with every round's report attached and a parked-reason of exhausted-rework

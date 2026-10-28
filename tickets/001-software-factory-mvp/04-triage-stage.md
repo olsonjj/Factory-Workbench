@@ -4,7 +4,9 @@
 
 **Blocked by:** 03: Rework loop + budgets.
 
-**Status:** ready-for-agent
+**Status:** done — all acceptance criteria checked
+
+**Shipped:** merged to main (see `git log` and item archives in `factory/items/archive/`)
 
 - [x] A dropped markdown item gets a real triage decision from the configured model (Ollama Cloud provider config works end-to-end)
 - [x] `proceed` moves the item onward in the pipeline state; `reject` archives it with the triage report as an artifact and a rejected status in `wb status`
