@@ -120,7 +120,8 @@ const INDEX_PROSE_LIMIT = 100;
  * and a `-->` line — content there is an artifact of recording, not a
  * lesson. */
 function firstProseLine(body: string): string {
-  const bound = (s: string): string => (s.length > INDEX_PROSE_LIMIT ? `${s.slice(0, INDEX_PROSE_LIMIT - 1)}…` : s);
+  const bound = (s: string): string =>
+    (s = s.replace(/\s+/g, " ").trim()).length > INDEX_PROSE_LIMIT ? `${s.slice(0, INDEX_PROSE_LIMIT - 1)}…` : s;
   let inCodeFence = false;
   let inComment = false;
   for (const raw of body.split("\n")) {
@@ -133,28 +134,25 @@ function firstProseLine(body: string): string {
     // survives (an earlier version dropped the whole line and lost lessons
     // like "Use vitest <!-- updated after migration -->" — Greptile PR #6).
     let opensWithoutCloser = false;
-    let candidate = l;
-    if (l.includes("<!--")) {
-      const stripped = l.replace(/<!--[\s\S]*?-->/g, " ");
-      if (stripped.includes("<!--")) opensWithoutCloser = true; // unterminated inline opener
-      candidate = stripped;
-    }
+    let candidate = l.replace(/<!--[\s\S]*?-->/g, " ").trim();
+    if (candidate.includes("<!--")) opensWithoutCloser = true; // unterminated inline opener remains
     if (inComment) {
-      if (!candidate.includes("-->")) continue;
+      const idx = candidate.indexOf("-->");
+      if (idx < 0) continue;
       inComment = false;
-      const after = candidate.slice(candidate.indexOf("-->") + 3).trim();
-      if (after) return bound(after); // prose following the closer
-      continue;
+      // Resume the USUAL prose checks for text after the closer: it may be a
+      // heading, a fence, or blank — Greptile PR #6, round 3.
+      candidate = candidate.slice(idx + 3).trim();
     }
     if (!candidate || candidate.startsWith("#")) continue;
     if (candidate.startsWith("```")) { inCodeFence = true; continue; }
     if (opensWithoutCloser) {
-      const before = candidate.slice(0, candidate.indexOf("<!--")).replace(/\s+/g, " ").trim();
+      const before = candidate.slice(0, candidate.indexOf("<!--")).trim();
       if (before) return bound(before); // prose before the unterminated opener
       inComment = true;
       continue;
     }
-    if (candidate) return bound(candidate);
+    return bound(candidate);
   }
   return "";
 }

@@ -155,6 +155,30 @@ describe("kbDigestIndex (curator cross-batch digest)", () => {
     expect(kbDigestIndex(onlyComment, 10_000).text.split("\n")[0]!.endsWith("batch 1/1")).toBe(true); // empty summary line, still one line per entry
   });
 
+  it("inline-comment stripping never yields blank or heading-only summaries (Greptile round 3)", () => {
+    // (a) comment-only first line followed by a lesson: stripping leaves only
+    // whitespace, which must not pass the truthiness checks.
+    const note = "## 2026-10-27 — lesson (repo 7)\n\n<!-- note -->\n\nUse vitest\n\n";
+    const line = kbDigestIndex(note, 10_000).text.split("\n")[0];
+    expect(line).toContain("Use vitest");
+    const summary = line!.split(" | ")[1]!;
+    expect(summary.trim().length).toBeGreaterThan(0);
+    expect(summary).not.toMatch(/^\s+\|/);
+
+    // (b) text after a multiline closer re-enters the usual prose checks —
+    // a heading at the closer must not become the summary.
+    const closer = "## 2026-10-27 — lesson (repo 8)\n\n<!-- a\nb --># Summary\n\nthe real lesson\n\n";
+    const line2 = kbDigestIndex(closer, 10_000).text.split("\n")[0];
+    expect(line2).toContain("the real lesson");
+    expect(line2).not.toContain("# Summary");
+
+    // (b2) same-line closer followed by a heading: skip it, take later prose.
+    const closerHeading = "## 2026-10-27 — lesson (repo 9)\n\n<!-- x -->## artifact\n\nlesson after heading\n\n";
+    const line3 = kbDigestIndex(closerHeading, 10_000).text.split("\n")[0];
+    expect(line3).not.toContain("## artifact");
+    expect(line3).toContain("lesson after heading");
+  });
+
   it("empty and headerless layers produce an empty, non-truncated index", () => {
     expect(kbDigestIndex("", 1000)).toEqual({ text: "", truncated: false });
     expect(kbDigestIndex("no headers, just a blob".repeat(100), 500)).toEqual({ text: "", truncated: false });
