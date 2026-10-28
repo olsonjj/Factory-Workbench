@@ -277,7 +277,7 @@ program
     // WAL-mode readers never block the writer or vice versa.
     const { config: _config, root } = loadConfig(opts.root);
     if (!existsSync(path.join(root, "factory.db"))) {
-      console.log(`no factory.db in ${root} yet — run \`wb init\` to create the factory`);
+      console.log(`no factory.db in ${root} yet — it is created by the first write command (\`wb new\` or \`wb run\`)`);
       return;
     }
     const db = FactoryDb.openReadonly(root);
