@@ -198,6 +198,34 @@ describe("P0-2: wb retry recovery verb", () => {
     expect(item.parkedReason).toBe(`malformed front-matter: ${parked.detail.reason}`);
   });
 
+  it("parks a mid-run corruption at the item's current stage, not the claim path's (Greptile P2)", async () => {
+    // Greptile: the previous test parks at triage, which equals the claim path's
+    // fixed stage — it would pass even if parkMalformed hard-coded "triage".
+    // This case advances the item past spec so its stage is `implement`, then
+    // corrupts the source: the parked row must carry stage = implement.
+    harness = createHarness();
+    dropItem(harness, "Task");
+    let item = harness.db.listItems()[0]!;
+
+    // triage and spec pass normally → item advances to stage=implement.
+    const orch = makeOrchestrator(harness, new ScriptedRunner({ triage: [pass("triage")], spec: [pass("spec")] }));
+    await orch.tickAll();
+    await orch.tickAll();
+    item = harness.db.getItem(item.id)!;
+    expect(item.stage).toBe("implement");
+
+    // Corrupt the source mid-run; the next refresh parks it at its current stage.
+    harness.writeFile(item.sourceFile!, "no front matter here\n");
+    await orch.tickAll();
+
+    item = harness.db.getItem(item.id)!;
+    expect(item.status).toBe("malformed");
+    const hist = harness.db.getHistory(item.id);
+    const parked = hist.find((r) => r.event === "parked")!;
+    expect(parked.stage).toBe("implement"); // item.stage, not a hard-coded "triage"
+    expect(parked.detail.reason).toBe("front-matter must include a non-empty `title`");
+  });
+
   it("throws a clear error for a status retry does not apply to", async () => {
     harness = createHarness();
     dropItem(harness, "task");
