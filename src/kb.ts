@@ -46,14 +46,16 @@ export function readKbFile(kbFile: string, limitChars?: number): string {
 
 /**
  * Split a KB layer into chunks of at most maxChars, ALWAYS at entry
- * boundaries ("## " headers). Chunks concatenate back to the original text
- * byte-for-byte. Only a single entry larger than the whole budget overhangs
- * (truncated with a marker, never silently dropped). Used by the KB curator:
- * stage prompts must stay bounded, but curation still has to inspect every
- * entry ever appended.
+ * boundaries ("## " headers). Chunks contain whole entries and concatenate
+ * back to the original text byte-for-byte, except that a single entry larger
+ * than the whole budget is sliced at the budget (truncated with a marker,
+ * never silently dropped, and that withheld region belongs to no other
+ * chunk). Used by the KB curator: stage prompts must stay bounded, but
+ * curation still has to inspect every entry ever appended.
  */
-export function chunkKbLayer(text: string, maxChars: number): string[] {
-  if (text.length <= maxChars) return text.length === 0 ? [] : [text];
+export function chunkKbLayerWithOffsets(text: string, maxChars: number): { text: string; from: number }[] {
+  if (text.length === 0) return [];
+  if (text.length <= maxChars) return [{ text, from: 0 }];
   // Entry starts: offsets of "## " lines (plus offset 0 for any preamble).
   const starts: number[] = [0];
   let atLineStart = true;
@@ -61,19 +63,148 @@ export function chunkKbLayer(text: string, maxChars: number): string[] {
     if (atLineStart && text[i] === "#" && text.startsWith("## ", i)) starts.push(i);
     atLineStart = text[i] === "\n";
   }
-  const marker = (withheld: number): string => `\n<!-- oversized content truncated (${withheld} chars withheld from this batch) -->`;
-  const chunks: string[] = [];
-  let from = 0;
-  for (let i = 1; i < starts.length; i++) {
-    const start = starts[i]!;
-    if (start - from < maxChars) continue;
-    const piece = text.slice(from, start);
-    chunks.push(piece.length > maxChars ? piece.slice(0, maxChars) + marker(piece.length - maxChars) : piece);
-    from = start;
+  const pieces: { from: number; to: number }[] = [];
+  for (let i = 0; i < starts.length; i++) {
+    pieces.push({ from: starts[i]!, to: i + 1 < starts.length ? starts[i + 1]! : text.length });
   }
-  const tail = text.slice(from);
-  chunks.push(tail.length > maxChars ? tail.slice(0, maxChars) + marker(tail.length - maxChars) : tail);
+  const marker = (withheld: number): string => `\n<!-- oversized content truncated (${withheld} chars withheld from this batch) -->`;
+  const chunks: { text: string; from: number }[] = [];
+  // Accumulate whole entries: a piece that would push the open chunk past the
+  // budget starts a new chunk instead of being cut (the old implementation
+  // sliced at maxChars mid-entry, silently withholding that entry's tail
+  // from EVERY batch — found by Greptile review on PR #6).
+  const emit = (piece: { from: number; to: number }): void => {
+    const t = text.slice(piece.from, piece.to);
+    chunks.push({ text: t.length > maxChars ? t.slice(0, maxChars) + marker(t.length - maxChars) : t, from: piece.from });
+  };
+  let cur: { from: number; to: number } | null = null;
+  for (const piece of pieces) {
+    const len = piece.to - piece.from;
+    if (len > maxChars) {
+      if (cur && cur.to > cur.from) { emit(cur); cur = null; } // skip empty preambles
+      emit(piece); // a single entry larger than the whole budget: sliced, alone
+      continue;
+    }
+    if (cur && piece.to - cur.from <= maxChars) { cur = { from: cur.from, to: piece.to }; continue; }
+    if (cur && cur.to > cur.from) emit(cur);
+    cur = piece;
+  }
+  if (cur && cur.to > cur.from) emit(cur);
   return chunks;
+}
+
+export function chunkKbLayer(text: string, maxChars: number): string[] {
+  return chunkKbLayerWithOffsets(text, maxChars).map((c) => c.text);
+}
+
+/** One compact line per entry: `date — scope | first prose line | batch i/N`.
+ * Cross-batch digest for the KB curator (ticket 10): when a layer's full text
+ * exceeds the prompt budget, this still fits (one short line per entry), so
+ * every batch sees all entries lossily and can flag cross-batch findings. */
+export interface KbDigestIndex {
+  /** One line per entry; if the whole index exceeded `maxChars`, it is cut and
+   * a trailing marker records the withheld chars. */
+  text: string;
+  /** True when `text` was cut to fit `maxChars`. */
+  truncated: boolean;
+}
+
+const INDEX_PROSE_LIMIT = 100;
+
+/** First prose line of an entry body: skips blanks, headings, code fences
+ * (including the lines inside them) and HTML comments (including multiline
+ * ones — a lesson embedded in prose after the closer is found; inline comment
+ * spans are STRIPPED so prose around them survives); bounded to
+ * INDEX_PROSE_LIMIT chars. "Inside a fence" means between an open and a close
+ * ``` line, and "inside a comment" means between an unterminated `<!--` line
+ * and a `-->` line — content there is an artifact of recording, not a
+ * lesson. */
+function firstProseLine(body: string): string {
+  const bound = (s: string): string =>
+    (s = s.replace(/\s+/g, " ").trim()).length > INDEX_PROSE_LIMIT ? `${s.slice(0, INDEX_PROSE_LIMIT - 1)}…` : s;
+  let inCodeFence = false;
+  let inComment = false;
+  for (const raw of body.split("\n")) {
+    const l = raw.trim();
+    if (inCodeFence) {
+      if (l.startsWith("```")) inCodeFence = false;
+      continue;
+    }
+    // Strip completed inline comment spans FIRST, so prose around them
+    // survives (an earlier version dropped the whole line and lost lessons
+    // like "Use vitest <!-- updated after migration -->" — Greptile PR #6).
+    let opensWithoutCloser = false;
+    let candidate = l.replace(/<!--[\s\S]*?-->/g, " ").trim();
+    if (candidate.includes("<!--")) opensWithoutCloser = true; // unterminated inline opener remains
+    if (inComment) {
+      const idx = candidate.indexOf("-->");
+      if (idx < 0) continue;
+      inComment = false;
+      // Resume the USUAL prose checks for text after the closer: it may be a
+      // heading, a fence, or blank — Greptile PR #6, round 3.
+      candidate = candidate.slice(idx + 3).trim();
+    }
+    if (!candidate || candidate.startsWith("#")) continue;
+    if (candidate.startsWith("```")) { inCodeFence = true; continue; }
+    if (opensWithoutCloser) {
+      const before = candidate.slice(0, candidate.indexOf("<!--")).trim();
+      if (before) return bound(before); // prose before the unterminated opener
+      inComment = true;
+      continue;
+    }
+    return bound(candidate);
+  }
+  return "";
+}
+
+/**
+ * Build the cross-batch digest index for one KB layer. `totalBatches` is the
+ * unified curator-invocation count (max of both layers' chunk counts); when
+ * omitted, the layer's own chunk count is the denominator. The result is
+ * always bounded: at most `maxChars` plus a short truncation marker, so index
+ * construction can never unbound a curator prompt.
+ *
+ * Entries are parsed from the ORIGINAL full text (never the budget-sliced
+ * chunks: a straddled entry's lesson must survive even when its chunk was cut
+ * — Greptile review, PR #6). Chunk offsets are used only to assign batch
+ * numbers: an entry's header offset falls in exactly one chunk span.
+ */
+export function kbDigestIndex(text: string, maxChars: number, totalBatches?: number): KbDigestIndex {
+  const chunked = chunkKbLayerWithOffsets(text, maxChars);
+  const batches = totalBatches ?? Math.max(chunked.length, 1);
+  // Chunk i spans [from_i, from_{i+1}) — offsets stay contiguous (markers live
+  // inside a chunk's text, never between spans), so every entry start lands in
+  // exactly one span.
+  const batchOf = (entryStart: number): number => {
+    for (let i = 0; i < chunked.length; i++) {
+      const to = i + 1 < chunked.length ? chunked[i + 1]!.from : text.length;
+      if (entryStart >= chunked[i]!.from && entryStart < to) return i + 1;
+    }
+    return batches;
+  };
+  // Entry spans from the ORIGINAL text: start of each "## " line to the next.
+  const starts: number[] = [];
+  let atLineStart = true;
+  for (let i = 0; i < text.length; i++) {
+    if (atLineStart && text[i] === "#" && text.startsWith("## ", i)) starts.push(i);
+    atLineStart = text[i] === "\n";
+  }
+  const lines: string[] = [];
+  for (let i = 0; i < starts.length; i++) {
+    const from = starts[i]!;
+    const to = i + 1 < starts.length ? starts[i + 1]! : text.length;
+    const nl = text.indexOf("\n", from);
+    const header = (nl < 0 || nl > to ? text.slice(from, to) : text.slice(from, nl)).replace(/^##\s+/, "").trim();
+    const body = nl < 0 || nl > to ? "" : text.slice(nl + 1, to);
+    const sep = header.indexOf(" — ");
+    const date = sep >= 0 ? header.slice(0, sep) : "";
+    const scope = sep >= 0 ? header.slice(sep + 3) : header;
+    lines.push(`${date} — ${scope} | ${firstProseLine(body)} | batch ${batchOf(from)}/${batches}`);
+  }
+  const joined = lines.join("\n");
+  if (joined.length <= maxChars) return { text: joined, truncated: false };
+  const withheld = joined.length - maxChars;
+  return { text: `${joined.slice(0, maxChars)}\n<!-- digest index truncated (${withheld} chars withheld) -->`, truncated: true };
 }
 
 /** Char budget for triage's lightweight global-KB-only view. */
