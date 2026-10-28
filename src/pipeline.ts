@@ -8,7 +8,7 @@ import { artifactDir, itemDir } from "./paths.js";
 import type { FactoryConfig } from "./config.js";
 import { parseItemMarkdown } from "./frontmatter.js";
 import { appendEntry, chunkKbLayer, globalKbFile, kbDigestIndex, loadKbSnapshot, projectKbFile, readKbFile, repoSlug, type KbDigestIndex } from "./kb.js";
-import { parkMalformed, stamp } from "./util.js";
+import { stamp } from "./util.js";
 
 /** PR publication happens on the host, outside the stage seam. Never merges. */
 export interface PrPublishRequest {
@@ -355,7 +355,7 @@ export class Orchestrator {
     if (!item.sourceFile || !existsSync(item.sourceFile)) return item;
     const parsed = parseItemMarkdown(readFileSync(item.sourceFile, "utf8"));
     if (!parsed.ok) {
-      parkMalformed(this.db, item, parsed.reason);
+      this.db.parkMalformed(item, parsed.reason);
       return this.db.getItem(item.id)!;
     }
     const p = parsed.item;

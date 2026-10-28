@@ -4,7 +4,6 @@ import { parseItemMarkdown, slugify } from "./frontmatter.js";
 import type { FactoryDb } from "./db.js";
 import type { FactoryPaths } from "./paths.js";
 import { itemDir, itemFile } from "./paths.js";
-import { parkMalformed } from "./util.js";
 import type { ItemRecord } from "./types.js";
 
 /** Sorted list of claim-candidate markdown files in the inbox. Shared by
@@ -68,7 +67,7 @@ export function scanInbox(p: FactoryPaths, db: FactoryDb): InboxReport {
         sourceFile: dest,
       });
       db.appendHistory(item.id, "claimed", null, { file: fileName, malformed: parsed.reason });
-      parkMalformed(db, item, parsed.reason);
+      db.parkMalformed(item, parsed.reason);
       report.malformed.push({ slug, file: dest, reason: parsed.reason });
       continue;
     }

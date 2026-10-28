@@ -276,6 +276,23 @@ export class FactoryDb {
       .run(itemId, this.now(), event, stage, JSON.stringify(detail));
   }
 
+  /** Park an item as malformed front-matter: persist the parked state on the
+   *  item row and emit the `parked` history row. Single shared implementation
+   *  for both park sites — the claim path (`scanInbox`, src/inbox.ts) and the
+   *  re-parse path (`refreshFromSource`, src/pipeline.ts) — so `wb watch`
+   *  renders the parked line, fix hint, and OS notification for malformed
+   *  items the same way regardless of where parking happened. The row's stage
+   *  is `item.stage`: the stage the item was inserted with (claim path) or was
+   *  working in (re-parse path). */
+  parkMalformed(item: ItemRecord, reason: string): void {
+    this.updateItem(item.id, {
+      status: "malformed",
+      parkedReason: `malformed front-matter: ${reason}`,
+      parkedDetail: null,
+    });
+    this.appendHistory(item.id, "parked", item.stage, { reason });
+  }
+
   getHistory(itemId: number): HistoryRecord[] {
     const rows = this.db
       .prepare("SELECT ts, event, stage, detail FROM history WHERE item_id = ? ORDER BY id")
