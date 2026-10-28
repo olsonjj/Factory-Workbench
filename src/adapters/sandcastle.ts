@@ -738,9 +738,19 @@ export function preparePiConfigDir(factoryRoot: string): PiConfigStage | null {
 }
 
 const piConfigCache = new Map<string, PiConfigStage | null>();
+/**
+ * Get (or create) the staged pi config for this factory root. The cache is
+ * keyed by root, but a cached entry is only returned while its directory
+ * still exists — a rebuild of the factory root (cleanup between test suites,
+ * operator wipe between runs) previously left a dead stage in the cache whose
+ * bind-mount failed Sandcastle's hostPath existence check at run time.
+ */
 export function getPiConfigStage(factoryRoot: string): PiConfigStage | null {
-  if (!piConfigCache.has(factoryRoot)) piConfigCache.set(factoryRoot, preparePiConfigDir(factoryRoot));
-  return piConfigCache.get(factoryRoot) ?? null;
+  const cached = piConfigCache.get(factoryRoot);
+  if (cached && fs.existsSync(cached.agentDir)) return cached;
+  const fresh = preparePiConfigDir(factoryRoot);
+  piConfigCache.set(factoryRoot, fresh);
+  return fresh;
 }
 
 function piOllamaSpecIn(packages: string[]): boolean {

@@ -69,21 +69,12 @@ d("integration: sandcastle adapter (requires docker + OLLAMA_API_KEY)", () => {
     });
     expect(["pass", "reject", "needs-human", "gate-fail", "infra-fail"]).toContain(result.outcome);
   }, 300_000);
-});
 
-describe("adapter environment gating", () => {
-  it("is reported as skipped when docker is unavailable", () => {
-    if (!dockerAvailable) {
-      // the real test above is skipped; document it
-      expect(true).toBe(true);
-    } else {
-      expect(dockerAvailable).toBe(true);
-    }
-  });
-});
-
-d("gated real-agent check (ticket 08): a planted stale KB fact is verified and reported, not trusted", () => {
-  it("spec stage flags a KB fact that contradicts the repo", async () => {
+  // Same harness as above, on purpose: the staged pi-config (and everything
+  // else in the temp factory root) is cleaned up in this describe's afterAll,
+  // so any later describe reusing the module-level `harness` would run against
+  // deleted files. Keep gated real-agent tests inside this block.
+  it("spec stage flags a KB fact that contradicts the repo (ticket 08)", async () => {
     const { config } = loadConfig(undefined, harness.root);
     const runner = new SandcastleStageRunner({ config });
     const result = await runner.runStage({
@@ -106,4 +97,15 @@ d("gated real-agent check (ticket 08): a planted stale KB fact is verified and r
     // the agent must surface the repo's actual evidence rather than parroting jest
     expect(spec).toMatch(/vitest|node|package\.json|not jest/);
   }, 300_000);
+});
+
+describe("adapter environment gating", () => {
+  it("is reported as skipped when docker is unavailable", () => {
+    if (!dockerAvailable) {
+      // the real test above is skipped; document it
+      expect(true).toBe(true);
+    } else {
+      expect(dockerAvailable).toBe(true);
+    }
+  });
 });
