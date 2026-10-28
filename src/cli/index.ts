@@ -9,7 +9,8 @@ import { makePaths, ensureLayout } from "../paths.js";
 import { FactoryDb } from "../db.js";
 import { acquireFactoryLock, lockHolderAlive, readLockInfo } from "../lock.js";
 import { scanInbox } from "../inbox.js";
-import { ITEM_TEMPLATE } from "../frontmatter.js";
+import { ITEM_TEMPLATE, slugify } from "../frontmatter.js";
+import type { ItemRecord } from "../types.js";
 import { authorItem, type NewOptions } from "../new.js";
 import { makeRealIO } from "../prompt.js";
 import { Orchestrator, matchAnswers } from "../pipeline.js";
@@ -120,15 +121,45 @@ function logClaimReport(report: ReturnType<typeof scanInbox>): void {
 
 interface StatusFlags { all?: boolean }
 
-/** List the unclaimed markdown files still sitting in the inbox (non-mutating). */
-function inboxPendingFiles(inboxDir: string): string[] {
+/** Classify unclaimed inbox files without mutating anything (read-only peer of `scanInbox`).
+ *  Matches scanInbox's skip rule so "awaiting claim" means `wb run` will actually claim it. */
+function classifyInbox(db: FactoryDb, inboxDir: string): {
+  claimable: string[];
+  alreadyClaimed: { file: string; item: ItemRecord }[];
+  error: NodeJS.ErrnoException | null;
+} {
+  let files: string[];
   try {
-    if (!existsSync(inboxDir)) return [];
-    return readdirSync(inboxDir).filter((f) => f.toLowerCase().endsWith(".md"));
-  } catch {
-    return [];
+    if (!existsSync(inboxDir)) return { claimable: [], alreadyClaimed: [], error: null };
+    files = readdirSync(inboxDir).filter((f) => f.toLowerCase().endsWith(".md"));
+  } catch (err) {
+    // Missing dir is a normal settled state; any other read error must surface,
+    // otherwise status makes an unreadable inbox look empty.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { claimable: [], alreadyClaimed: [], error: null };
+    }
+    return { claimable: [], alreadyClaimed: [], error: err as NodeJS.ErrnoException };
   }
+  const claimable: string[] = [];
+  const alreadyClaimed: { file: string; item: ItemRecord }[] = [];
+  for (const fileName of files.sort()) {
+    const existing = db.findBySlug(slugify(path.basename(fileName)));
+    if (existing && existing.status !== "rejected") {
+      alreadyClaimed.push({ file: fileName, item: existing });
+    } else {
+      claimable.push(fileName);
+    }
+  }
+  return { claimable, alreadyClaimed, error: null };
 }
+
+/** Human age for a lock timestamp. */
+function formatAge(ms: number): string {
+  if (ms < 60_000) return "just started";
+  return `${Math.round(ms / 60_000)} min ago`;
+}
+
+const STALE_LOCK_MS = 10 * 60 * 1000;
 
 /** Shared item listing used by `wb status` (read-only, no lock needed). */
 function printStatusItems(db: FactoryDb, opts: StatusFlags): void {
@@ -245,16 +276,38 @@ program
     // and writes nothing (incl. schema). Safe to run while `wb run` is active;
     // WAL-mode readers never block the writer or vice versa.
     const { config: _config, root } = loadConfig(opts.root);
+    if (!existsSync(path.join(root, "factory.db"))) {
+      console.log(`no factory.db in ${root} yet — run \`wb init\` to create the factory`);
+      return;
+    }
     const db = FactoryDb.openReadonly(root);
     try {
+      // Report the lock holder informationally — never an error, and never
+      // assumed to be `wb run` (any wb command may hold the lock).
       const lock = readLockInfo(root);
-      if (lock && lockHolderAlive(lock)) {
-        const started = new Date(lock.ts);
-        console.log(`run in progress (pid ${lock.pid}, started ${started.toLocaleTimeString()}, ${Math.max(1, Math.round((Date.now() - lock.ts) / 60_000))} min ago)`);
+      if (lock) {
+        const age = Date.now() - lock.ts;
+        if (lockHolderAlive(lock)) {
+          const started = age < 60_000 ? "just started" : `started ${new Date(lock.ts).toLocaleTimeString()}`;
+          const stale = age > STALE_LOCK_MS ? " (possibly stale)" : "";
+          console.log(`factory command in progress (pid ${lock.pid}, ${started}, ${formatAge(age)})${stale}`);
+        } else {
+          console.log(
+            `stale factory lock (pid ${lock.pid}, ${formatAge(age)}) — holder is not running; ` +
+            `if no run is in progress you can remove ${path.join(root, "factory.lock")}`,
+          );
+        }
       }
-      const pending = inboxPendingFiles(makePaths(root).inbox);
-      if (pending.length > 0) {
-        console.log(`inbox: ${pending.length} file(s) awaiting claim (claiming happens in \`wb run\`)`);
+      const inbox = classifyInbox(db, makePaths(root).inbox);
+      if (inbox.error) {
+        console.log(`inbox: unreadable (${inbox.error.message ?? inbox.error}) — cannot check for pending files`);
+      } else {
+        if (inbox.claimable.length > 0) {
+          console.log(`inbox: ${inbox.claimable.length} file(s) awaiting claim (claiming happens in \`wb run\`)`);
+        }
+        for (const { file, item } of inbox.alreadyClaimed) {
+          console.log(`inbox: ${file} will be skipped — slug already claimed (item #${item.id}, ${item.status})`);
+        }
       }
       printStatusItems(db, opts);
     } finally {
