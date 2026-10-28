@@ -638,7 +638,7 @@ export function classifyFinding(
   if (f.kind === "prunable-dir") {
     return flags.forceOrphans
       ? { action: "remove", requiresFlag: null, reason: "orphan leftover dir — --force-orphans given" }
-      : { action: "report-only", requiresFlag: "--force-orphans", reason: "orphan leftover dir — needs --force-orphans" };
+      : { action: "report-only", requiresFlag: "--force-orphans", reason: "orphan leftover dir" };
   }
   // kind === "worktree"
   // Locked worktrees are operator-retained — never reaped, never unlocked.
@@ -654,7 +654,7 @@ export function classifyFinding(
     // Rule 3: report-only by default — after `wb init` a rebuilt DB makes
     // every existing worktree look orphaned; never mass-delete on that.
     if (!flags.forceOrphans) {
-      return { action: "report-only", requiresFlag: "--force-orphans", reason: "orphan — no item row; needs --force-orphans" };
+      return { action: "report-only", requiresFlag: "--force-orphans", reason: "orphan — no item row" };
     }
     if (heldDirty && !flags.forceDirty) {
       return { action: "report-only", requiresFlag: "--force-dirty", reason: dirty ? "orphan — dirty" : "orphan — dirty state unknown" };
