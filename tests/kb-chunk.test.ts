@@ -98,6 +98,42 @@ describe("kbDigestIndex (curator cross-batch digest)", () => {
     expect(idx.text.length).toBeLessThanOrEqual(1000 + 200);
   });
 
+  it("keeps whole entries whole: a chunk boundary carries the next entry, never slices it", () => {
+    const e1 = `## 2026-10-27 — lesson (repo 1)\n\n${"a".repeat(300)}\n\n`;
+    const e2 = `## 2026-10-27 — lesson (repo 2)\n\n${"b".repeat(350)}\n\n`;
+    const text = e1 + e2;
+    const chunks = chunkKbLayer(text, 400);
+    // The old implementation sliced chunk 1 at 400 mid-entry-2 and withheld
+    // its 290 remaining chars from every batch (Greptile PR #6 finding 1).
+    expect(chunks.join("")).toBe(text); // byte-for-byte, no marker
+    expect(chunks.some((c) => c.includes("(repo 1)"))).toBe(true);
+    expect(chunks.some((c) => c.includes("b".repeat(350)))).toBe(true);
+    expect(chunks.every((c) => !c.includes("withheld"))).toBe(true);
+  });
+
+  it("digest is built from the original entries: a straddled lesson still indexes", () => {
+    const e1 = "## 2026-10-27 — lesson (repo 1)\n\ntests run via jest\n\n";
+    const e2 = `## 2026-10-27 — lesson (repo 2)\n\nthe lesson: verify KB facts before relying\n\n${"x".repeat(800)}\n\n`;
+    const idx = kbDigestIndex(e1 + e2, 400);
+    expect(idx.truncated).toBe(false);
+    expect(idx.text).toContain("verify KB facts before relying"); // full text of entry 2, beyond any slice
+    expect(idx.text).toContain("(repo 2)");
+    expect(idx.text).toContain("tests run via jest");
+  });
+
+  it("first prose line skips code INSIDE a fence and text INSIDE a multiline comment", () => {
+    const fenced = "## 2026-10-27 — lesson (repo 1)\n\n```\nnpm install --no-audit\n```\n\nthe lesson: rerun tests after install\n\n";
+    const linesFenced = kbDigestIndex(fenced, 10_000).text.split("\n");
+    expect(linesFenced[0]).toContain("the lesson: rerun tests after install");
+    expect(linesFenced[0]).not.toContain("npm install"); // in-fence command, not the lesson
+
+    const commented = "## 2026-10-27 — lesson (repo 2)\n\n<!-- this entry records the old approach\nwhich is now wrong\n-->\n\nthe lesson: cross-check batches before applying\n\n";
+    const linesCommented = kbDigestIndex(commented, 10_000).text.split("\n");
+    expect(linesCommented[0]).toContain("the lesson: cross-check batches before applying");
+    expect(linesCommented[0]).not.toContain("old approach"); // inside the comment, not the lesson
+    expect(linesCommented[0]).not.toContain("now wrong");
+  });
+
   it("empty and headerless layers produce an empty, non-truncated index", () => {
     expect(kbDigestIndex("", 1000)).toEqual({ text: "", truncated: false });
     expect(kbDigestIndex("no headers, just a blob".repeat(100), 500)).toEqual({ text: "", truncated: false });
