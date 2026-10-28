@@ -150,12 +150,9 @@ Pipeline: **triage → spec → implement → test → review → pull-request**
 {
   "root": "/path/to/factory",
   "models": {
-    "default": "deepseek-v4-pro:0813",
-    "triage": "deepseek-v4.1-flash",
-    "spec": "deepseek-v4-pro:0813",
-    "implement": "deepseek-v4-pro:0813",
-    "test": "deepseek-v4.1-flash",
-    "review": "glm-5.3-flash"
+    "default": "deepseek-v4.1-flash-1017",
+    "implement": "glm-5.3",
+    "review": "deepseek-v4-pro:0813"
   },
   "budgets": { "maxGateAttempts": 3, "maxInfraRetries": 3, "retryBackoffMs": 5000 },
   "sandbox": { "imageName": "sandcastle:local" }
@@ -163,8 +160,15 @@ Pipeline: **triage → spec → implement → test → review → pull-request**
 ```
 
 - All stages default to one model; the per-stage override mechanism is the
-  mapping structure above. The shipped default config gives review a different
-  model family from implement.
+  mapping structure above.
+- Model selection rationale (JSON config files can't carry comments, so it
+  is documented in `src/config.ts` next to `DEFAULT_MODEL`): the default
+  slot is the best value-per-token model in the Ollama Cloud catalog and
+  runs the mechanical stages (triage/spec/test/curate); implement gets the
+  strongest long-horizon agent model for the family (GLM 5.3); review must
+  be a DIFFERENT model family from implement (ticket 06) so its blind
+  spots don't overlap, which is why it keeps DeepSeek V4 Pro. Judge model
+  swaps by cost per passed item (factory DB), not benchmark tables.
 - `OLLAMA_API_KEY` must be set on the host; it is passed through to the
   sandbox `pi` sessions. `gh` must be pre-authenticated.
 

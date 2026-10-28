@@ -44,6 +44,35 @@ export interface FactoryConfig {
 
 export const DEFAULT_MODEL = "deepseek-v4-pro:0813";
 
+/**
+ * Model-selection rationale for the LIVE factory.config.json (2026-10):
+ * the config file is plain JSON — it cannot carry comments — so the reasoning
+ * lives here and in README "Model selection".
+ *
+ * Current live assignment:
+ *   default:  deepseek-v4.1-flash-1017 — triage/spec/test/curate.
+ *             Best value on the Ollama Cloud catalog at decision time:
+ *             highest Intelligence Index on its tier (~45, Artificial
+ *             Analysis) at ~2x the TPS and roughly half the off-peak price
+ *             of deepseek-v4-pro. These stages are short/mechanical;
+ *             flagship weight buys nothing here.
+ *   implement: glm-5.3 — strong long-horizon agent benchmarks (DeepSWE,
+ *             AutomationBench, Terminal-Bench) where this pipeline's
+ *             failure cost is concentrated; slowest of the picks, which is
+ *             acceptable because implement runs once per item.
+ *   review:   deepseek-v4-pro:0813 — deliberately a DIFFERENT model family
+ *             from implement (ticket 06): the review gate exists to catch
+ *             what the implementer's blind spots let through, so it must
+ *             not share them. Cheap enough to rerun freely.
+ *
+ * Invariants when editing live models:
+ *   1. implement and review must be different families.
+ *   2. Model ids must exist in the Ollama Cloud catalog reachable via
+ *      OLLAMA_API_KEY; a typo only surfaces as a mid-pipeline failure.
+ *   3. Judge swaps by cost per passed item (factory DB: usage.model + gate
+ *      outcomes), not by benchmark tables.
+ */
+
 export const DEFAULT_CONFIG: Omit<FactoryConfig, "root"> = {
   models: {
     default: DEFAULT_MODEL,

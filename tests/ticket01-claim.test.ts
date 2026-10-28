@@ -96,7 +96,10 @@ describe("ticket 01: factory skeleton + inbox ingest", () => {
     harness = createHarness();
     expect(ensureConfigFile(harness.root)).toBe(true);
     expect(ensureConfigFile(harness.root)).toBe(false);
-    const { config } = loadConfig();
+    // loadConfig must resolve against the harness root: an argument-less
+    // call falls back to <cwd>/factory and would read the LIVE factory
+    // config, silently coupling this test to whatever models are deployed.
+    const { config } = loadConfig(harness.root);
     expect(config.models.default).toBe(DEFAULT_MODEL);
     expect(config.budgets.maxGateAttempts).toBe(3);
     expect(config.budgets.maxInfraRetries).toBe(3);
