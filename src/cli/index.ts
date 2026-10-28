@@ -319,7 +319,7 @@ program
   .description("Watch the factory live: print changes and OS-notify when items park")
   .option("--root <dir>", "factory root directory")
   .option("--interval <seconds>", "seconds between DB polls", "5")
-  .action((opts: { root?: string; interval?: string }) => {
+  .action(async (opts: { root?: string; interval?: string }) => {
     const intervalSec = parseIntervalSeconds(opts.interval);
     const { config, root } = loadConfig(opts.root);
     if (!existsSync(path.join(root, "factory.db"))) {
@@ -327,16 +327,26 @@ program
       return;
     }
     // Read-only like `wb status`: open the DB read-only, never take the
-    // factory lock, never claim from the inbox, never write anywhere. The
-    // poll loop keeps the process alive; Ctrl+C exits cleanly with 0.
+    // factory lock, never claim from the inbox, never write anywhere. The DB
+    // handle is closed in `finally`; the poll loop keeps the command alive
+    // until Ctrl+C, which stops the loop and exits cleanly with 0.
     const db = FactoryDb.openReadonly(root);
-    nodeProcess.on("SIGINT", () => {
+    try {
+      console.log(`wb watch — polling every ${intervalSec}s · quit with Ctrl+C`);
+      const state: WatchState = { lastEventId: 0, lastCard: null, first: true };
+      const stop = startWatch(db, state, config.budgets.maxGateAttempts, intervalSec);
+      nodeProcess.on("SIGINT", () => {
+        stop();
+        nodeProcess.exit(0);
+      });
+      // Keep the command alive until Ctrl+C (the chained poll timers hold
+      // the event loop open). Awaiting — not returning — this never-resolving
+      // promise keeps the `finally` below from running while the loop lives;
+      // SIGINT exits above, and `finally` covers any earlier throw.
+      await new Promise<never>(() => {});
+    } finally {
       db.close();
-      nodeProcess.exit(0);
-    });
-    console.log(`wb watch — polling every ${intervalSec}s · quit with Ctrl+C`);
-    const state: WatchState = { lastEventId: 0, lastCard: null, first: true };
-    startWatch(db, state, config.budgets.maxGateAttempts, intervalSec);
+    }
   });
 
 program

@@ -245,10 +245,11 @@ Non-parked example:
 ### 4.4 OS notification (`notifyParked`)
 
 - Best-effort, fire-and-forget, never throws out of the call site:
-  - `darwin`: `spawn("osascript", ["-e", `display notification "${text}" with title "Workbench"`], { stdio: "ignore", detached: true })` and `.unref()`.
-  - `linux`: `spawn("notify-send", ["-t", "Workbench", text], { stdio: "ignore", detached: true })` and `.unref()`.
+  - `darwin`: first escape the text for the AppleScript string literal — `safe = text.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/[\r\n]+/g, " ")` — then `spawn("osascript", ["-e", `display notification "${safe}" with title "Workbench"`], { stdio: "ignore", detached: true })` and `.unref()`.
+  - `linux`: `spawn("notify-send", ["-t", "5000", "Workbench", text], { stdio: "ignore", detached: true })` and `.unref()` (`-t 5000` is the expire timeout in ms; `Workbench` is the summary, `text` the body).
   - other platforms: no-op.
-- Wrap in try/catch; a spawn failure is swallowed silently. `spawn` (not shell-interpolated `exec`) is used precisely so a reason containing quotes/slashes cannot inject into the command.
+- Wrap in try/catch; a spawn failure is swallowed silently. Spawn errors that arrive *asynchronously* (e.g. ENOENT when the binary is missing) are reported on the child's `"error"` event — subscribe a no-op handler on the returned child so an unhandled `"error"` can never crash `wb`.
+- Security note: `spawn` with argv arrays prevents *shell* injection (no shell ever interpolates the text), but it does **not** make the darwin payload safe on its own — the `-e` argument is AppleScript *source*, so an unescaped `"` in the text would close the string literal and let a parked reason inject script (e.g. `do shell script …`). That is why the text is escaped for AppleScript (backslash and double-quote escaped, newlines flattened) before interpolation.
 - CLI wires `notify = (t) => notifyParked(t)`. Tests inject a fake `spawnFn` and assert argv (§7.5).
 
 ## 5. CLI surface summary
@@ -268,7 +269,7 @@ Non-parked example:
 2. **Card logic**: `renderCard` → `PARKED: none` variant and parked variant; truncation of a long RUN line at 80 (`…` present, length ≤ 82 incl. indent); `runWatchOnce` second-call comparison: unchanged state → `outcome.lines` empty (no card), changed parked_reason → card printed.
 3. **Polling/diff**: consecutive `runWatchOnce` calls — call with rows 1–3 then rows 3–10 and assert ids 1–3 are consumed only once (`state.lastEventId` advances 3 → 10; duplicate row ids produce no lines).
 4. **Interval parsing**: `parseIntervalSeconds(undefined) === 5`; `"0" → 1`; `"-3" → 1`; `"2.7" → 2`; `"abc" → 1`.
-5. **Notification**: fake `spawnFn = (cmd, args, opts) => recorded.push({cmd, args, opts})`; assert darwin call is `osascript` with one `-e` arg containing `display notification "#1 s parked at triage — needs-human" with title "Workbench"`; linux call is `notify-send` with `["-t", "Workbench", "<text>"]`; `stdio: "ignore"` and `detached: true` in opts; a throwing `spawnFn` doesn't propagate.
+5. **Notification**: fake `spawnFn = (cmd, args, opts) => recorded.push({cmd, args, opts})`; assert darwin call is `osascript` with one `-e` arg containing `display notification "#1 s parked at triage — needs-human" with title "Workbench"`; linux call is `notify-send` with `["-t", "5000", "Workbench", "<text>"]`; `stdio: "ignore"` and `detached: true` in opts; a throwing `spawnFn` doesn't propagate. AppleScript escaping: a text containing `"`, `\\` and a newline (e.g. a `do shell script` injection attempt) must produce an `-e` source with the quote escaped as `\"`, the backslash as `\\\\`, no raw newline, and the payload unable to terminate the string literal.
 6. **Integration** (`tests/watch-integration.test.ts`, following `tests/status-readonly.test.ts`'s seeding approach): `createHarness()`, `h.inboxFile(...)` + `claim(h)`, then via `h.db.appendHistory(...)` seed extra rows (claim, stage-start attempt 2, stage-pass with nextStage, parked awaiting-approval, unparked with via/note); call the poll function against `h.db` with `state.first=true`, then again (single polls, no live loop) and assert output lines (banner excluded), that the second poll with no DB changes emits nothing, and that **no `factory.lock` was created** (watch never takes the lock: `existsSync(path.join(h.root, "factory.lock")) === false`).
 
 Run: `npm test` (vitest) and `npm run typecheck` must pass; `strict` + `noUncheckedIndexedAccess` are on in `tsconfig.json` — index-guard accordingly.

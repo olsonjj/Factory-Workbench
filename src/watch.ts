@@ -352,26 +352,45 @@ export type SpawnFn = (
   cmd: string,
   args: string[],
   opts: { stdio: "ignore"; detached: boolean },
-) => { unref?: () => void };
+) => { unref?: () => void; on?: (event: "error", handler: () => void) => void };
+
+/**
+ * Escape a string for embedding inside an AppleScript double-quoted string
+ * literal: backslash first, then double-quote, and flatten newlines (an
+ * embedded `"` would otherwise close the literal and let a parked reason
+ * inject script — e.g. `do shell script …` — into the osascript source).
+ */
+function escapeAppleScriptString(text: string): string {
+  return text.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/[\r\n]+/g, " ");
+}
 
 /**
  * Best-effort, fire-and-forget OS notification for a parked line. Never
  * throws: any spawn failure is swallowed, the child is detached and unref'd so
- * it can never block or crash `wb`.
+ * it can never block or crash `wb`. argv arrays prevent *shell* injection,
+ * but the darwin payload is AppleScript source, so the text is escaped for
+ * the AppleScript string literal too (see `escapeAppleScriptString`).
  */
 export function notifyParked(text: string, platform: string = process.platform, spawnFn: SpawnFn = spawn): void {
   try {
-    let child: { unref?: () => void } | undefined;
+    let child: ReturnType<SpawnFn> | undefined;
     if (platform === "darwin") {
-      child = spawnFn("osascript", ["-e", `display notification "${text}" with title "Workbench"`], {
+      const safe = escapeAppleScriptString(text);
+      child = spawnFn("osascript", ["-e", `display notification "${safe}" with title "Workbench"`], {
         stdio: "ignore",
         detached: true,
       });
     } else if (platform === "linux") {
-      child = spawnFn("notify-send", ["-t", "Workbench", text], { stdio: "ignore", detached: true });
+      // notify-send <options> <summary> [body]: -t is the expire timeout (ms).
+      child = spawnFn("notify-send", ["-t", "5000", "Workbench", text], { stdio: "ignore", detached: true });
     } else {
       return;
     }
+    // Spawn failures like ENOENT (binary missing) are reported *asynchronously*
+    // on the child's "error" event — a synchronous try/catch cannot catch them,
+    // and an unhandled "error" would crash the process. Subscribe a no-op so
+    // best-effort really is best-effort.
+    child?.on?.("error", () => {});
     child?.unref?.();
   } catch {
     // Swallowed: notifications are best-effort only.

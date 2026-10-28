@@ -369,9 +369,33 @@ describe("notification", () => {
     expect(rec.calls).toHaveLength(1);
     const call = rec.calls[0]!;
     expect(call.cmd).toBe("notify-send");
-    expect(call.args).toEqual(["-t", "Workbench", "#2 t parked — exhausted-rework"]);
+    expect(call.args).toEqual(["-t", "5000", "Workbench", "#2 t parked — exhausted-rework"]);
     expect(call.opts).toEqual({ stdio: "ignore", detached: true });
     expect(rec.unrefCount).toBe(1);
+  });
+
+  it("escapes the darwin AppleScript string: quotes, backslashes and newlines cannot break out", () => {
+    const rec = recordingSpawn();
+    // Injection attempt: close the notification string, start a new AppleScript
+    // statement, and leave a trailing backslash that would eat the delimiter.
+    const malicious = 'needs-human")\ndo shell script "touch /tmp/pwned\\';
+    notifyParked(malicious, "darwin", rec.spawnFn);
+    expect(rec.calls).toHaveLength(1);
+    const source = rec.calls[0]!.args[1]!;
+    expect(rec.calls[0]!.args[0]).toBe("-e");
+    expect(source.startsWith('display notification "')).toBe(true);
+    expect(source.endsWith('" with title "Workbench"')).toBe(true);
+    // No raw newline survives, so no second AppleScript statement can be
+    // formed; the payload stays inside the one string literal.
+    expect(source).not.toMatch(/[\r\n]/);
+    // Exact source: payload quote → \", trailing backslash → \\\\, newline → space.
+    expect(source).toBe(
+      'display notification "needs-human\\") do shell script \\"touch /tmp/pwned\\\\" with title "Workbench"',
+    );
+    // The escaped quote means the injected `do shell script` cannot be
+    // reached as a statement: after the opening delimiter everything is
+    // inert literal text.
+    expect(source).toContain('needs-human\\"');
   });
 
   it("is a no-op on other platforms", () => {
@@ -386,5 +410,21 @@ describe("notification", () => {
     };
     expect(() => notifyParked("text", "darwin", throwing)).not.toThrow();
     expect(() => notifyParked("text", "linux", throwing)).not.toThrow();
+  });
+
+  it("swallows asynchronous spawn errors (e.g. ENOENT) so wb never crashes", () => {
+    const handlers: Record<string, () => void> = {};
+    const spawnFn: SpawnFn = () => ({
+      // Real spawn reports a missing binary asynchronously on the child's
+      // "error" event — a synchronous try/catch cannot catch that, and an
+      // unhandled "error" would crash the process.
+      on: (event: "error", handler: () => void) => {
+        handlers[event] = handler;
+      },
+      unref: () => {},
+    });
+    expect(() => notifyParked("text", "linux", spawnFn)).not.toThrow();
+    expect(handlers["error"]).toBeTypeOf("function");
+    expect(() => handlers["error"]!()).not.toThrow();
   });
 });
