@@ -4,6 +4,7 @@ import { parseItemMarkdown, slugify } from "./frontmatter.js";
 import type { FactoryDb } from "./db.js";
 import type { FactoryPaths } from "./paths.js";
 import { itemDir, itemFile } from "./paths.js";
+import { parkMalformed } from "./util.js";
 import type { ItemRecord } from "./types.js";
 
 /** Sorted list of claim-candidate markdown files in the inbox. Shared by
@@ -65,13 +66,9 @@ export function scanInbox(p: FactoryPaths, db: FactoryDb): InboxReport {
         stage: "triage",
         status: "malformed",
         sourceFile: dest,
-        parkedReason: `malformed front-matter: ${parsed.reason}`,
       });
       db.appendHistory(item.id, "claimed", null, { file: fileName, malformed: parsed.reason });
-      // Emit a `parked` row too, so `wb watch` renders the parked line, fix
-      // hint, and OS notification for malformed items (same shape as other
-      // parks; stage is the triage stage the item was inserted with).
-      db.appendHistory(item.id, "parked", item.stage, { reason: parsed.reason });
+      parkMalformed(db, item, parsed.reason);
       report.malformed.push({ slug, file: dest, reason: parsed.reason });
       continue;
     }

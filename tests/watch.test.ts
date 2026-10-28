@@ -134,15 +134,16 @@ describe("event formatting", () => {
   });
 
   it("resolves parked hints from parked_reason for malformed re-parse rows", () => {
-    // Re-parse parking: detail.reason is the plain parse reason, the item's
-    // parked_reason is "malformed front-matter: …" — the hint must trigger.
+    // Re-parse parking (parkMalformed): row stage is item.stage, detail.reason
+    // is the plain parse reason, the item's parked_reason is "malformed
+    // front-matter: …" — the hint must trigger.
     const malformed = item({ status: "malformed", parkedReason: "malformed front-matter: repo: missing" });
     const line = formatEventLine(
-      row({ id: 6, event: "parked", stage: null, detail: { reason: "repo: missing" } }),
+      row({ id: 6, event: "parked", stage: "triage", detail: { reason: "repo: missing" } }),
       malformed,
       MAX,
     );
-    expect(line).toBe(`⚠ ${CLOCK} (!) #1 fix-bugs parked — repo: missing → \`wb retry fix-bugs  # fix front-matter first\`${BEL}`);
+    expect(line).toBe(`⚠ ${CLOCK} (!) #1 fix-bugs parked at triage — repo: missing → \`wb retry fix-bugs  # fix front-matter first\`${BEL}`);
   });
 
   it("renders parked with null stage, missing item fallbacks and no hint for human-rejected", () => {

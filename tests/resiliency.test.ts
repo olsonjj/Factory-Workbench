@@ -176,6 +176,28 @@ describe("P0-2: wb retry recovery verb", () => {
     expect(reQueued.parkedReason).toBeNull();
   });
 
+  it("uniform parked row shape when refreshFromSource parks mid-run (stage = item.stage)", async () => {
+    harness = createHarness();
+    dropItem(harness, "Task");
+    let item = harness.db.listItems()[0]!;
+    expect(item.status).toBe("queued");
+
+    // Corrupt the source file mid-run so refreshFromSource parks it.
+    harness.writeFile(item.sourceFile!, "no front matter here\n");
+    const orch = makeOrchestrator(harness, new ScriptedRunner({ triage: [pass("triage")] }));
+    await orch.tickAll();
+
+    item = harness.db.getItem(item.id)!;
+    expect(item.status).toBe("malformed");
+    expect(item.parkedReason).toContain("malformed front-matter: ");
+    const hist = harness.db.getHistory(item.id);
+    const parked = hist.find((r) => r.event === "parked")!;
+    expect(parked.stage).toBe("triage"); // the stage the item was working in — was null before unification
+    expect(Object.keys(parked.detail)).toEqual(["reason"]);
+    expect(parked.detail.reason).toBe("front-matter must include a non-empty `title`");
+    expect(item.parkedReason).toBe(`malformed front-matter: ${parked.detail.reason}`);
+  });
+
   it("throws a clear error for a status retry does not apply to", async () => {
     harness = createHarness();
     dropItem(harness, "task");
