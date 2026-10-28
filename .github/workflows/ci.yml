@@ -1,5 +1,14 @@
 name: CI
 
+# The docker-gated real-agent integration tests (tests/integration/)
+# deliberately self-skip in this workflow: they require a pre-built
+# sandcastle:local image (built from the gitignored .sandcastle/Dockerfile
+# via `npx sandcastle docker build-image`), a staged host ~/.pi/agent config
+# (auth + model catalog for the sandboxed agent), and a git identity for the
+# test harness commits. No runner preparation is done here, so CI runs the
+# hermetic suite only. Re-enable them in a dedicated job that provisions all
+# three before `npm test`.
+
 on:
   push:
   pull_request:
@@ -11,10 +20,6 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # OLLAMA_API_KEY optionally un-gates the Docker-gated real-agent
-    # integration tests (they self-skip when it is unset).
-    env:
-      OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

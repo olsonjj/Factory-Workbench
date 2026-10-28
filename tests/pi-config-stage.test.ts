@@ -12,19 +12,27 @@ import { getPiConfigStage } from "../src/adapters/sandcastle.js";
 describe("getPiConfigStage", () => {
   let homeFixture: string;
   let realHome: string | undefined;
+  /** Every factory root created by factoryRoot() in the current test. */
+  let factoryRoots: string[];
 
   beforeEach(() => {
     realHome = process.env.HOME;
     homeFixture = fs.mkdtempSync(path.join(os.tmpdir(), "pi-home-"));
+    factoryRoots = [];
     process.env.HOME = homeFixture;
   });
 
   afterEach(() => {
     process.env.HOME = realHome;
     fs.rmSync(homeFixture, { recursive: true, force: true });
+    for (const root of factoryRoots) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  const factoryRoot = (): string => fs.mkdtempSync(path.join(os.tmpdir(), "factory-pi-stage-"));
+  const factoryRoot = (): string => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "factory-pi-stage-"));
+    factoryRoots.push(root);
+    return root;
+  };
   /** Give the fixture host the minimal pi config file (only auth.json today). */
   const giveHostAuth = (): void => {
     fs.mkdirSync(path.join(homeFixture, ".pi", "agent"), { recursive: true });
@@ -55,6 +63,9 @@ describe("getPiConfigStage", () => {
     fs.writeFileSync(path.join(first!.agentDir, "extra-marker"), "x");
     const second = getPiConfigStage(root);
     expect(second).not.toBeNull();
+    // Object identity: the cache must return the SAME stage, not re-stage
+    // (re-staging would re-copy files and could even repeat an npm install).
+    expect(second).toBe(first);
     expect(fs.existsSync(path.join(second!.agentDir, "extra-marker"))).toBe(true);
   });
 

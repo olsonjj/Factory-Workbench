@@ -42,7 +42,13 @@ d("integration: sandcastle adapter (requires docker + OLLAMA_API_KEY)", () => {
     fs.writeFileSync(path.join(repoDir, "package.json"), JSON.stringify({ name: "x", scripts: { test: "node -e \"console.log('ok')\"" } }));
     git(["init", "-b", "main"]);
     git(["add", "."]);
-    execFileSync("git", ["-C", repoDir, "commit", "-m", "init", "-q"], {});
+    // -c identity: the harness must not depend on the host having a global
+    // git user configured (fresh runners / containers commonly don't).
+    execFileSync(
+      "git",
+      ["-C", repoDir, "-c", "user.name=wb", "-c", "user.email=wb@factory.workbench", "commit", "-m", "init", "-q"],
+      {},
+    );
     harness.config.sandbox.imageName = "sandcastle:local";
   });
 
