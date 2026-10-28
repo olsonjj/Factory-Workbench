@@ -89,6 +89,37 @@ describe("wb watch (integration)", () => {
     expect(existsSync(path.join(h.root, "factory.lock"))).toBe(false);
   });
 
+  it("renders a parked line with a fix hint when malformed front-matter parks an item at claim", () => {
+    const h = makeHarness();
+    // Prime BEFORE claim: empty db → lastEventId primes to 0.
+    const watchDb = FactoryDb.openReadonly(h.root);
+    watchDbs.push(watchDb);
+    const first = pollOnce(watchDb, initialState(), 3);
+    expect(first.lines).toEqual([]);
+
+    // Malformed item: front-matter missing `title` (reason: frontmatter.ts).
+    h.inboxFile("Broken", { repo: "/tmp/some-repo" }, "This will never parse.");
+    claim(h);
+
+    const second = pollOnce(watchDb, first.state, 3);
+    // Row 1: the claim line; row 2: the parked line; row 3: changed card.
+    expect(second.lines).toHaveLength(3);
+    expect(second.lines[0]).toMatch(/^\[\d{2}:\d{2}:\d{2}\] #1 broken claim$/);
+    expect(second.lines[1]).toMatch(
+      /^⚠ \[\d{2}:\d{2}:\d{2}\] \(!\) #1 broken parked at triage — front-matter must include a non-empty `title` → `wb retry broken  # fix front-matter first`\x07$/,
+    );
+    expect(second.lines[2]).toContain("PARKED: #1 broken (malformed front-matter:");
+    expect(second.notificationTexts).toEqual([
+      "#1 broken parked at triage — front-matter must include a non-empty `title`",
+    ]);
+
+    // History ordering directly through the writer DB: claim, then parked.
+    const hist = h.db.getHistory(h.db.listItems()[0]!.id);
+    expect(hist.map((r) => r.event)).toEqual(["claimed", "parked"]);
+    expect(hist[1]!.stage).toBe("triage");
+    expect(hist[1]!.detail).toEqual({ reason: "front-matter must include a non-empty `title`" });
+  });
+
   it("renders events from the same snapshot as the card (single read transaction)", () => {
     // Regression: pollOnce must consume one consistent snapshot, not separate
     // item/history reads. Here the history row is generic (no detail reason)
