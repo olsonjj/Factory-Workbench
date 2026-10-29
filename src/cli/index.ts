@@ -16,6 +16,7 @@ import { makeRealIO } from "../prompt.js";
 import { Orchestrator, matchAnswers } from "../pipeline.js";
 import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, ollamaEnv } from "../adapters/sandcastle.js";
 import { parseIntervalSeconds, startWatch, type WatchState } from "../watch.js";
+import { runGc, GitGcScanner, GitGcReaper, renderGcHuman, renderGcJson, type GcFlags } from "../gc.js";
 import { sleep } from "../util.js";
 
 const program = new Command("wb");
@@ -346,6 +347,105 @@ program
       await new Promise<never>(() => {});
     } finally {
       db.close();
+    }
+  });
+
+program
+  .command("gc")
+  .description("Reconcile the factory DB against every target repo's git state; report leaked worktrees/branches and (with --apply) reap the safe subset")
+  .option("--root <dir>", "factory root directory")
+  .option("--apply", "execute the planned reaps (takes the factory lock)")
+  .option("--delete-branches", "with --apply: also delete provably-safe branches of terminal items (merged into base, or — with --force-branches — probe-confirmed no open PR)")
+  .option("--force-branches", "with --apply --delete-branches: delete unmerged branches whose PR probe confirms no open PR")
+  .option("--force-dirty", "with --apply: reap worktrees with uncommitted changes (the changed-file list is recorded into the item's artifacts first)")
+  .option("--force-orphans", "with --apply: reap worktrees/dirs no item row references")
+  .option("--json", "emit one machine-readable JSON document instead of the human report")
+  .action(async (opts: { root?: string; apply?: boolean; deleteBranches?: boolean; forceBranches?: boolean; forceDirty?: boolean; forceOrphans?: boolean; json?: boolean }) => {
+    const flags: GcFlags = {
+      apply: !!opts.apply,
+      deleteBranches: !!opts.deleteBranches,
+      forceBranches: !!opts.forceBranches,
+      forceDirty: !!opts.forceDirty,
+      forceOrphans: !!opts.forceOrphans,
+      json: !!opts.json,
+    };
+    // The mutating flags are meaningless in report mode; their presence must
+    // not silently widen the report.
+    const stray = (
+      [
+        ["deleteBranches", "--delete-branches"],
+        ["forceBranches", "--force-branches"],
+        ["forceDirty", "--force-dirty"],
+        ["forceOrphans", "--force-orphans"],
+      ] as const
+    ).filter(([key]) => flags[key]);
+    if (!flags.apply && stray.length > 0) {
+      console.error(`${stray.map(([, flag]) => flag).join(" ")} only makes sense with --apply — report mode never mutates anything`);
+      nodeProcess.exit(1);
+    }
+    if (!flags.apply) {
+      // Read-only report, mirroring `wb status`'s open pattern exactly: no
+      // factory lock, no DB write, no factory.db creation, no git/fs
+      // mutation. Reconciliation races are cosmetic in report mode, so it is
+      // safe while any other wb command holds the lock (WAL readers never
+      // block the writer or vice versa).
+      const { root } = loadConfig(opts.root);
+      if (!existsSync(path.join(root, "factory.db"))) {
+        console.log(`no factory.db in ${root} yet — it is created by any write command (e.g. \`wb new\` or \`wb run\`)`);
+        return;
+      }
+      const db = FactoryDb.openReadonly(root);
+      try {
+        // Lock holder is informational only, exactly like `wb status` — but
+        // suppressed in --json mode so the document stays parseable.
+        if (!flags.json) {
+          const lock = readLockInfo(root);
+          if (lock) {
+            const age = Date.now() - lock.ts;
+            if (lockHolderAlive(lock)) {
+              const stale = age > STALE_LOCK_MS ? " (possibly stale)" : "";
+              console.log(`factory command in progress (pid ${lock.pid}, ${formatAge(age)})${stale}`);
+            } else {
+              console.log(
+                `stale factory lock (pid ${lock.pid}, ${formatAge(age)}) — holder is not running; ` +
+                  `if no run is in progress you can remove ${path.join(root, "factory.lock")}`,
+              );
+            }
+          }
+        }
+        const result = await runGc(
+          { db, paths: makePaths(root), scanner: new GitGcScanner(), reaper: new GitGcReaper() },
+          flags,
+        );
+        console.log(flags.json ? renderGcJson(result) : renderGcHuman(result));
+      } finally {
+        db.close();
+      }
+      return;
+    }
+    // Mutating verb: take the factory lock like every other write command
+    // (a held lock fails with the standard busy error). Deliberately NOT
+    // withFactory/openFactory — those claim inbox files and construct a
+    // SandcastleStageRunner; gc has no runner and claims nothing.
+    const { root } = loadConfig(opts.root);
+    const release = acquireFactoryLock(root);
+    let db: FactoryDb | null = null;
+    try {
+      db = new FactoryDb(root);
+      const result = await runGc(
+        { db, paths: makePaths(root), scanner: new GitGcScanner(), reaper: new GitGcReaper() },
+        flags,
+      );
+      console.log(flags.json ? renderGcJson(result) : renderGcHuman(result));
+      if (result.errors.length > 0) {
+        for (const err of result.errors) {
+          console.error(`gc: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        nodeProcess.exitCode = 1;
+      }
+    } finally {
+      db?.close();
+      release();
     }
   });
 

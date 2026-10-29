@@ -100,12 +100,30 @@ wb reject <id> --reason "fix the X"   # feedback feeds the next agent run
 wb answer <id> -a "..."  # answer parked triage questions; triage re-runs
 wb retry <id>            # re-queue a malformed / infra-failed / exhausted-rework item
 wb curate [project]      # on-demand KB curation proposal (read-only)
+wb gc [--apply] [--json] # reconcile the DB against target repos' git state; report
+                          # leaked worktrees/branches (per-repo housekeeping) and, with
+                          # --apply, reap the safe subset (terminal items' worktrees and
+                          # stale-branch repairs; branches only under --delete-branches)
 ```
 
 `wb status` is always read-only: it takes no factory lock, claims nothing,
 and writes nothing, so it works while `wb run` (or any other wb command) is
 active — it reports the lock holder (`factory command in progress (pid …)`)
 and any inbox files still awaiting claim instead of failing.
+
+`wb gc` (spec: `specs/wb-gc.spec.md`) is read-only the same way: it never
+takes the lock, creates no `factory.db`, and mutates nothing, so it is safe
+to run anytime. With `--apply` it becomes a write verb (factory lock taken)
+that reaps leaked worktrees of terminal items and stale worktrees holding
+resumable items' branches (the crash-recovery repair — the changed-file list
+of any dirty reap is recorded into the item's artifacts first, behind
+`--force-dirty`). Branches are kept by default; `--delete-branches` deletes
+only what is provably merged into the recorded base (local `merge-base`;
+squash/rebase merges need `--force-branches` after a probe confirms no open
+PR). Orphans (worktrees no item row references) are report-only unless
+`--force-orphans` — a rebuilt DB never triggers mass deletion. An unknown
+dirty state (a failed probe) holds like dirty, and admin-locked worktrees
+(`git worktree lock`) are reported as kept and never unlocked or reaped.
 
 What the operator sees — `wb status` shows every item's state, including *why*
 anything is parked:
