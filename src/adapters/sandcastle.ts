@@ -507,21 +507,9 @@ Return your verdict as JSON inside a <review>...</review> tag:
     this.worktrees.clear();
     // The runner's worktree lifetime is the item lifetime, so per-item npm
     // prefixes are cleaned up with the item's worktree disposal.
-    for (const dir of this.npmPrefixes.values()) {
-      try {
-        fs.rmSync(dir, { recursive: true, force: true });
-      } catch {
-        // best-effort cleanup
-      }
-    }
+    this.npmPrefixes.forEach(rmRfBestEffort);
     this.npmPrefixes.clear();
-    for (const dir of this.agentDirs.values()) {
-      try {
-        fs.rmSync(dir, { recursive: true, force: true });
-      } catch {
-        // best-effort cleanup
-      }
-    }
+    this.agentDirs.forEach(rmRfBestEffort);
     this.agentDirs.clear();
     this.sessionsDirOfLastRun = null;
   }
@@ -681,10 +669,13 @@ ${COMPLETE}`;
         const proposal = parseStructuredString(result, "proposal", text || undefined);
         return { outcome: "pass", artifacts: [{ name: "proposal", content: proposal }] };
       } finally {
-        fs.rmSync(agentDir, { recursive: true, force: true });
+        // Same best-effort policy as the runner's dispose wipes: a cleanup
+        // failure must not mask a completed curation (a throw in this
+        // finally would override the return below).
+        rmRfBestEffort(agentDir);
       }
     } finally {
-      fs.rmSync(scratch, { recursive: true, force: true });
+      rmRfBestEffort(scratch);
     }
   }
 
@@ -836,6 +827,21 @@ export function piConfigMounts(
  * empty writable dir — pi fails model resolution later, same as pre-staging).
  * Exported for tests.
  */
+/**
+ * The one "best-effort directory wipe" policy shared by every cleanup site
+ * that must never turn a resource-release failure into a run failure:
+ * recursive, force, and any error swallowed. NOT for wipe-before-rebuild
+ * sites (ensureItemNpmPrefix / freshAgentDir): a failed pre-rebuild wipe is
+ * a correctness problem and must propagate.
+ */
+function rmRfBestEffort(dir: string): void {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // best-effort cleanup: nothing a later run depends on
+  }
+}
+
 export function freshAgentDir(template: PiConfigStage | null, target: string): void {
   fs.rmSync(target, { recursive: true, force: true });
   fs.mkdirSync(path.join(target, "sessions"), { recursive: true });
