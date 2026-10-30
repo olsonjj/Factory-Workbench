@@ -182,8 +182,9 @@ export class SandcastleStageRunner implements StageRunner {
   private readonly npmPrefixes = new Map<string, string>();
   /** Per-item agent-dir copies (item slug → host dir), cleaned up in dispose(). */
   private readonly agentDirs = new Map<string, string>();
-  /** Agent-dir root whose sessions the most recent run wrote to (for agentText). */
-  private lastAgentDir: string | null = null;
+  /** Agent-dir copy the most recent run wrote sessions into; agentText depends
+   *  on wtRun/wtRunScratch having run first (set just before every run). */
+  private sessionsDirOfLastRun: string | null = null;
   private runStartedAt = 0;
 
   private staging(): PiConfigStage | null {
@@ -196,8 +197,8 @@ export class SandcastleStageRunner implements StageRunner {
     if (staged) {
       // Sessions are written by the per-run agent-dir copy (freshAgentDir);
       // before any run of this process, fall back to the staged template.
-      const sessionsDir = this.lastAgentDir
-        ? path.join(this.lastAgentDir, "sessions")
+      const sessionsDir = this.sessionsDirOfLastRun
+        ? path.join(this.sessionsDirOfLastRun, "sessions")
         : path.join(staged.agentDir, "sessions");
       const text = assistantTextFromSessions(sessionsDir, this.runStartedAt);
       if (text) return text;
@@ -287,15 +288,18 @@ export class SandcastleStageRunner implements StageRunner {
    * mounted read-only without breaking pi startup (live-verified via the
    * gated integration suite). The security property this preserves instead:
    * the copy is minimal (never auth.json — credentials ride env only) and
-   * is discarded after the run, so nothing an agent writes here survives
-   * beyond the run or crosses items. Sessions land inside the copy, under
-   * the factory root (durable, inspectable).
+   * is rebuilt from the template BEFORE every run, so tampering cannot
+   * persist into a later stage of the same item or into a later item. A
+   * run's residue stays on the host disk only until that item's next stage
+   * run (or runner dispose) wipes it — it is not removed right at run end.
+   * Session files inside the copy are therefore transient, not durable:
+   * inspectable while the run/item is live, never an audit trail.
    */
   private ensureItemAgentDir(slug: string): string {
     const target = path.join(this.config.root, "pi-config", "agents", slug);
     freshAgentDir(this.staging(), target);
     this.agentDirs.set(slug, target);
-    this.lastAgentDir = target;
+    this.sessionsDirOfLastRun = target;
     return target;
   }
 
@@ -519,7 +523,7 @@ Return your verdict as JSON inside a <review>...</review> tag:
       }
     }
     this.agentDirs.clear();
-    this.lastAgentDir = null;
+    this.sessionsDirOfLastRun = null;
   }
 }
 
@@ -783,14 +787,16 @@ export interface PiConfigMount {
  * 1. the per-run agent-dir copy, WRITABLE — pi must write its settings lock
  *    beside the settings file at read time (a read-only mount breaks
  *    startup; see the PiConfigStage docstring), so isolation is temporal
- *    instead: the copy is minimal, per-run, and wiped after the run;
- *    copy is minimal, per-run, and wiped after the run;
+ *    instead: the copy is minimal and rebuilt from the template before
+ *    every run, so a run's writes survive at most until the next run of
+ *    the same item (or runner dispose) wipes them;
  * 2. (when npmPrefix is non-null) the npm global prefix at NPM_GLOBAL_PREFIX.
  *
  * Residual exposure, documented deliberately (finding H1 follow-ups track
  * these): the per-run settings/models files are READABLE and WRITABLE inside
- * one run — but they are non-secret and wiped after the run, so a compromised
- * stage cannot persist tampering into a later stage or item; the per-item npm
+ * one run — but every run starts from a fresh template copy, so a compromised
+ * stage cannot persist tampering into a later stage or item (residue lingers
+ * on host disk only until that item's next stage run wipes it); the per-item npm
  * prefix is writable within a single stage run (an in-run `npm i` still works
  * and can affect only that run); and credentials reach stages via env, which
  * a compromised stage can always read — the goal is that a stage cannot
@@ -858,7 +864,8 @@ export function freshAgentDir(template: PiConfigStage | null, target: string): v
  * npm_config_prefix pointing at it, so the packages resolve without any
  * in-container global install attempt. Nothing mounts the base template
  * writable, ever. Sessions land in the factory root, under the per-run
- * agent dirs (pi-config/agents/<run>/sessions — durable, inspectable).
+ * agent dirs (pi-config/agents/<run>/sessions — transient: wiped by that
+ * item's next stage run or runner dispose, never an audit trail).
  */
 export function preparePiConfigDir(factoryRoot: string): PiConfigStage | null {
   const agentDir = path.join(process.env.HOME ?? "~", ".pi", "agent");
