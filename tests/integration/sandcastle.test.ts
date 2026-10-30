@@ -9,7 +9,7 @@ import {
   claim,
   type TestHarness,
 } from "../helpers.js";
-import { SandcastleStageRunner, GhPrPublisher } from "../../src/adapters/sandcastle.js";
+import { SandcastleStageRunner, GhPrPublisher, ollamaEnv } from "../../src/adapters/sandcastle.js";
 import { loadConfig } from "../../src/config.js";
 
 /**
@@ -58,7 +58,9 @@ d("integration: sandcastle adapter (requires docker + OLLAMA_API_KEY)", () => {
 
   it("triage stage returns a real verdict for a well-formed item", async () => {
     const { config } = loadConfig(undefined, harness.root);
-    const runner = new SandcastleStageRunner({ config });
+    // Credentials ride env-only since the H1 hardening (auth.json is never
+    // staged): wire the runner exactly like the production CLI does.
+    const runner = new SandcastleStageRunner({ config, env: ollamaEnv() });
     const result = await runner.runStage({
       stage: "triage",
       item: {
@@ -82,7 +84,8 @@ d("integration: sandcastle adapter (requires docker + OLLAMA_API_KEY)", () => {
   // deleted files. Keep gated real-agent tests inside this block.
   it("spec stage flags a KB fact that contradicts the repo (ticket 08)", async () => {
     const { config } = loadConfig(undefined, harness.root);
-    const runner = new SandcastleStageRunner({ config });
+    // Same env wiring as production (see the triage test above).
+    const runner = new SandcastleStageRunner({ config, env: ollamaEnv() });
     const result = await runner.runStage({
       stage: "spec",
       item: {

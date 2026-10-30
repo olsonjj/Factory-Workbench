@@ -337,13 +337,16 @@ describe("P1-8: lazy staging + dispose", () => {
       const home = process.env.HOME!;
       const agentDir = path.join(home, ".pi", "agent");
       mkdirSync(agentDir, { recursive: true });
-      writeFileSync(path.join(agentDir, "auth.json"), "{}");
+      writeFileSync(path.join(agentDir, "settings.json"), "{}");
       const root = tmpDir("factory-stage-");
       const a = getPiConfigStage(root);
       const b = getPiConfigStage(root);
       expect(a).toBeTruthy();
       expect(a).toBe(b); // identical object ⇒ side effects ran once
-      expect(existsSync(path.join(root, "pi-config", "auth.json"))).toBe(true);
+      expect(existsSync(path.join(root, "pi-config", "settings.json"))).toBe(true);
+      // auth.json is never staged (finding H1) — even though these tests do
+      // not create one on the host, the staged copy must not have one.
+      expect(existsSync(path.join(root, "pi-config", "auth.json"))).toBe(false);
     });
   });
 

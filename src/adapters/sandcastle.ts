@@ -178,21 +178,35 @@ export class SandcastleStageRunner implements StageRunner {
   private readonly config: FactoryConfig;
   private readonly env: Record<string, string>;
   private readonly worktrees = new Map<string, Worktree>();
+  /** Per-item npm-global prefix dirs (item slug → host dir), cleaned up in dispose(). */
+  private readonly npmPrefixes = new Map<string, string>();
+  /** Per-item agent-dir copies (item slug → host dir), cleaned up in dispose(). */
+  private readonly agentDirs = new Map<string, string>();
+  /** Agent-dir copy the most recent run wrote sessions into; agentText depends
+   *  on wtRun/wtRunScratch having run first (set just before every run). */
+  private sessionsDirOfLastRun: string | null = null;
   private runStartedAt = 0;
 
   private staging(): PiConfigStage | null {
     return getPiConfigStage(this.config.root);
   }
 
-  /** Assistant text from the sandboxed pi session, with stream-parse fallback. */
+  /** Assistant text from the sandboxed pi session, with stream-parse fallback.
+   *  Deliberately NO staged-template fallback for the sessions dir: the
+   *  template never holds sessions (freshAgentDir creates them per run
+   *  copy), so before any run there is nothing session-like to read — the
+   *  stream-parse fallback covers it. */
   private agentText(result: RunResult): string | undefined {
-    const staged = this.staging();
-    if (staged) {
-      const text = assistantTextFromSessions(path.join(staged.agentDir, "sessions"), this.runStartedAt);
-      if (text) return text;
-    }
-    return lastIterationText(result) || undefined;
+    // Depends on wtRun/wtRunScratch having set sessionsDirOfLastRun.
+    if (!this.sessionsDirOfLastRun) return lastIterationText(result) || undefined;
+    const text = assistantTextFromSessions(
+      path.join(this.sessionsDirOfLastRun, "sessions"),
+      this.runStartedAt,
+    );
+    return text || lastIterationText(result) || undefined;
   }
+
+
 
   constructor(deps: SandcastleRunnerDeps) {
     this.config = deps.config;
@@ -241,26 +255,69 @@ export class SandcastleStageRunner implements StageRunner {
     return wt;
   }
 
-  private async wtRun(opts: { wt: Worktree; model: string; prompt: string }): Promise<RunResult> {
+  /**
+   * Per-item writable npm-global prefix, isolated from every other item and
+   * from later stages of the same item: the base template is wiped and
+   * re-copied on EVERY call, so an agent-installed package can persist
+   * neither into a later stage of this item nor into a later item. The copy
+   * is small (the seeded pi packages) and runs on the host before the
+   * sandbox starts; pipeline execution is strictly sequential per
+   * specs/001-software-factory-mvp.md, so there is no concurrent-writer
+   * hazard. A crashed process can leave a stale npm-items/<slug>/ dir
+   * behind — accepted residue (reaping it via `wb gc` is out of scope).
+   */
+  private ensureItemNpmPrefix(slug: string): string | null {
+    const staged = this.staging();
+    const base = staged?.npmGlobalPrefixBase ?? null;
+    if (!base) return null;
+    const target = path.join(this.config.root, "pi-config", "npm-items", slug);
+    fs.rmSync(target, { recursive: true, force: true });
+    fs.cpSync(base, target, { recursive: true });
+    this.npmPrefixes.set(slug, target);
+    return target;
+  }
+
+  /**
+   * Per-run writable pi agent dir, isolated like the npm prefix: wiped and
+   * re-copied from the staged template on EVERY call, so tampering cannot
+   * persist into a later stage of the same item or into a later item.
+   *
+   * Writability is REQUIRED, not a regression: pi acquires a lock file
+   * (settings.json.lock) beside its settings file at read time and writes
+   * session files under <agent-dir>/sessions, so the agent dir cannot be
+   * mounted read-only without breaking pi startup (live-verified via the
+   * gated integration suite). The security property this preserves instead:
+   * the copy is minimal (never auth.json — credentials ride env only) and
+   * is rebuilt from the template BEFORE every run, so tampering cannot
+   * persist into a later stage of the same item or into a later item. A
+   * run's residue stays on the host disk only until that item's next stage
+   * run (or runner dispose) wipes it — it is not removed right at run end.
+   * Session files inside the copy are therefore transient, not durable:
+   * inspectable while the run/item is live, never an audit trail.
+   */
+  private ensureItemAgentDir(slug: string): string {
+    const target = path.join(this.config.root, "pi-config", "agents", slug);
+    freshAgentDir(this.staging(), target);
+    this.agentDirs.set(slug, target);
+    this.sessionsDirOfLastRun = target;
+    return target;
+  }
+
+  private async wtRun(opts: { wt: Worktree; slug: string; model: string; prompt: string }): Promise<RunResult> {
     const { wt, model, prompt } = opts;
     const staged = this.staging();
-    const piConfigMounts = staged
-      ? [
-          { hostPath: staged.agentDir, sandboxPath: "/home/agent/.pi/agent" },
-          ...(staged.npmGlobalPrefix
-            ? [{ hostPath: staged.npmGlobalPrefix, sandboxPath: NPM_GLOBAL_PREFIX }]
-            : []),
-        ]
-      : [];
+    const npmPrefix = staged ? this.ensureItemNpmPrefix(opts.slug) : null;
+    const agentDir = this.ensureItemAgentDir(opts.slug);
+    const mounts = piConfigMounts(agentDir, npmPrefix);
     // Dependency install before the agent starts — Node projects only; see
     // sandboxReadyHooksFor() for the rationale and the non-Node skip.
     const hooks = sandboxReadyHooksFor(wt.worktreePath);
-    const piEnv = { ...this.env, ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefix }) };
+    const piEnv = { ...this.env, ...piEnvFor({ npmGlobalPrefixMount: npmPrefix !== null }) };
     return wt.run({
       agent: pi(model, { env: piEnv }),
       sandbox: docker({
         imageName: this.config.sandbox.imageName,
-        ...(piConfigMounts.length > 0 ? { mounts: piConfigMounts } : {}),
+        ...(mounts.length > 0 ? { mounts } : {}),
       }),
       ...(hooks ? { hooks } : {}),
       prompt: [prompt, COMPLETE].join("\n\n"),
@@ -295,6 +352,7 @@ ${kbBlock}`;
 
     const result = await this.wtRun({
       wt: await this.worktreeFor(req.item),
+      slug: req.item.slug,
       model,
       prompt,
     });
@@ -336,7 +394,7 @@ ${req.kb.global || "(none)"}
 Project:
 ${req.kb.project || "(none)"}`;
 
-    const result = await this.wtRun({ wt, model, prompt });
+    const result = await this.wtRun({ wt, slug: req.item.slug, model, prompt });
     const spec = parseStructuredString(result, "spec", this.agentText(result));
     return { outcome: "pass", artifacts: [{ name: "spec", content: spec }] };
   }
@@ -363,7 +421,7 @@ ${req.kb.global || "(none)"}
 Project:
 ${req.kb.project || "(none)"}`;
 
-    const result = await this.wtRun({ wt, model, prompt });
+    const result = await this.wtRun({ wt, slug: req.item.slug, model, prompt });
     const commits = (result.commits ?? []).map((c) => c.sha);
     return {
       outcome: "pass",
@@ -386,7 +444,7 @@ Return your verdict as JSON inside a <test>...</test> tag:
 - fix: only if you fixed something — what the fix was, generalized so a future run can learn from it
 - lesson: only if tests failed — what went wrong`;
 
-    const result = await this.wtRun({ wt, model, prompt });
+    const result = await this.wtRun({ wt, slug: req.item.slug, model, prompt });
     const v = parseStructured(result, "test", TestVerdict, this.agentText(result));
     if (!v.testsPassed) {
       return {
@@ -418,7 +476,7 @@ Return your verdict as JSON inside a <review>...</review> tag:
 - fix: only when you fail — concrete fix instructions for the implementer
 - prSummary: one line summarizing the outcome of the whole pipeline for this item`;
 
-    const result = await this.wtRun({ wt, model, prompt });
+    const result = await this.wtRun({ wt, slug: req.item.slug, model, prompt });
     const v = parseStructured(result, "review", ReviewVerdict, this.agentText(result));
     if (v.verdict === "fail") {
       return {
@@ -447,6 +505,13 @@ Return your verdict as JSON inside a <review>...</review> tag:
       }
     }
     this.worktrees.clear();
+    // The runner's worktree lifetime is the item lifetime, so per-item npm
+    // prefixes are cleaned up with the item's worktree disposal.
+    this.npmPrefixes.forEach(rmRfBestEffort);
+    this.npmPrefixes.clear();
+    this.agentDirs.forEach(rmRfBestEffort);
+    this.agentDirs.clear();
+    this.sessionsDirOfLastRun = null;
   }
 }
 
@@ -592,30 +657,33 @@ Return the full proposal markdown inside a <proposal>...</proposal> tag.
 ${COMPLETE}`;
 
       const startedAt = Date.now();
-      const result = await this.wtRunScratch({ scratch, model, prompt, mounts });
-      const staged = this.staging();
-      const text = staged
-        ? assistantTextFromSessions(path.join(staged.agentDir, "sessions"), startedAt) ?? lastIterationText(result)
-        : lastIterationText(result);
-      const proposal = parseStructuredString(result, "proposal", text || undefined);
-      return { outcome: "pass", artifacts: [{ name: "proposal", content: proposal }] };
+      // Per-run writable agent-dir copy, same shape as the stage runner's
+      // (pi must write its settings lock at read time); wiped in the finally
+      // below, so nothing the curator run writes survives past the run.
+      const agentDir = path.join(config.root, "pi-config", "agents", "curator");
+      freshAgentDir(this.staging(), agentDir);
+      try {
+        const result = await this.wtRunScratch({ scratch, agentDir, model, prompt, mounts });
+        const text =
+          assistantTextFromSessions(path.join(agentDir, "sessions"), startedAt) ?? lastIterationText(result);
+        const proposal = parseStructuredString(result, "proposal", text || undefined);
+        return { outcome: "pass", artifacts: [{ name: "proposal", content: proposal }] };
+      } finally {
+        // Same best-effort policy as the runner's dispose wipes: a cleanup
+        // failure must not mask a completed curation (a throw in this
+        // finally would override the return below).
+        rmRfBestEffort(agentDir);
+      }
     } finally {
-      fs.rmSync(scratch, { recursive: true, force: true });
+      rmRfBestEffort(scratch);
     }
   }
 
-  private async wtRunScratch(opts: { scratch: string; model: string; prompt: string; mounts: { hostPath: string; sandboxPath: string; readonly: true }[] }): Promise<RunResult> {
+  private async wtRunScratch(opts: { scratch: string; agentDir: string; model: string; prompt: string; mounts: { hostPath: string; sandboxPath: string; readonly: true }[] }): Promise<RunResult> {
     const { run } = await import("@ai-hero/sandcastle");
     const staged = this.staging();
-    const piConfigMounts = staged
-      ? [
-          { hostPath: staged.agentDir, sandboxPath: "/home/agent/.pi/agent" },
-          ...(staged.npmGlobalPrefix
-            ? [{ hostPath: staged.npmGlobalPrefix, sandboxPath: NPM_GLOBAL_PREFIX }]
-            : []),
-        ]
-      : [];
-    const env = { ...(this.deps.env ?? {}), ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefix }) };
+    const mounts = piConfigMounts(opts.agentDir, staged?.npmGlobalPrefixBase ?? null, "curator");
+    const env = { ...(this.deps.env ?? {}), ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefixBase }) };
     // Deliberately NO hooks.sandbox.onSandboxReady here (unlike wtRun): the
     // scratch cwd has no package.json (it only hosts read-only KB mounts), so
     // an npm install would fail and abort the run. Skipping is the designed
@@ -624,7 +692,7 @@ ${COMPLETE}`;
       agent: pi(opts.model, { env }),
       sandbox: docker({
         imageName: this.deps.config.sandbox.imageName,
-        mounts: [...piConfigMounts, ...opts.mounts],
+        mounts: [...mounts, ...opts.mounts],
       }),
       cwd: opts.scratch,
       prompt: opts.prompt,
@@ -659,54 +727,170 @@ export function sandboxReadyHooksFor(worktreePath: string): SandboxHooks | undef
   };
 }
 
-/** Host-side env passthrough for Ollama Cloud credentials. */
+/**
+ * Host-side env passthrough for Ollama Cloud credentials. ONLY the API-key
+ * vars are forwarded: sandbox stages talk to Ollama Cloud only, and passing
+ * host OLLAMA_HOST through would let a compromised stage redirect model
+ * traffic to an attacker-chosen host, so it is deliberately not forwarded.
+ * If a future config needs a custom endpoint, that is an explicit follow-up.
+ */
 export function ollamaEnv(): Record<string, string> {
   const env: Record<string, string> = {};
-  for (const key of ["OLLAMA_API_KEY", "OLLAMA_HOST", "OLLAMA_CLOUD_API_KEY"]) {
+  for (const key of ["OLLAMA_API_KEY", "OLLAMA_CLOUD_API_KEY"]) {
     if (process.env[key]) env[key] = process.env[key]!;
   }
   return env;
 }
 
 /**
- * pi inside the sandbox is a fresh install: no auth, no custom providers, no
- * model catalog. Stage the host's pi config (auth.json, models.json,
- * models-store.json) read-only inside the factory root and point the sandboxed
- * agent at it via PI_CODING_AGENT_DIR, so it can resolve and call exactly the
- * model the config file names. (The agent needs the key to call the model
- * anyway — no new exposure; nothing outside the local factory root.)
+ * Staged pi config TEMPLATE for sandboxed agents. The staged directory is a
+ * HOST-SIDE SEED only — it is never mounted. Each run gets a fresh, writable
+ * per-run copy (freshAgentDir) mounted at /home/agent/.pi/agent — the
+ * sandboxed pi's default agent-dir path, resolved by the mount itself, not by
+ * PI_CODING_AGENT_DIR.
+ *
+ * Why writable, not read-only: pi acquires a lock file (settings.json.lock)
+ * BESIDE its settings file at read time and writes sessions under
+ * <agent-dir>/sessions, so a read-only mount aborts pi startup (live-verified
+ * via the gated integration suite). Isolation is temporal instead: copies are
+ * minimal (never auth.json — credentials ride env only) and discarded after
+ * the run, so an agent's writes here survive neither the stage boundary nor
+ * the item. Credentials are NOT part of the stage: sandbox stages are
+ * credentialed exclusively by env (ollamaEnv() → SandcastleRunnerDeps.env →
+ * pi(model, { env })).
  */
 export interface PiConfigStage {
-  /** Mounted as the sandbox's ~/.pi/agent (credentials, catalog, settings). */
+  /** Staged pi config TEMPLATE (models, settings; NEVER auth.json). */
   agentDir: string;
-  /** Writable npm global root mounted at NPM_GLOBAL_PREFIX, pre-seeded with pi packages. */
-  npmGlobalPrefix: string | null;
+  /** Host path of the seeded npm prefix template. NEVER mounted writable. */
+  npmGlobalPrefixBase: string | null;
+}
+
+export interface PiConfigMount {
+  hostPath: string;
+  sandboxPath: string;
+  readonly?: boolean;
 }
 
 /**
- * Stage the host's pi agent configuration for the sandbox. The containerized
- * pi (a global install) treats user-scope packages as GLOBAL npm installs and
- * writes them under the npm global root. We bind a pre-seeded, writable
- * prefix at /home/agent/.npm-global and point npm_config_prefix at it, so the
- * packages resolve without any in-container global install attempt.
- * Sessions land in the factory root (durable, inspectable).
+ * Shared pi-config mount list for agent stages (wtRun) and the curator
+ * (wtRunScratch), which previously duplicated it:
+ * 1. the per-run agent-dir copy, WRITABLE — pi must write its settings lock
+ *    beside the settings file at read time (a read-only mount breaks
+ *    startup; see the PiConfigStage docstring), so isolation is temporal
+ *    instead: the copy is minimal and rebuilt from the template before
+ *    every run, so a run's writes survive at most until the next run of
+ *    the same item (or runner dispose) wipes them;
+ * 2. (when npmPrefix is non-null) the npm global prefix at NPM_GLOBAL_PREFIX.
+ *
+ * Residual exposure, documented deliberately (finding H1 follow-ups track
+ * these): the per-run settings/models files are READABLE and WRITABLE inside
+ * one run — but every run starts from a fresh template copy, so a compromised
+ * stage cannot persist tampering into a later stage or item (residue lingers
+ * on host disk only until that item's next stage run wipes it); the per-item npm
+ * prefix is writable within a single stage run (an in-run `npm i` still works
+ * and can affect only that run); and credentials reach stages via env, which
+ * a compromised stage can always read — the goal is that a stage cannot
+ * PERSIST a key or read unrelated credentials, not that it can never see its
+ * own.
+ *
+ * In "curator" mode the prefix mount is read-only: the curator consumes
+ * untrusted repo/KB text, never installs, and nothing legitimate writes to
+ * the prefix in a scratch run — a read-only base prefix there is strictly
+ * safer and needs no copy/cleanup. If pi or an injected curator attempts an
+ * installation it fails inside that one run — contained.
+ */
+export function piConfigMounts(
+  agentDir: string,
+  npmPrefix: string | null,
+  mode: "agent" | "curator" = "agent",
+): PiConfigMount[] {
+  const mounts: PiConfigMount[] = [
+    { hostPath: agentDir, sandboxPath: "/home/agent/.pi/agent" },
+  ];
+  if (npmPrefix !== null) {
+    mounts.push({
+      hostPath: npmPrefix,
+      sandboxPath: NPM_GLOBAL_PREFIX,
+      ...(mode === "curator" ? { readonly: true } : {}),
+    });
+  }
+  return mounts;
+}
+
+/**
+ * Wipe + re-create a per-run agent dir at `target` from the staged template:
+ * config files copied (whatever of models.json / models-store.json /
+ * settings.json the template has — auth.json is not in the template by
+ * construction), and an empty sessions/ subdir created so the sandboxed pi
+ * has somewhere to write session files. Works even with a null template (an
+ * empty writable dir — pi fails model resolution later, same as pre-staging).
+ * Exported for tests.
+ */
+/**
+ * The one "best-effort directory wipe" policy shared by every cleanup site
+ * that must never turn a resource-release failure into a run failure:
+ * recursive, force, and any error swallowed. NOT for wipe-before-rebuild
+ * sites (ensureItemNpmPrefix / freshAgentDir): a failed pre-rebuild wipe is
+ * a correctness problem and must propagate.
+ */
+function rmRfBestEffort(dir: string): void {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // best-effort cleanup: nothing a later run depends on
+  }
+}
+
+export function freshAgentDir(template: PiConfigStage | null, target: string): void {
+  fs.rmSync(target, { recursive: true, force: true });
+  fs.mkdirSync(path.join(target, "sessions"), { recursive: true });
+  if (!template) return;
+  for (const f of ["models.json", "models-store.json", "settings.json"]) {
+    const src = path.join(template.agentDir, f);
+    if (fs.existsSync(src)) fs.copyFileSync(src, path.join(target, f));
+  }
+}
+
+/**
+ * Stage the host's pi agent configuration for the sandbox — WITHOUT
+ * auth.json: the host's full credential set is deliberately never copied
+ * (minimal credentials, finding H1). Sandbox stages are credentialed
+ * exclusively by env (OLLAMA_API_KEY / OLLAMA_CLOUD_API_KEY via ollamaEnv()
+ * → SandcastleRunnerDeps.env); credentialing other provider families
+ * without auth.json would need a follow-up (out of scope). Consequence: a
+ * host with ONLY auth.json now stages nothing — previously it staged a
+ * partial config that could not resolve models anyway.
+ *
+ * The containerized pi (a global install) treats user-scope packages as
+ * GLOBAL npm installs and writes them under the npm global root, so we
+ * pre-seed an npm prefix template (npm-global-base) — pinned to exact
+ * versions at seed time — which the runner copies per item (see
+ * ensureItemNpmPrefix) and mounts at NPM_GLOBAL_PREFIX with
+ * npm_config_prefix pointing at it, so the packages resolve without any
+ * in-container global install attempt. Nothing mounts the base template
+ * writable, ever. Sessions land in the factory root, under the per-run
+ * agent dirs (pi-config/agents/<run>/sessions — transient: wiped by that
+ * item's next stage run or runner dispose, never an audit trail).
  */
 export function preparePiConfigDir(factoryRoot: string): PiConfigStage | null {
   const agentDir = path.join(process.env.HOME ?? "~", ".pi", "agent");
-  const files = ["auth.json", "models.json", "models-store.json", "settings.json"].filter((f) =>
+  // auth.json is deliberately absent from this list — see the docstring.
+  const files = ["models.json", "models-store.json", "settings.json"].filter((f) =>
     fs.existsSync(path.join(agentDir, f)),
   );
   if (files.length === 0) return null;
   const target = path.join(factoryRoot, "pi-config");
   fs.mkdirSync(target, { recursive: true });
-  fs.mkdirSync(path.join(target, "sessions"), { recursive: true });
+  // No sessions/ dir on the template: nothing mounts or reads it (sessions
+  // are created per run inside freshAgentDir's copies — see agentText).
   for (const f of files) {
     fs.copyFileSync(path.join(agentDir, f), path.join(target, f));
   }
 
-  // Pre-seed the writable npm global prefix with the packages pi's settings
+  // Pre-seed the npm global prefix template with the packages pi's settings
   // declare, so the sandbox never needs a global install (root-owned, fails).
-  let npmGlobalPrefix: string | null = null;
+  let npmGlobalPrefixBase: string | null = null;
   const settingsPath = path.join(target, "settings.json");
   let packages: string[] = [];
   try {
@@ -716,25 +900,168 @@ export function preparePiConfigDir(factoryRoot: string): PiConfigStage | null {
   }
   if (packages.length > 0) {
     const hostNpmDir = path.join(agentDir, "npm");
-    if (fs.existsSync(path.join(hostNpmDir, "node_modules", "pi-ollama-cloud")) && hasNpmSpecFor(piOllamaSpecIn(packages))) {
-      // Install each declared package into the staged global prefix.
-      npmGlobalPrefix = path.join(target, "npm-global");
-      fs.mkdirSync(npmGlobalPrefix, { recursive: true });
-      const specs = packages
-        .map((p) => (p.startsWith("npm:") ? p.slice(4) : p))
-        .map((spec) => (spec.includes("@", 1) ? spec : `${spec}@latest`));
+    if (fs.existsSync(path.join(hostNpmDir, "node_modules", "pi-ollama-cloud"))) {
+      // Intentionally NOT gated on the declared list containing
+      // pi-ollama-cloud (the pre-PR gate): pi loads whatever
+      // settings.packages declare, so the prefix must seed exactly that
+      // list — anything missing would fall back to an in-container global
+      // install, which fails (root-owned). The host npm-dir presence check
+      // is a cheap proxy for "this host installs pi packages"; seeding runs
+      // once per factory root (piConfigCache), not per item. Any resolution
+      // or install failure ⇒ no prefix mounted at all — the sandboxed pi
+      // falls back as before; we never silently install unpinned.
+      npmGlobalPrefixBase = path.join(target, "npm-global-base");
+      fs.mkdirSync(npmGlobalPrefixBase, { recursive: true });
       try {
+        const specs = resolveExactSpecs(packages, npmViewResolver);
         execFileSync(
           "npm",
-          ["install", "-g", "--prefix", npmGlobalPrefix, "--legacy-peer-deps", "--no-audit", "--no-fund", ...specs],
+          ["install", "-g", "--prefix", npmGlobalPrefixBase, "--legacy-peer-deps", "--no-audit", "--no-fund", ...specs],
           { timeout: 180_000, stdio: "pipe" },
         );
       } catch {
+        npmGlobalPrefixBase = null;
         // Best-effort; without it pi retries a global install in-container.
       }
     }
   }
-  return { agentDir: target, npmGlobalPrefix };
+  return { agentDir: target, npmGlobalPrefixBase };
+}
+
+const EXACT_SEMVER = /^\d+\.\d+\.\d+([-+].*)?$/;
+
+/**
+ * Split a package spec into { name, range } — range null when the spec is a
+ * bare name. Handles scoped names: the separating '@' is the last '@' at
+ * index > 0. A leading "npm:" prefix (as pi's settings may declare) is
+ * stripped first.
+ */
+export function parsePackageSpec(spec: string): { name: string; range: string | null } {
+  const stripped = spec.startsWith("npm:") ? spec.slice(4) : spec;
+  const at = stripped.lastIndexOf("@");
+  if (at > 0) {
+    const range = stripped.slice(at + 1);
+    return { name: stripped.slice(0, at), range: range.length > 0 ? range : null };
+  }
+  return { name: stripped, range: null };
+}
+
+export type VersionResolver = (name: string, range: string | null) => string;
+
+/**
+ * Resolve each declared package ONCE to an exact version; specs already
+ * pinned to a full semver pass through untouched (the resolver is not
+ * called for them). Throws on unresolvable specs (caller aborts seeding).
+ */
+export function resolveExactSpecs(specs: string[], resolve: VersionResolver): string[] {
+  return specs.map((spec) => {
+    const { name, range } = parsePackageSpec(spec);
+    if (range && EXACT_SEMVER.test(range)) return `${name}@${range}`;
+    return `${name}@${resolve(name, range)}`;
+  });
+}
+
+/**
+ * Default VersionResolver: host-side `npm view <name>[@range] version
+ * --json`, JSON-parsed, then the top entry of a semver-descending sort —
+ * npm does not document its output ordering, and the pinned version must
+ * never depend on it (see newestSemver). Throws when nothing resolvable
+ * is returned (caller aborts seeding).
+ */
+function npmViewResolver(name: string, range: string | null): string {
+  const out = execFileSync(
+    "npm",
+    ["view", range ? `${name}@${range}` : name, "version", "--json"],
+    { timeout: 60_000, stdio: "pipe", encoding: "utf8" },
+  );
+  return newestSemver(JSON.parse(out), `npm view ${name}`);
+}
+
+interface SemverParts {
+  major: number;
+  minor: number;
+  patch: number;
+  /** Prerelease/build suffix ("-beta.2", "+meta") or "" for a clean release. */
+  suffix: string;
+}
+
+function semverParts(v: string): SemverParts | null {
+  const m = /^(\d+)\.(\d+)\.(\d+)((?:[-+].*)?)$/.exec(v.trim());
+  return m
+    ? { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]), suffix: m[4] ?? "" }
+    : null;
+}
+
+/**
+ * Pick the NEWEST version from an npm `view --json` payload (a single
+ * version string or an array) — sorted by semver descending, never by the
+ * payload's own order (npm does not document its sort order; the old
+ * last-entry read silently depended on it). Ties on MAJOR.MINOR.PATCH use
+ * semver §11 prerelease precedence, segment-wise (clean release >
+ * prerelease; numeric segments compare numerically; alphanumeric above
+ * numeric; more segments above a shorter prefix; the ±build-metadata
+ * segment carries no precedence — the first tie wins). Throws when the
+ * payload is empty or carries no semver-parsable version: the caller
+ * refuses to seed rather than pin garbage. Exported for tests.
+ */
+export function newestSemver(parsed: unknown, source = "versions payload"): string {
+  const raw = (Array.isArray(parsed) ? parsed : [parsed]).map((v) => String(v ?? "").trim());
+  const candidates = raw
+    .map((v) => ({ v, parts: semverParts(v) }))
+    .filter((c): c is { v: string; parts: SemverParts } => c.parts !== null)
+    .sort((a, b) =>
+      b.parts.major - a.parts.major ||
+      b.parts.minor - a.parts.minor ||
+      b.parts.patch - a.parts.patch ||
+      -comparePrerelease(a.parts.suffix, b.parts.suffix),
+    );
+  if (candidates.length === 0) {
+    if (raw.length > 0 && raw.every((v) => v.length > 0)) {
+      throw new Error(`no semver-parsable version in ${source}: ${raw.join(", ")}`);
+    }
+    throw new Error(`no version resolved from ${source}`);
+  }
+  return candidates[0]!.v;
+}
+
+/** Prerelease identifier string of a semver suffix, or null for a clean
+ *  release / build-metadata-only suffix ("+build.7") — per semver §11,
+ *  build metadata carries no precedence. */
+function prereleaseOf(suffix: string): string | null {
+  if (!suffix.startsWith("-")) return null;
+  return suffix.slice(1).split("+")[0] ?? null;
+}
+
+/** Semver §11.4 prerelease precedence, ASCENDING; a prerelease-less suffix
+ *  (null) sorts ABOVE any prerelease — the caller inverts this for the
+ *  newest-first sort. */
+function comparePrerelease(suffixA: string, suffixB: string): number {
+  const a = prereleaseOf(suffixA);
+  const b = prereleaseOf(suffixB);
+  if (a === b) return 0;
+  if (a === null) return 1; // release sorts above any prerelease
+  if (b === null) return -1;
+  const sa = a.split(".");
+  const sb = b.split(".");
+  for (let i = 0; i < Math.max(sa.length, sb.length); i++) {
+    const x = sa[i];
+    const y = sb[i];
+    if (x === undefined) return -1; // fewer segments = lower precedence
+    if (y === undefined) return 1;
+    const nx = /^\d+$/.test(x);
+    const ny = /^\d+$/.test(y);
+    if (nx && ny) {
+      const d = Number(x) - Number(y);
+      if (d !== 0) return d;
+    } else if (nx) {
+      return -1; // numeric identifiers sort below alphanumeric
+    } else if (ny) {
+      return 1;
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return 0;
 }
 
 const piConfigCache = new Map<string, PiConfigStage | null>();
@@ -751,14 +1078,6 @@ export function getPiConfigStage(factoryRoot: string): PiConfigStage | null {
   const fresh = preparePiConfigDir(factoryRoot);
   piConfigCache.set(factoryRoot, fresh);
   return fresh;
-}
-
-function piOllamaSpecIn(packages: string[]): boolean {
-  return packages.some((p) => p.includes("pi-ollama-cloud"));
-}
-
-function hasNpmSpecFor(_present: boolean): boolean {
-  return _present;
 }
 
 function realRepoPath(repo: string): string {
