@@ -180,6 +180,10 @@ export class SandcastleStageRunner implements StageRunner {
   private readonly worktrees = new Map<string, Worktree>();
   /** Per-item npm-global prefix dirs (item slug → host dir), cleaned up in dispose(). */
   private readonly npmPrefixes = new Map<string, string>();
+  /** Per-item agent-dir copies (item slug → host dir), cleaned up in dispose(). */
+  private readonly agentDirs = new Map<string, string>();
+  /** Agent-dir root whose sessions the most recent run wrote to (for agentText). */
+  private lastAgentDir: string | null = null;
   private runStartedAt = 0;
 
   private staging(): PiConfigStage | null {
@@ -190,11 +194,18 @@ export class SandcastleStageRunner implements StageRunner {
   private agentText(result: RunResult): string | undefined {
     const staged = this.staging();
     if (staged) {
-      const text = assistantTextFromSessions(path.join(staged.agentDir, "sessions"), this.runStartedAt);
+      // Sessions are written by the per-run agent-dir copy (freshAgentDir);
+      // before any run of this process, fall back to the staged template.
+      const sessionsDir = this.lastAgentDir
+        ? path.join(this.lastAgentDir, "sessions")
+        : path.join(staged.agentDir, "sessions");
+      const text = assistantTextFromSessions(sessionsDir, this.runStartedAt);
       if (text) return text;
     }
     return lastIterationText(result) || undefined;
   }
+
+
 
   constructor(deps: SandcastleRunnerDeps) {
     this.config = deps.config;
@@ -265,11 +276,35 @@ export class SandcastleStageRunner implements StageRunner {
     return target;
   }
 
+  /**
+   * Per-run writable pi agent dir, isolated like the npm prefix: wiped and
+   * re-copied from the staged template on EVERY call, so tampering cannot
+   * persist into a later stage of the same item or into a later item.
+   *
+   * Writability is REQUIRED, not a regression: pi acquires a lock file
+   * (settings.json.lock) beside its settings file at read time and writes
+   * session files under <agent-dir>/sessions, so the agent dir cannot be
+   * mounted read-only without breaking pi startup (live-verified via the
+   * gated integration suite). The security property this preserves instead:
+   * the copy is minimal (never auth.json — credentials ride env only) and
+   * is discarded after the run, so nothing an agent writes here survives
+   * beyond the run or crosses items. Sessions land inside the copy, under
+   * the factory root (durable, inspectable).
+   */
+  private ensureItemAgentDir(slug: string): string {
+    const target = path.join(this.config.root, "pi-config", "agents", slug);
+    freshAgentDir(this.staging(), target);
+    this.agentDirs.set(slug, target);
+    this.lastAgentDir = target;
+    return target;
+  }
+
   private async wtRun(opts: { wt: Worktree; slug: string; model: string; prompt: string }): Promise<RunResult> {
     const { wt, model, prompt } = opts;
     const staged = this.staging();
     const npmPrefix = staged ? this.ensureItemNpmPrefix(opts.slug) : null;
-    const mounts = staged ? piConfigMounts(staged, npmPrefix) : [];
+    const agentDir = this.ensureItemAgentDir(opts.slug);
+    const mounts = piConfigMounts(agentDir, npmPrefix);
     // Dependency install before the agent starts — Node projects only; see
     // sandboxReadyHooksFor() for the rationale and the non-Node skip.
     const hooks = sandboxReadyHooksFor(wt.worktreePath);
@@ -476,6 +511,15 @@ Return your verdict as JSON inside a <review>...</review> tag:
       }
     }
     this.npmPrefixes.clear();
+    for (const dir of this.agentDirs.values()) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup
+      }
+    }
+    this.agentDirs.clear();
+    this.lastAgentDir = null;
   }
 }
 
@@ -621,24 +665,29 @@ Return the full proposal markdown inside a <proposal>...</proposal> tag.
 ${COMPLETE}`;
 
       const startedAt = Date.now();
-      const result = await this.wtRunScratch({ scratch, model, prompt, mounts });
-      const staged = this.staging();
-      const text = staged
-        ? assistantTextFromSessions(path.join(staged.agentDir, "sessions"), startedAt) ?? lastIterationText(result)
-        : lastIterationText(result);
-      const proposal = parseStructuredString(result, "proposal", text || undefined);
-      return { outcome: "pass", artifacts: [{ name: "proposal", content: proposal }] };
+      // Per-run writable agent-dir copy, same shape as the stage runner's
+      // (pi must write its settings lock at read time); wiped in the finally
+      // below, so nothing the curator run writes survives past the run.
+      const agentDir = path.join(config.root, "pi-config", "agents", "curator");
+      freshAgentDir(this.staging(), agentDir);
+      try {
+        const result = await this.wtRunScratch({ scratch, agentDir, model, prompt, mounts });
+        const text =
+          assistantTextFromSessions(path.join(agentDir, "sessions"), startedAt) ?? lastIterationText(result);
+        const proposal = parseStructuredString(result, "proposal", text || undefined);
+        return { outcome: "pass", artifacts: [{ name: "proposal", content: proposal }] };
+      } finally {
+        fs.rmSync(agentDir, { recursive: true, force: true });
+      }
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
     }
   }
 
-  private async wtRunScratch(opts: { scratch: string; model: string; prompt: string; mounts: { hostPath: string; sandboxPath: string; readonly: true }[] }): Promise<RunResult> {
+  private async wtRunScratch(opts: { scratch: string; agentDir: string; model: string; prompt: string; mounts: { hostPath: string; sandboxPath: string; readonly: true }[] }): Promise<RunResult> {
     const { run } = await import("@ai-hero/sandcastle");
     const staged = this.staging();
-    const mounts = staged
-      ? piConfigMounts(staged, staged.npmGlobalPrefixBase, "curator")
-      : [];
+    const mounts = piConfigMounts(opts.agentDir, staged?.npmGlobalPrefixBase ?? null, "curator");
     const env = { ...(this.deps.env ?? {}), ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefixBase }) };
     // Deliberately NO hooks.sandbox.onSandboxReady here (unlike wtRun): the
     // scratch cwd has no package.json (it only hosts read-only KB mounts), so
@@ -699,17 +748,24 @@ export function ollamaEnv(): Record<string, string> {
 }
 
 /**
- * Staged pi config for a sandboxed agent. The staged directory is mounted
- * READ-ONLY at /home/agent/.pi/agent — the sandboxed pi's default agent-dir
- * path; nothing sets PI_CODING_AGENT_DIR, the mount path is what points pi
- * at the staged config — with a writable sessions child mount shadowing the
- * read-only parent at exactly the path the sandboxed pi writes session files
- * (see piConfigMounts). Credentials are NOT part of the stage: sandbox stages
- * are credentialed exclusively by env (ollamaEnv() → SandcastleRunnerDeps.env
- * → pi(model, { env })).
+ * Staged pi config TEMPLATE for sandboxed agents. The staged directory is a
+ * HOST-SIDE SEED only — it is never mounted. Each run gets a fresh, writable
+ * per-run copy (freshAgentDir) mounted at /home/agent/.pi/agent — the
+ * sandboxed pi's default agent-dir path, resolved by the mount itself, not by
+ * PI_CODING_AGENT_DIR.
+ *
+ * Why writable, not read-only: pi acquires a lock file (settings.json.lock)
+ * BESIDE its settings file at read time and writes sessions under
+ * <agent-dir>/sessions, so a read-only mount aborts pi startup (live-verified
+ * via the gated integration suite). Isolation is temporal instead: copies are
+ * minimal (never auth.json — credentials ride env only) and discarded after
+ * the run, so an agent's writes here survive neither the stage boundary nor
+ * the item. Credentials are NOT part of the stage: sandbox stages are
+ * credentialed exclusively by env (ollamaEnv() → SandcastleRunnerDeps.env →
+ * pi(model, { env })).
  */
 export interface PiConfigStage {
-  /** Staged pi config (models, settings; NEVER auth.json), mounted read-only. */
+  /** Staged pi config TEMPLATE (models, settings; NEVER auth.json). */
   agentDir: string;
   /** Host path of the seeded npm prefix template. NEVER mounted writable. */
   npmGlobalPrefixBase: string | null;
@@ -724,38 +780,36 @@ export interface PiConfigMount {
 /**
  * Shared pi-config mount list for agent stages (wtRun) and the curator
  * (wtRunScratch), which previously duplicated it:
- * 1. the staged agent dir, read-only — config/catalog/settings become
- *    tamper-proof inside the sandbox;
- * 2. a writable sessions child mount at the sandboxed pi's default session
- *    path (/home/agent/.pi/agent/sessions), so session writes still work
- *    under the read-only parent AND the host-side readers
- *    (assistantTextFromSessions) keep reading the same host directory
- *    (<staged.agentDir>/sessions) unchanged;
- * 3. (when npmPrefix is non-null) the npm global prefix at NPM_GLOBAL_PREFIX.
+ * 1. the per-run agent-dir copy, WRITABLE — pi must write its settings lock
+ *    beside the settings file at read time (a read-only mount breaks
+ *    startup; see the PiConfigStage docstring), so isolation is temporal
+ *    instead: the copy is minimal, per-run, and wiped after the run;
+ *    copy is minimal, per-run, and wiped after the run;
+ * 2. (when npmPrefix is non-null) the npm global prefix at NPM_GLOBAL_PREFIX.
  *
  * Residual exposure, documented deliberately (finding H1 follow-ups track
- * these): the staged models.json/models-store.json/settings.json remain
- * READABLE inside the sandbox (non-secret, and now tamper-proof); the
- * per-item npm prefix is writable within a single stage run (an in-run
- * `npm i` still works and can affect only that run); and credentials reach
- * stages via env, which a compromised stage can always read — the goal is
- * that a stage cannot PERSIST a key or read unrelated credentials, not that
- * it can never see its own.
+ * these): the per-run settings/models files are READABLE and WRITABLE inside
+ * one run — but they are non-secret and wiped after the run, so a compromised
+ * stage cannot persist tampering into a later stage or item; the per-item npm
+ * prefix is writable within a single stage run (an in-run `npm i` still works
+ * and can affect only that run); and credentials reach stages via env, which
+ * a compromised stage can always read — the goal is that a stage cannot
+ * PERSIST a key or read unrelated credentials, not that it can never see its
+ * own.
  *
- * In "curator" mode the prefix mount is read-only too: the curator consumes
+ * In "curator" mode the prefix mount is read-only: the curator consumes
  * untrusted repo/KB text, never installs, and nothing legitimate writes to
  * the prefix in a scratch run — a read-only base prefix there is strictly
  * safer and needs no copy/cleanup. If pi or an injected curator attempts an
  * installation it fails inside that one run — contained.
  */
 export function piConfigMounts(
-  staged: PiConfigStage,
+  agentDir: string,
   npmPrefix: string | null,
   mode: "agent" | "curator" = "agent",
 ): PiConfigMount[] {
   const mounts: PiConfigMount[] = [
-    { hostPath: staged.agentDir, sandboxPath: "/home/agent/.pi/agent", readonly: true },
-    { hostPath: path.join(staged.agentDir, "sessions"), sandboxPath: "/home/agent/.pi/agent/sessions" },
+    { hostPath: agentDir, sandboxPath: "/home/agent/.pi/agent" },
   ];
   if (npmPrefix !== null) {
     mounts.push({
@@ -765,6 +819,25 @@ export function piConfigMounts(
     });
   }
   return mounts;
+}
+
+/**
+ * Wipe + re-create a per-run agent dir at `target` from the staged template:
+ * config files copied (whatever of models.json / models-store.json /
+ * settings.json the template has — auth.json is not in the template by
+ * construction), and an empty sessions/ subdir created so the sandboxed pi
+ * has somewhere to write session files. Works even with a null template (an
+ * empty writable dir — pi fails model resolution later, same as pre-staging).
+ * Exported for tests.
+ */
+export function freshAgentDir(template: PiConfigStage | null, target: string): void {
+  fs.rmSync(target, { recursive: true, force: true });
+  fs.mkdirSync(path.join(target, "sessions"), { recursive: true });
+  if (!template) return;
+  for (const f of ["models.json", "models-store.json", "settings.json"]) {
+    const src = path.join(template.agentDir, f);
+    if (fs.existsSync(src)) fs.copyFileSync(src, path.join(target, f));
+  }
 }
 
 /**
@@ -784,7 +857,8 @@ export function piConfigMounts(
  * ensureItemNpmPrefix) and mounts at NPM_GLOBAL_PREFIX with
  * npm_config_prefix pointing at it, so the packages resolve without any
  * in-container global install attempt. Nothing mounts the base template
- * writable, ever. Sessions land in the factory root (durable, inspectable).
+ * writable, ever. Sessions land in the factory root, under the per-run
+ * agent dirs (pi-config/agents/<run>/sessions — durable, inspectable).
  */
 export function preparePiConfigDir(factoryRoot: string): PiConfigStage | null {
   const agentDir = path.join(process.env.HOME ?? "~", ".pi", "agent");

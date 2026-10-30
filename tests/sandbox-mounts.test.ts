@@ -1,50 +1,86 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as path from "node:path";
-import { piConfigMounts, ollamaEnv, NPM_GLOBAL_PREFIX, type PiConfigStage } from "../src/adapters/sandcastle.js";
+import * as fs from "node:fs";
+import { piConfigMounts, freshAgentDir, ollamaEnv, NPM_GLOBAL_PREFIX, type PiConfigStage } from "../src/adapters/sandcastle.js";
 
-/** A stage literal is all piConfigMounts needs — no filesystem involved. */
+/** A stage literal is all freshAgentDir/piConfigMounts need. */
 const stage = (agentDir = "/factory/pi-config"): PiConfigStage => ({ agentDir, npmGlobalPrefixBase: null });
 
 describe("piConfigMounts", () => {
-  it("with a prefix (agent mode): exactly three mounts, config read-only, sessions writable child, prefix writable", () => {
-    const mounts = piConfigMounts(stage("/factory/pi-config"), "/factory/pi-config/npm-items/slug");
-    expect(mounts).toHaveLength(3);
+  it("with a prefix (agent mode): exactly two mounts, both writable", () => {
+    const mounts = piConfigMounts("/factory/pi-config/agents/slug", "/factory/pi-config/npm-items/slug");
+    expect(mounts).toHaveLength(2);
+    // The per-run agent-dir copy must be WRITABLE: pi acquires a settings
+    // lock (settings.json.lock) beside its settings file at read time, so a
+    // read-only mount aborts startup (live-verified via the gated
+    // integration suite). Isolation is temporal instead (per-run, wiped).
     expect(mounts[0]).toEqual({
-      hostPath: "/factory/pi-config",
+      hostPath: "/factory/pi-config/agents/slug",
       sandboxPath: "/home/agent/.pi/agent",
-      readonly: true,
     });
-    // Writable sessions child shadowing the read-only parent, at exactly the
-    // path the sandboxed pi writes session files to.
+    expect(mounts[0].readonly).toBeUndefined();
     expect(mounts[1]).toEqual({
-      hostPath: path.join("/factory/pi-config", "sessions"),
-      sandboxPath: "/home/agent/.pi/agent/sessions",
-    });
-    expect(mounts[1].readonly).toBeUndefined();
-    expect(mounts[2]).toEqual({
       hostPath: "/factory/pi-config/npm-items/slug",
       sandboxPath: NPM_GLOBAL_PREFIX,
     });
-    expect(mounts[2].readonly).toBeUndefined();
-  });
-
-  it("without a prefix: exactly two mounts (config + sessions)", () => {
-    const mounts = piConfigMounts(stage(), null);
-    expect(mounts).toHaveLength(2);
-    expect(mounts[0].readonly).toBe(true);
-    expect(mounts[1].sandboxPath).toBe("/home/agent/.pi/agent/sessions");
-  });
-
-  it("curator mode: the prefix mount is read-only too", () => {
-    const mounts = piConfigMounts(stage(), "/factory/pi-config/npm-global-base", "curator");
-    expect(mounts).toHaveLength(3);
-    expect(mounts[0].readonly).toBe(true);
     expect(mounts[1].readonly).toBeUndefined();
-    expect(mounts[2]).toEqual({
+  });
+
+  it("without a prefix: exactly one mount (the agent dir)", () => {
+    const mounts = piConfigMounts("/factory/pi-config/agents/slug", null);
+    expect(mounts).toHaveLength(1);
+    expect(mounts[0]!.sandboxPath).toBe("/home/agent/.pi/agent");
+    expect(mounts[0]!.readonly).toBeUndefined();
+  });
+
+  it("curator mode: the agent dir stays writable, the prefix mount is read-only", () => {
+    const mounts = piConfigMounts("/factory/pi-config/agents/curator", "/factory/pi-config/npm-global-base", "curator");
+    expect(mounts).toHaveLength(2);
+    expect(mounts[0]!.sandboxPath).toBe("/home/agent/.pi/agent");
+    expect(mounts[0]!.readonly).toBeUndefined();
+    expect(mounts[1]).toEqual({
       hostPath: "/factory/pi-config/npm-global-base",
       sandboxPath: NPM_GLOBAL_PREFIX,
       readonly: true,
     });
+  });
+});
+
+describe("freshAgentDir", () => {
+  const root = path.join(process.cwd(), ".tmp-fresh-agent-dir-test");
+
+  it("copies the template config files (never auth.json), creates a writable sessions dir, and wipes prior content", () => {
+    const target = path.join(root, "agents", "slug");
+    fs.rmSync(root, { recursive: true, force: true });
+    const templateAgent = path.join(root, "template");
+    fs.mkdirSync(templateAgent, { recursive: true });
+    fs.writeFileSync(path.join(templateAgent, "settings.json"), '{"packages":[]}');
+    fs.writeFileSync(path.join(templateAgent, "models.json"), "{}");
+    fs.writeFileSync(path.join(templateAgent, "auth.json"), '{"secret":"sk-..."}');
+    const template: PiConfigStage = { agentDir: templateAgent, npmGlobalPrefixBase: null };
+
+    // First run: writes a marker that must NOT survive the second call.
+    freshAgentDir(template, target);
+    fs.writeFileSync(path.join(target, "tamper-marker"), "x");
+
+    // Second run: a fresh copy — prior content (incl. tampering) is gone.
+    freshAgentDir(template, target);
+    for (const f of ["settings.json", "models.json"]) {
+      expect(fs.readFileSync(path.join(target, f), "utf8")).toBe(f === "settings.json" ? '{"packages":[]}' : "{}");
+    }
+    expect(fs.existsSync(path.join(target, "auth.json"))).toBe(false);
+    expect(fs.existsSync(path.join(target, "tamper-marker"))).toBe(false);
+    expect(fs.statSync(path.join(target, "sessions")).isDirectory()).toBe(true);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("creates an empty writable dir even with a null template", () => {
+    const target = path.join(root, "agents", "no-template");
+    fs.rmSync(target, { recursive: true, force: true });
+    freshAgentDir(null, target);
+    expect(fs.statSync(target).isDirectory()).toBe(true);
+    expect(fs.statSync(path.join(target, "sessions")).isDirectory()).toBe(true);
+    fs.rmSync(root, { recursive: true, force: true });
   });
 });
 

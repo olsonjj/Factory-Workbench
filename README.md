@@ -189,8 +189,11 @@ Pipeline: **triage → spec → implement → test → review → pull-request**
   swaps by cost per passed item (factory DB), not benchmark tables.
 - `OLLAMA_API_KEY` must be set on the host; only the Ollama Cloud API-key
   env vars are passed into the sandbox `pi` sessions (never the host's
-  `auth.json` or `OLLAMA_HOST`), and the staged pi config is mounted
-  read-only with a writable session directory. `gh` must be pre-authenticated.
+  `auth.json`, which is not staged at all, or `OLLAMA_HOST`), and every
+  sandbox run gets a fresh, minimal, per-run copy of the staged pi config
+  (no credentials, wiped after the run) mounted writable — the pi agent dir
+  cannot be read-only since pi writes its settings lock at read time.
+  `gh` must be pre-authenticated.
 
 ## Knowledge base
 
