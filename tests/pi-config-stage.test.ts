@@ -54,9 +54,8 @@ describe("getPiConfigStage", () => {
     expect(staged!.agentDir).toBe(path.join(root, "pi-config"));
     expect(staged!.npmGlobalPrefixBase).toBeNull();
     expect(fs.readFileSync(path.join(staged!.agentDir, "settings.json"), "utf8")).toBe('{"packages":[]}');
-    // The writable session dir (mounted as its own child mount in the sandbox)
-    // must exist so the mount's host-path existence check passes.
-    expect(fs.existsSync(path.join(staged!.agentDir, "sessions"))).toBe(true);
+    // The template deliberately holds NO sessions dir: sessions exist only
+    // inside freshAgentDir's per-run copies; nothing mounts the template.
   });
 
   it("never stages auth.json, even when present on the host", () => {

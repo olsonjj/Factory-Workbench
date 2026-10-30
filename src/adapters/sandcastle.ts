@@ -876,7 +876,8 @@ export function preparePiConfigDir(factoryRoot: string): PiConfigStage | null {
   if (files.length === 0) return null;
   const target = path.join(factoryRoot, "pi-config");
   fs.mkdirSync(target, { recursive: true });
-  fs.mkdirSync(path.join(target, "sessions"), { recursive: true });
+  // No sessions/ dir on the template: nothing mounts or reads it (sessions
+  // are created per run inside freshAgentDir's copies — see agentText).
   for (const f of files) {
     fs.copyFileSync(path.join(agentDir, f), path.join(target, f));
   }
