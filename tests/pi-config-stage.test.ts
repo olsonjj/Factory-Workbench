@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getPiConfigStage, parsePackageSpec, resolveExactSpecs } from "../src/adapters/sandcastle.js";
+import { getPiConfigStage, newestSemver, parsePackageSpec, resolveExactSpecs } from "../src/adapters/sandcastle.js";
 
 /**
  * pi-config staging is gated on the host ~/.pi/agent having config files
@@ -190,5 +190,44 @@ describe("resolveExactSpecs", () => {
       throw new Error("unresolvable");
     };
     expect(() => resolveExactSpecs(["pkg"], resolve)).toThrow("unresolvable");
+  });
+});
+
+describe("newestSemver", () => {
+  it("picks the semver-sorted newest entry regardless of payload order", () => {
+    // npm's own ordering is undocumented — lexicographic string sort would
+    // pick 1.9.0 from this payload; the pin must be 1.10.0.
+    expect(newestSemver(["1.9.0", "1.2.0", "1.10.0"])).toBe("1.10.0");
+    expect(newestSemver(["0.9.0", "2.0.0", "1.10.0", "2.1.0-beta.1"])).toBe("2.1.0-beta.1");
+  });
+
+  it("passes a single-version payload through", () => {
+    expect(newestSemver("1.2.3")).toBe("1.2.3");
+  });
+
+  it("sorts a clean release above same-version prereleases, by semver §11 precedence", () => {
+    expect(newestSemver(["2.0.0-beta.1", "2.0.0", "2.0.0-beta.2"])).toBe("2.0.0");
+    expect(newestSemver(["2.0.0-beta.1", "2.0.0-beta.2"])).toBe("2.0.0-beta.2");
+    // Numeric segments compare numerically, not lexicographically.
+    expect(newestSemver(["2.0.0-beta.2", "2.0.0-beta.10"])).toBe("2.0.0-beta.10");
+    // More segments above an equal-length prefix; alphanumeric above numeric.
+    expect(newestSemver(["2.0.0-beta", "2.0.0-beta.2"])).toBe("2.0.0-beta.2");
+    expect(newestSemver(["2.0.0-2", "2.0.0-beta"])).toBe("2.0.0-beta");
+  });
+
+  it("build metadata carries no precedence (first tie wins)", () => {
+    expect(newestSemver(["2.0.0-beta.1+exp.1", "2.0.0-beta.1+exp.9"])).toBe("2.0.0-beta.1+exp.1");
+    const picked = newestSemver(["2.0.0+build.9", "2.0.0+build.1"]);
+    expect(picked).toMatch(/^2\.0\.0\+build\.(9|1)$/);
+  });
+
+  it("throws on an empty payload and on semver-unparsable entries (caller aborts seeding, unpinned never)", () => {
+    expect(() => newestSemver([])).toThrow("no version resolved");
+    expect(() => newestSemver(["latest", "next"])).toThrow("no semver-parsable version");
+    expect(() => newestSemver("")).toThrow("no version resolved");
+  });
+
+  it("ignores non-semver members of a mixed payload rather than pinning them", () => {
+    expect(newestSemver(["latest", "1.2.3"])).toBe("1.2.3");
   });
 });

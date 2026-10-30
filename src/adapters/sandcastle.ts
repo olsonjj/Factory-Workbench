@@ -191,19 +191,19 @@ export class SandcastleStageRunner implements StageRunner {
     return getPiConfigStage(this.config.root);
   }
 
-  /** Assistant text from the sandboxed pi session, with stream-parse fallback. */
+  /** Assistant text from the sandboxed pi session, with stream-parse fallback.
+   *  Deliberately NO staged-template fallback for the sessions dir: the
+   *  template never holds sessions (freshAgentDir creates them per run
+   *  copy), so before any run there is nothing session-like to read — the
+   *  stream-parse fallback covers it. */
   private agentText(result: RunResult): string | undefined {
-    const staged = this.staging();
-    if (staged) {
-      // Sessions are written by the per-run agent-dir copy (freshAgentDir);
-      // before any run of this process, fall back to the staged template.
-      const sessionsDir = this.sessionsDirOfLastRun
-        ? path.join(this.sessionsDirOfLastRun, "sessions")
-        : path.join(staged.agentDir, "sessions");
-      const text = assistantTextFromSessions(sessionsDir, this.runStartedAt);
-      if (text) return text;
-    }
-    return lastIterationText(result) || undefined;
+    // Depends on wtRun/wtRunScratch having set sessionsDirOfLastRun.
+    if (!this.sessionsDirOfLastRun) return lastIterationText(result) || undefined;
+    const text = assistantTextFromSessions(
+      path.join(this.sessionsDirOfLastRun, "sessions"),
+      this.runStartedAt,
+    );
+    return text || lastIterationText(result) || undefined;
   }
 
 
@@ -894,10 +894,15 @@ export function preparePiConfigDir(factoryRoot: string): PiConfigStage | null {
   if (packages.length > 0) {
     const hostNpmDir = path.join(agentDir, "npm");
     if (fs.existsSync(path.join(hostNpmDir, "node_modules", "pi-ollama-cloud"))) {
-      // Pin every declared package to an exact version and install those
-      // (host-side; npm install here already needs the registry/network).
-      // Any resolution or install failure ⇒ no prefix mounted at all — the
-      // sandboxed pi falls back as before; we never silently install unpinned.
+      // Intentionally NOT gated on the declared list containing
+      // pi-ollama-cloud (the pre-PR gate): pi loads whatever
+      // settings.packages declare, so the prefix must seed exactly that
+      // list — anything missing would fall back to an in-container global
+      // install, which fails (root-owned). The host npm-dir presence check
+      // is a cheap proxy for "this host installs pi packages"; seeding runs
+      // once per factory root (piConfigCache), not per item. Any resolution
+      // or install failure ⇒ no prefix mounted at all — the sandboxed pi
+      // falls back as before; we never silently install unpinned.
       npmGlobalPrefixBase = path.join(target, "npm-global-base");
       fs.mkdirSync(npmGlobalPrefixBase, { recursive: true });
       try {
@@ -951,8 +956,10 @@ export function resolveExactSpecs(specs: string[], resolve: VersionResolver): st
 
 /**
  * Default VersionResolver: host-side `npm view <name>[@range] version
- * --json`, JSON-parsed and stringified-trimmed. A range matching multiple
- * versions yields an array — take the newest (last) entry.
+ * --json`, JSON-parsed, then the top entry of a semver-descending sort —
+ * npm does not document its output ordering, and the pinned version must
+ * never depend on it (see newestSemver). Throws when nothing resolvable
+ * is returned (caller aborts seeding).
  */
 function npmViewResolver(name: string, range: string | null): string {
   const out = execFileSync(
@@ -960,11 +967,94 @@ function npmViewResolver(name: string, range: string | null): string {
     ["view", range ? `${name}@${range}` : name, "version", "--json"],
     { timeout: 60_000, stdio: "pipe", encoding: "utf8" },
   );
-  const parsed = JSON.parse(out) as unknown;
-  const version = Array.isArray(parsed) ? String(parsed[parsed.length - 1]) : String(parsed);
-  const trimmed = version.trim();
-  if (!trimmed) throw new Error(`npm view ${name} version returned nothing`);
-  return trimmed;
+  return newestSemver(JSON.parse(out), `npm view ${name}`);
+}
+
+interface SemverParts {
+  major: number;
+  minor: number;
+  patch: number;
+  /** Prerelease/build suffix ("-beta.2", "+meta") or "" for a clean release. */
+  suffix: string;
+}
+
+function semverParts(v: string): SemverParts | null {
+  const m = /^(\d+)\.(\d+)\.(\d+)((?:[-+].*)?)$/.exec(v.trim());
+  return m
+    ? { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]), suffix: m[4] ?? "" }
+    : null;
+}
+
+/**
+ * Pick the NEWEST version from an npm `view --json` payload (a single
+ * version string or an array) — sorted by semver descending, never by the
+ * payload's own order (npm does not document its sort order; the old
+ * last-entry read silently depended on it). Ties on MAJOR.MINOR.PATCH use
+ * semver §11 prerelease precedence, segment-wise (clean release >
+ * prerelease; numeric segments compare numerically; alphanumeric above
+ * numeric; more segments above a shorter prefix; the ±build-metadata
+ * segment carries no precedence — the first tie wins). Throws when the
+ * payload is empty or carries no semver-parsable version: the caller
+ * refuses to seed rather than pin garbage. Exported for tests.
+ */
+export function newestSemver(parsed: unknown, source = "versions payload"): string {
+  const raw = (Array.isArray(parsed) ? parsed : [parsed]).map((v) => String(v ?? "").trim());
+  const candidates = raw
+    .map((v) => ({ v, parts: semverParts(v) }))
+    .filter((c): c is { v: string; parts: SemverParts } => c.parts !== null)
+    .sort((a, b) =>
+      b.parts.major - a.parts.major ||
+      b.parts.minor - a.parts.minor ||
+      b.parts.patch - a.parts.patch ||
+      -comparePrerelease(a.parts.suffix, b.parts.suffix),
+    );
+  if (candidates.length === 0) {
+    if (raw.length > 0 && raw.every((v) => v.length > 0)) {
+      throw new Error(`no semver-parsable version in ${source}: ${raw.join(", ")}`);
+    }
+    throw new Error(`no version resolved from ${source}`);
+  }
+  return candidates[0]!.v;
+}
+
+/** Prerelease identifier string of a semver suffix, or null for a clean
+ *  release / build-metadata-only suffix ("+build.7") — per semver §11,
+ *  build metadata carries no precedence. */
+function prereleaseOf(suffix: string): string | null {
+  if (!suffix.startsWith("-")) return null;
+  return suffix.slice(1).split("+")[0] ?? null;
+}
+
+/** Semver §11.4 prerelease precedence, ASCENDING; a prerelease-less suffix
+ *  (null) sorts ABOVE any prerelease — the caller inverts this for the
+ *  newest-first sort. */
+function comparePrerelease(suffixA: string, suffixB: string): number {
+  const a = prereleaseOf(suffixA);
+  const b = prereleaseOf(suffixB);
+  if (a === b) return 0;
+  if (a === null) return 1; // release sorts above any prerelease
+  if (b === null) return -1;
+  const sa = a.split(".");
+  const sb = b.split(".");
+  for (let i = 0; i < Math.max(sa.length, sb.length); i++) {
+    const x = sa[i];
+    const y = sb[i];
+    if (x === undefined) return -1; // fewer segments = lower precedence
+    if (y === undefined) return 1;
+    const nx = /^\d+$/.test(x);
+    const ny = /^\d+$/.test(y);
+    if (nx && ny) {
+      const d = Number(x) - Number(y);
+      if (d !== 0) return d;
+    } else if (nx) {
+      return -1; // numeric identifiers sort below alphanumeric
+    } else if (ny) {
+      return 1;
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return 0;
 }
 
 const piConfigCache = new Map<string, PiConfigStage | null>();
