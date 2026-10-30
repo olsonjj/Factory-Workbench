@@ -187,8 +187,10 @@ Pipeline: **triage → spec → implement → test → review → pull-request**
   be a DIFFERENT model family from implement (ticket 06) so its blind
   spots don't overlap, which is why it keeps DeepSeek V4 Pro. Judge model
   swaps by cost per passed item (factory DB), not benchmark tables.
-- `OLLAMA_API_KEY` must be set on the host; it is passed through to the
-  sandbox `pi` sessions. `gh` must be pre-authenticated.
+- `OLLAMA_API_KEY` must be set on the host; only the Ollama Cloud API-key
+  env vars are passed into the sandbox `pi` sessions (never the host's
+  `auth.json` or `OLLAMA_HOST`), and the staged pi config is mounted
+  read-only with a writable session directory. `gh` must be pre-authenticated.
 
 ## Knowledge base
 

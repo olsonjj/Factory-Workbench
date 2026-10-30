@@ -178,6 +178,8 @@ export class SandcastleStageRunner implements StageRunner {
   private readonly config: FactoryConfig;
   private readonly env: Record<string, string>;
   private readonly worktrees = new Map<string, Worktree>();
+  /** Per-item npm-global prefix dirs (item slug → host dir), cleaned up in dispose(). */
+  private readonly npmPrefixes = new Map<string, string>();
   private runStartedAt = 0;
 
   private staging(): PiConfigStage | null {
@@ -241,26 +243,42 @@ export class SandcastleStageRunner implements StageRunner {
     return wt;
   }
 
-  private async wtRun(opts: { wt: Worktree; model: string; prompt: string }): Promise<RunResult> {
+  /**
+   * Per-item writable npm-global prefix, isolated from every other item and
+   * from later stages of the same item: the base template is wiped and
+   * re-copied on EVERY call, so an agent-installed package can persist
+   * neither into a later stage of this item nor into a later item. The copy
+   * is small (the seeded pi packages) and runs on the host before the
+   * sandbox starts; pipeline execution is strictly sequential per
+   * specs/001-software-factory-mvp.md, so there is no concurrent-writer
+   * hazard. A crashed process can leave a stale npm-items/<slug>/ dir
+   * behind — accepted residue (reaping it via `wb gc` is out of scope).
+   */
+  private ensureItemNpmPrefix(slug: string): string | null {
+    const staged = this.staging();
+    const base = staged?.npmGlobalPrefixBase ?? null;
+    if (!base) return null;
+    const target = path.join(this.config.root, "pi-config", "npm-items", slug);
+    fs.rmSync(target, { recursive: true, force: true });
+    fs.cpSync(base, target, { recursive: true });
+    this.npmPrefixes.set(slug, target);
+    return target;
+  }
+
+  private async wtRun(opts: { wt: Worktree; slug: string; model: string; prompt: string }): Promise<RunResult> {
     const { wt, model, prompt } = opts;
     const staged = this.staging();
-    const piConfigMounts = staged
-      ? [
-          { hostPath: staged.agentDir, sandboxPath: "/home/agent/.pi/agent" },
-          ...(staged.npmGlobalPrefix
-            ? [{ hostPath: staged.npmGlobalPrefix, sandboxPath: NPM_GLOBAL_PREFIX }]
-            : []),
-        ]
-      : [];
+    const npmPrefix = staged ? this.ensureItemNpmPrefix(opts.slug) : null;
+    const mounts = staged ? piConfigMounts(staged, npmPrefix) : [];
     // Dependency install before the agent starts — Node projects only; see
     // sandboxReadyHooksFor() for the rationale and the non-Node skip.
     const hooks = sandboxReadyHooksFor(wt.worktreePath);
-    const piEnv = { ...this.env, ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefix }) };
+    const piEnv = { ...this.env, ...piEnvFor({ npmGlobalPrefixMount: npmPrefix !== null }) };
     return wt.run({
       agent: pi(model, { env: piEnv }),
       sandbox: docker({
         imageName: this.config.sandbox.imageName,
-        ...(piConfigMounts.length > 0 ? { mounts: piConfigMounts } : {}),
+        ...(mounts.length > 0 ? { mounts } : {}),
       }),
       ...(hooks ? { hooks } : {}),
       prompt: [prompt, COMPLETE].join("\n\n"),
@@ -295,6 +313,7 @@ ${kbBlock}`;
 
     const result = await this.wtRun({
       wt: await this.worktreeFor(req.item),
+      slug: req.item.slug,
       model,
       prompt,
     });
@@ -336,7 +355,7 @@ ${req.kb.global || "(none)"}
 Project:
 ${req.kb.project || "(none)"}`;
 
-    const result = await this.wtRun({ wt, model, prompt });
+    const result = await this.wtRun({ wt, slug: req.item.slug, model, prompt });
     const spec = parseStructuredString(result, "spec", this.agentText(result));
     return { outcome: "pass", artifacts: [{ name: "spec", content: spec }] };
   }
@@ -363,7 +382,7 @@ ${req.kb.global || "(none)"}
 Project:
 ${req.kb.project || "(none)"}`;
 
-    const result = await this.wtRun({ wt, model, prompt });
+    const result = await this.wtRun({ wt, slug: req.item.slug, model, prompt });
     const commits = (result.commits ?? []).map((c) => c.sha);
     return {
       outcome: "pass",
@@ -386,7 +405,7 @@ Return your verdict as JSON inside a <test>...</test> tag:
 - fix: only if you fixed something — what the fix was, generalized so a future run can learn from it
 - lesson: only if tests failed — what went wrong`;
 
-    const result = await this.wtRun({ wt, model, prompt });
+    const result = await this.wtRun({ wt, slug: req.item.slug, model, prompt });
     const v = parseStructured(result, "test", TestVerdict, this.agentText(result));
     if (!v.testsPassed) {
       return {
@@ -418,7 +437,7 @@ Return your verdict as JSON inside a <review>...</review> tag:
 - fix: only when you fail — concrete fix instructions for the implementer
 - prSummary: one line summarizing the outcome of the whole pipeline for this item`;
 
-    const result = await this.wtRun({ wt, model, prompt });
+    const result = await this.wtRun({ wt, slug: req.item.slug, model, prompt });
     const v = parseStructured(result, "review", ReviewVerdict, this.agentText(result));
     if (v.verdict === "fail") {
       return {
@@ -447,6 +466,16 @@ Return your verdict as JSON inside a <review>...</review> tag:
       }
     }
     this.worktrees.clear();
+    // The runner's worktree lifetime is the item lifetime, so per-item npm
+    // prefixes are cleaned up with the item's worktree disposal.
+    for (const dir of this.npmPrefixes.values()) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup
+      }
+    }
+    this.npmPrefixes.clear();
   }
 }
 
@@ -607,15 +636,10 @@ ${COMPLETE}`;
   private async wtRunScratch(opts: { scratch: string; model: string; prompt: string; mounts: { hostPath: string; sandboxPath: string; readonly: true }[] }): Promise<RunResult> {
     const { run } = await import("@ai-hero/sandcastle");
     const staged = this.staging();
-    const piConfigMounts = staged
-      ? [
-          { hostPath: staged.agentDir, sandboxPath: "/home/agent/.pi/agent" },
-          ...(staged.npmGlobalPrefix
-            ? [{ hostPath: staged.npmGlobalPrefix, sandboxPath: NPM_GLOBAL_PREFIX }]
-            : []),
-        ]
+    const mounts = staged
+      ? piConfigMounts(staged, staged.npmGlobalPrefixBase, "curator")
       : [];
-    const env = { ...(this.deps.env ?? {}), ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefix }) };
+    const env = { ...(this.deps.env ?? {}), ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefixBase }) };
     // Deliberately NO hooks.sandbox.onSandboxReady here (unlike wtRun): the
     // scratch cwd has no package.json (it only hosts read-only KB mounts), so
     // an npm install would fail and abort the run. Skipping is the designed
@@ -624,7 +648,7 @@ ${COMPLETE}`;
       agent: pi(opts.model, { env }),
       sandbox: docker({
         imageName: this.deps.config.sandbox.imageName,
-        mounts: [...piConfigMounts, ...opts.mounts],
+        mounts: [...mounts, ...opts.mounts],
       }),
       cwd: opts.scratch,
       prompt: opts.prompt,
@@ -659,41 +683,113 @@ export function sandboxReadyHooksFor(worktreePath: string): SandboxHooks | undef
   };
 }
 
-/** Host-side env passthrough for Ollama Cloud credentials. */
+/**
+ * Host-side env passthrough for Ollama Cloud credentials. ONLY the API-key
+ * vars are forwarded: sandbox stages talk to Ollama Cloud only, and passing
+ * host OLLAMA_HOST through would let a compromised stage redirect model
+ * traffic to an attacker-chosen host, so it is deliberately not forwarded.
+ * If a future config needs a custom endpoint, that is an explicit follow-up.
+ */
 export function ollamaEnv(): Record<string, string> {
   const env: Record<string, string> = {};
-  for (const key of ["OLLAMA_API_KEY", "OLLAMA_HOST", "OLLAMA_CLOUD_API_KEY"]) {
+  for (const key of ["OLLAMA_API_KEY", "OLLAMA_CLOUD_API_KEY"]) {
     if (process.env[key]) env[key] = process.env[key]!;
   }
   return env;
 }
 
 /**
- * pi inside the sandbox is a fresh install: no auth, no custom providers, no
- * model catalog. Stage the host's pi config (auth.json, models.json,
- * models-store.json) read-only inside the factory root and point the sandboxed
- * agent at it via PI_CODING_AGENT_DIR, so it can resolve and call exactly the
- * model the config file names. (The agent needs the key to call the model
- * anyway — no new exposure; nothing outside the local factory root.)
+ * Staged pi config for a sandboxed agent. The staged directory is mounted
+ * READ-ONLY at /home/agent/.pi/agent — the sandboxed pi's default agent-dir
+ * path; nothing sets PI_CODING_AGENT_DIR, the mount path is what points pi
+ * at the staged config — with a writable sessions child mount shadowing the
+ * read-only parent at exactly the path the sandboxed pi writes session files
+ * (see piConfigMounts). Credentials are NOT part of the stage: sandbox stages
+ * are credentialed exclusively by env (ollamaEnv() → SandcastleRunnerDeps.env
+ * → pi(model, { env })).
  */
 export interface PiConfigStage {
-  /** Mounted as the sandbox's ~/.pi/agent (credentials, catalog, settings). */
+  /** Staged pi config (models, settings; NEVER auth.json), mounted read-only. */
   agentDir: string;
-  /** Writable npm global root mounted at NPM_GLOBAL_PREFIX, pre-seeded with pi packages. */
-  npmGlobalPrefix: string | null;
+  /** Host path of the seeded npm prefix template. NEVER mounted writable. */
+  npmGlobalPrefixBase: string | null;
+}
+
+export interface PiConfigMount {
+  hostPath: string;
+  sandboxPath: string;
+  readonly?: boolean;
 }
 
 /**
- * Stage the host's pi agent configuration for the sandbox. The containerized
- * pi (a global install) treats user-scope packages as GLOBAL npm installs and
- * writes them under the npm global root. We bind a pre-seeded, writable
- * prefix at /home/agent/.npm-global and point npm_config_prefix at it, so the
- * packages resolve without any in-container global install attempt.
- * Sessions land in the factory root (durable, inspectable).
+ * Shared pi-config mount list for agent stages (wtRun) and the curator
+ * (wtRunScratch), which previously duplicated it:
+ * 1. the staged agent dir, read-only — config/catalog/settings become
+ *    tamper-proof inside the sandbox;
+ * 2. a writable sessions child mount at the sandboxed pi's default session
+ *    path (/home/agent/.pi/agent/sessions), so session writes still work
+ *    under the read-only parent AND the host-side readers
+ *    (assistantTextFromSessions) keep reading the same host directory
+ *    (<staged.agentDir>/sessions) unchanged;
+ * 3. (when npmPrefix is non-null) the npm global prefix at NPM_GLOBAL_PREFIX.
+ *
+ * Residual exposure, documented deliberately (finding H1 follow-ups track
+ * these): the staged models.json/models-store.json/settings.json remain
+ * READABLE inside the sandbox (non-secret, and now tamper-proof); the
+ * per-item npm prefix is writable within a single stage run (an in-run
+ * `npm i` still works and can affect only that run); and credentials reach
+ * stages via env, which a compromised stage can always read — the goal is
+ * that a stage cannot PERSIST a key or read unrelated credentials, not that
+ * it can never see its own.
+ *
+ * In "curator" mode the prefix mount is read-only too: the curator consumes
+ * untrusted repo/KB text, never installs, and nothing legitimate writes to
+ * the prefix in a scratch run — a read-only base prefix there is strictly
+ * safer and needs no copy/cleanup. If pi or an injected curator attempts an
+ * installation it fails inside that one run — contained.
+ */
+export function piConfigMounts(
+  staged: PiConfigStage,
+  npmPrefix: string | null,
+  mode: "agent" | "curator" = "agent",
+): PiConfigMount[] {
+  const mounts: PiConfigMount[] = [
+    { hostPath: staged.agentDir, sandboxPath: "/home/agent/.pi/agent", readonly: true },
+    { hostPath: path.join(staged.agentDir, "sessions"), sandboxPath: "/home/agent/.pi/agent/sessions" },
+  ];
+  if (npmPrefix !== null) {
+    mounts.push({
+      hostPath: npmPrefix,
+      sandboxPath: NPM_GLOBAL_PREFIX,
+      ...(mode === "curator" ? { readonly: true } : {}),
+    });
+  }
+  return mounts;
+}
+
+/**
+ * Stage the host's pi agent configuration for the sandbox — WITHOUT
+ * auth.json: the host's full credential set is deliberately never copied
+ * (minimal credentials, finding H1). Sandbox stages are credentialed
+ * exclusively by env (OLLAMA_API_KEY / OLLAMA_CLOUD_API_KEY via ollamaEnv()
+ * → SandcastleRunnerDeps.env); credentialing other provider families
+ * without auth.json would need a follow-up (out of scope). Consequence: a
+ * host with ONLY auth.json now stages nothing — previously it staged a
+ * partial config that could not resolve models anyway.
+ *
+ * The containerized pi (a global install) treats user-scope packages as
+ * GLOBAL npm installs and writes them under the npm global root, so we
+ * pre-seed an npm prefix template (npm-global-base) — pinned to exact
+ * versions at seed time — which the runner copies per item (see
+ * ensureItemNpmPrefix) and mounts at NPM_GLOBAL_PREFIX with
+ * npm_config_prefix pointing at it, so the packages resolve without any
+ * in-container global install attempt. Nothing mounts the base template
+ * writable, ever. Sessions land in the factory root (durable, inspectable).
  */
 export function preparePiConfigDir(factoryRoot: string): PiConfigStage | null {
   const agentDir = path.join(process.env.HOME ?? "~", ".pi", "agent");
-  const files = ["auth.json", "models.json", "models-store.json", "settings.json"].filter((f) =>
+  // auth.json is deliberately absent from this list — see the docstring.
+  const files = ["models.json", "models-store.json", "settings.json"].filter((f) =>
     fs.existsSync(path.join(agentDir, f)),
   );
   if (files.length === 0) return null;
@@ -704,9 +800,9 @@ export function preparePiConfigDir(factoryRoot: string): PiConfigStage | null {
     fs.copyFileSync(path.join(agentDir, f), path.join(target, f));
   }
 
-  // Pre-seed the writable npm global prefix with the packages pi's settings
+  // Pre-seed the npm global prefix template with the packages pi's settings
   // declare, so the sandbox never needs a global install (root-owned, fails).
-  let npmGlobalPrefix: string | null = null;
+  let npmGlobalPrefixBase: string | null = null;
   const settingsPath = path.join(target, "settings.json");
   let packages: string[] = [];
   try {
@@ -716,25 +812,78 @@ export function preparePiConfigDir(factoryRoot: string): PiConfigStage | null {
   }
   if (packages.length > 0) {
     const hostNpmDir = path.join(agentDir, "npm");
-    if (fs.existsSync(path.join(hostNpmDir, "node_modules", "pi-ollama-cloud")) && hasNpmSpecFor(piOllamaSpecIn(packages))) {
-      // Install each declared package into the staged global prefix.
-      npmGlobalPrefix = path.join(target, "npm-global");
-      fs.mkdirSync(npmGlobalPrefix, { recursive: true });
-      const specs = packages
-        .map((p) => (p.startsWith("npm:") ? p.slice(4) : p))
-        .map((spec) => (spec.includes("@", 1) ? spec : `${spec}@latest`));
+    if (fs.existsSync(path.join(hostNpmDir, "node_modules", "pi-ollama-cloud"))) {
+      // Pin every declared package to an exact version and install those
+      // (host-side; npm install here already needs the registry/network).
+      // Any resolution or install failure ⇒ no prefix mounted at all — the
+      // sandboxed pi falls back as before; we never silently install unpinned.
+      npmGlobalPrefixBase = path.join(target, "npm-global-base");
+      fs.mkdirSync(npmGlobalPrefixBase, { recursive: true });
       try {
+        const specs = resolveExactSpecs(packages, npmViewResolver);
         execFileSync(
           "npm",
-          ["install", "-g", "--prefix", npmGlobalPrefix, "--legacy-peer-deps", "--no-audit", "--no-fund", ...specs],
+          ["install", "-g", "--prefix", npmGlobalPrefixBase, "--legacy-peer-deps", "--no-audit", "--no-fund", ...specs],
           { timeout: 180_000, stdio: "pipe" },
         );
       } catch {
+        npmGlobalPrefixBase = null;
         // Best-effort; without it pi retries a global install in-container.
       }
     }
   }
-  return { agentDir: target, npmGlobalPrefix };
+  return { agentDir: target, npmGlobalPrefixBase };
+}
+
+const EXACT_SEMVER = /^\d+\.\d+\.\d+([-+].*)?$/;
+
+/**
+ * Split a package spec into { name, range } — range null when the spec is a
+ * bare name. Handles scoped names: the separating '@' is the last '@' at
+ * index > 0. A leading "npm:" prefix (as pi's settings may declare) is
+ * stripped first.
+ */
+export function parsePackageSpec(spec: string): { name: string; range: string | null } {
+  const stripped = spec.startsWith("npm:") ? spec.slice(4) : spec;
+  const at = stripped.lastIndexOf("@");
+  if (at > 0) {
+    const range = stripped.slice(at + 1);
+    return { name: stripped.slice(0, at), range: range.length > 0 ? range : null };
+  }
+  return { name: stripped, range: null };
+}
+
+export type VersionResolver = (name: string, range: string | null) => string;
+
+/**
+ * Resolve each declared package ONCE to an exact version; specs already
+ * pinned to a full semver pass through untouched (the resolver is not
+ * called for them). Throws on unresolvable specs (caller aborts seeding).
+ */
+export function resolveExactSpecs(specs: string[], resolve: VersionResolver): string[] {
+  return specs.map((spec) => {
+    const { name, range } = parsePackageSpec(spec);
+    if (range && EXACT_SEMVER.test(range)) return `${name}@${range}`;
+    return `${name}@${resolve(name, range)}`;
+  });
+}
+
+/**
+ * Default VersionResolver: host-side `npm view <name>[@range] version
+ * --json`, JSON-parsed and stringified-trimmed. A range matching multiple
+ * versions yields an array — take the newest (last) entry.
+ */
+function npmViewResolver(name: string, range: string | null): string {
+  const out = execFileSync(
+    "npm",
+    ["view", range ? `${name}@${range}` : name, "version", "--json"],
+    { timeout: 60_000, stdio: "pipe", encoding: "utf8" },
+  );
+  const parsed = JSON.parse(out) as unknown;
+  const version = Array.isArray(parsed) ? String(parsed[parsed.length - 1]) : String(parsed);
+  const trimmed = version.trim();
+  if (!trimmed) throw new Error(`npm view ${name} version returned nothing`);
+  return trimmed;
 }
 
 const piConfigCache = new Map<string, PiConfigStage | null>();
@@ -751,14 +900,6 @@ export function getPiConfigStage(factoryRoot: string): PiConfigStage | null {
   const fresh = preparePiConfigDir(factoryRoot);
   piConfigCache.set(factoryRoot, fresh);
   return fresh;
-}
-
-function piOllamaSpecIn(packages: string[]): boolean {
-  return packages.some((p) => p.includes("pi-ollama-cloud"));
-}
-
-function hasNpmSpecFor(_present: boolean): boolean {
-  return _present;
 }
 
 function realRepoPath(repo: string): string {
