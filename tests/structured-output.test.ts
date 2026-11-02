@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { RunResult } from "@ai-hero/sandcastle";
 import {
+  dropInvalidJsonEscapes,
   parseStructured,
   ReviewVerdict,
   StructuredOutputParseError,
@@ -63,6 +64,30 @@ describe("parseStructured: optional stage fields accept explicit null", () => {
     ).toThrow(StructuredOutputParseError);
     expect(() =>
       parseStructured(runResultWith(`<test>{ "testsPassed": true, "report": [] }</test>`), "test", TestVerdict),
+    ).toThrow(StructuredOutputParseError);
+  });
+});
+describe("parseStructured: invalid JSON escapes from quoted template literals", () => {
+  // Shapes observed from Claude Code (2026-11-02 e2e): backticks escaped as \`
+  // inside JSON strings when quoting JS template literals.
+  const review =
+    '<review>\n{\n  "verdict": "pass",\n  "findings": "greet.js adds `export const farewell = (name) => \\`Goodbye, ${name}!\\`;`"\n}\n</review>';
+
+  it("repairs \\` and keeps the verdict and text intact", () => {
+    const v = parseStructured({} as RunResult, "review", ReviewVerdict, review);
+    expect(v.verdict).toBe("pass");
+    expect(v.findings).toBe("greet.js adds `export const farewell = (name) => `Goodbye, ${name}!`;`");
+  });
+
+  it("leaves valid escapes untouched, including an escaped backslash before a backtick", () => {
+    const valid = String.raw`"a\"b\\c\/d\n\té \\` + "`" + `"`;
+    expect(dropInvalidJsonEscapes(valid)).toBe(valid);
+    expect(JSON.parse(dropInvalidJsonEscapes(valid))).toBe(JSON.parse(valid));
+  });
+
+  it("still throws when the payload is broken beyond invalid escapes", () => {
+    expect(() =>
+      parseStructured({} as RunResult, "review", ReviewVerdict, '<review>{ "verdict": "pass", \\` </review>'),
     ).toThrow(StructuredOutputParseError);
   });
 });

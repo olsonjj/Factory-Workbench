@@ -131,6 +131,17 @@ function extractTagContent(text: string, tag: string): string | undefined {
   return last;
 }
 
+/**
+ * Agents quoting JS template literals inside JSON strings write \` (observed
+ * from Claude on triage and review), which JSON rejects. Drop the backslash
+ * from escapes JSON doesn't define; valid pairs (\\ \" \n \uXXXX …) are
+ * consumed whole, so they are never altered. Only used after a strict parse
+ * has already failed.
+ */
+export function dropInvalidJsonEscapes(text: string): string {
+  return text.replace(/\\([\s\S])/g, (pair, ch: string) => ('"\\/bfnrtu'.includes(ch) ? pair : ch));
+}
+
 export function parseStructured<T>(result: RunResult, tag: string, schema: z.ZodType<T>, agentText?: string): T {
   const raw = extractTagContent(agentText || lastIterationText(result), tag);
   if (raw === undefined) {
@@ -140,7 +151,11 @@ export function parseStructured<T>(result: RunResult, tag: string, schema: z.Zod
   try {
     parsed = JSON.parse(raw.trim());
   } catch (cause) {
-    throw new StructuredOutputParseError(tag, cause);
+    try {
+      parsed = JSON.parse(dropInvalidJsonEscapes(raw.trim()));
+    } catch {
+      throw new StructuredOutputParseError(tag, cause);
+    }
   }
   const check = schema.safeParse(parsed);
   if (!check.success) {
