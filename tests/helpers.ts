@@ -6,6 +6,7 @@ import { makePaths, type FactoryPaths } from "../src/paths.js";
 import { loadConfig, type FactoryConfig } from "../src/config.js";
 import { scanInbox } from "../src/inbox.js";
 import { Orchestrator, type PrPublishRequest, type PrPublisher } from "../src/pipeline.js";
+import type { BaseFreshnessChecker, BaseFreshnessResult } from "../src/baseFreshness.js";
 import type { CuratorRunner, PrPublishResult, StageRequest, StageResult, StageRunner } from "../src/types.js";
 
 export interface TestHarness {
@@ -181,6 +182,7 @@ export function makeOrchestrator(
     publisher?: PrPublisher;
     curator?: CuratorRunner | null;
     maxResumeTicks?: number;
+    baseCheck?: BaseFreshnessChecker | null;
   } = {},
 ): Orchestrator {
   const { config, configFile } = { config: harness.config, configFile: "" };
@@ -195,6 +197,11 @@ export function makeOrchestrator(
     publisher: opts.publisher ?? new FakePublisher(),
     sleep: async () => {},
     maxResumeTicks: opts.maxResumeTicks,
+    // Silent proceed: existing tests tick items with fake repo paths like
+    // /tmp/repo — the real checker would print noise. Real-git behavior is
+    // tested directly against GitBaseFreshnessChecker and via fakes at this
+    // port in tests/base-freshness.test.ts.
+    baseCheck: "baseCheck" in opts ? opts.baseCheck : { check: (): BaseFreshnessResult => ({ action: "proceed", message: null, localTip: null, upstreamTip: null }) } satisfies BaseFreshnessChecker,
   });
 }
 

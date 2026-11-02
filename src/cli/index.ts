@@ -14,6 +14,7 @@ import type { ItemRecord } from "../types.js";
 import { authorItem, type NewOptions } from "../new.js";
 import { makeRealIO } from "../prompt.js";
 import { Orchestrator, matchAnswers } from "../pipeline.js";
+import { GitBaseFreshnessChecker } from "../baseFreshness.js";
 import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, agentEnvFor } from "../adapters/sandcastle.js";
 import { parseIntervalSeconds, startWatch, type WatchState } from "../watch.js";
 import { runGc, GitGcScanner, GitGcReaper, renderGcHuman, renderGcJson, type GcFlags } from "../gc.js";
@@ -46,6 +47,7 @@ function openFactory(rootOverride?: string): {
       curator: new SandcastleCurator({ config, env: agentEnvFor(config) }),
       publisher: new GhPrPublisher(),
       sleep,
+      baseCheck: new GitBaseFreshnessChecker(),
     });
     return { root, paths, db, orch, claimReport, release };
   } catch (err) {
@@ -92,10 +94,14 @@ async function withFactory<T>(
   }
 }
 
-function printTick(entries: { slug: string; id: number; fromStage: string; status: string; detail: string }[], empty: string): void {
+function printTick(entries: { slug: string; id: number; fromStage: string; status: string; detail: string; changed?: boolean }[], empty: string): void {
   if (entries.length === 0) console.log(empty);
   for (const e of entries) {
-    console.log(`${e.slug} (#${e.id}): ${e.fromStage} → ${e.status}` + (e.detail ? ` — ${e.detail}` : ""));
+    if (e.changed === false) {
+      console.log(`${e.slug} (#${e.id}): skipped — ${e.detail}`);
+    } else {
+      console.log(`${e.slug} (#${e.id}): ${e.fromStage} → ${e.status}` + (e.detail ? ` — ${e.detail}` : ""));
+    }
   }
 }
 
@@ -175,6 +181,11 @@ function printStatusItems(db: FactoryDb, opts: StatusFlags): void {
     if (item.parkedReason) console.log(`    parked: ${item.parkedReason}`);
     if (item.parkedDetail) {
       const d = item.parkedDetail;
+      if (item.parkedReason === "stale-base" && typeof d.base === "string" && typeof d.repo === "string") {
+        console.log(
+          `    stale base: ${d.base} (${d.localTip ?? "?"}) behind origin/${d.base} (${d.upstreamTip ?? "?"}) — git pull in ${d.repo}`,
+        );
+      }
       if (Array.isArray(d.questions) && d.questions.length > 0) {
         console.log("    questions:");
         for (const q of d.questions as string[]) console.log(`      - ${q}`);
