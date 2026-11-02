@@ -9,7 +9,10 @@ resumable after a crash or an interruption.
 Built on [pi](https://github.com/badlogic/pi-mono) (the agent harness, running
 inside sandboxes) and [@ai-hero/sandcastle](https://www.npmjs.com/package/@ai-hero/sandcastle)
 (Docker sandboxing, git worktrees, named branch strategy). Models run via
-Ollama Cloud.
+Ollama Cloud — or, when the agent provider is switched to Claude Code
+(`agent.provider: "claude"` in the config), via Anthropic. The provider is a
+config knob below the `StageRunner` seam; everything above it (pipeline,
+state machine, gates, KB, PR publishing) is provider-agnostic.
 
 ## How it flows
 
@@ -31,9 +34,13 @@ Ollama Cloud.
 
 - Node 22+ and `npm`
 - Docker (OrbStack or Docker Desktop) running, with the sandbox image built:
-  `npx sandcastle docker build-image`
-- `OLLAMA_API_KEY` exported on the host (Ollama Cloud) — passed to sandbox
-  agent sessions
+  `npx sandcastle docker build-image` (for the default `pi` provider) or the
+  [claude image](#choosing-the-agent-provider) (for `agent.provider: "claude"`)
+- A provider credential exported on the host, injected into the sandbox agent
+  sessions via env only (no agent install is needed on the host):
+  - `OLLAMA_API_KEY` for the default `pi` provider (Ollama Cloud), or
+  - `ANTHROPIC_API_KEY` **or** `CLAUDE_CODE_OAUTH_TOKEN` for `claude`
+    (Claude Code; whichever is set is used — never both required)
 - `gh` CLI pre-authenticated on the host (`gh auth status`) — PR publishing
 
 ## Install
@@ -59,7 +66,7 @@ This creates a self-contained, movable root:
 
 ```text
 factory/
-├── factory.config.json       # per-stage models, budgets, sandbox image
+├── factory.config.json       # agent provider, per-stage models, budgets, sandbox image
 ├── inbox/                    # drop work items here
 ├── items/
 │   └── <slug>/
@@ -162,20 +169,27 @@ Pipeline: **triage → spec → implement → test → review → pull-request**
 
 ## Configuration
 
-`factory/factory.config.json`:
+`factory/factory.config.json` (`wb init` writes this file with the defaults —
+including `"agent": { "provider": "pi" }` so the provider knob is discoverable
+in the generated file):
 
 ```json
 {
   "root": "/path/to/factory",
+  "agent": { "provider": "claude" },
   "models": {
-    "default": "deepseek-v4.1-flash-1017",
-    "implement": "glm-5.3",
-    "review": "deepseek-v4-pro:0813"
+    "default": "claude-sonnet-4-6",
+    "implement": "claude-sonnet-4-6",
+    "review": "claude-opus-4-8"
   },
   "budgets": { "maxGateAttempts": 3, "maxInfraRetries": 3, "retryBackoffMs": 5000 },
-  "sandbox": { "imageName": "sandcastle:local" }
+  "sandbox": { "imageName": "sandcastle:claude" }
 }
 ```
+
+(the variant above is the `claude` one; omit the `agent` section — or set it to
+`"pi"` — and keep `sandbox.imageName: "sandcastle:local"` for the default pi
+setup, whose models are Ollama Cloud ids)
 
 - All stages default to one model; the per-stage override mechanism is the
   mapping structure above.
@@ -196,6 +210,63 @@ Pipeline: **triage → spec → implement → test → review → pull-request**
   run replaces the copy) — the pi agent dir cannot be read-only since pi
   writes its settings lock at read time. `gh` must be pre-authenticated.
 
+### Choosing the agent provider
+
+`agent.provider` selects which agent runtime backs every stage below the
+`StageRunner` seam. Everything above the seam — pipeline, state machine,
+SQLite, inbox/KB, gates, PR publishing — is provider-agnostic.
+
+| | `pi` (default) | `claude` |
+|---|---|---|
+| Credential env (host → sandbox) | `OLLAMA_API_KEY` / `OLLAMA_CLOUD_API_KEY` | `ANTHROPIC_API_KEY` **or** `CLAUDE_CODE_OAUTH_TOKEN` (whichever is set) |
+| Sandbox image | `sandcastle:local` (`npx sandcastle docker build-image`) | a claude-enabled image, e.g. `sandcastle:claude`, set via `sandbox.imageName` |
+| Default models | Ollama Cloud ids (`src/config.ts`) | `claude-sonnet-4-6` default, `claude-opus-4-8` review |
+| pi-config staging (agent-dir mounts, npm prefix) | yes | no — claude needs only env injection |
+
+Only the provider's own credential env vars are ever passed into a sandbox
+run (a `claude` run never sees `OLLAMA_API_KEY`, a `pi` run never sees
+`ANTHROPIC_API_KEY`; no endpoint vars like `OLLAMA_HOST` / `ANTHROPIC_BASE_URL`
+are forwarded — same redirect-attack reasoning). No `claude` install is
+needed on the host: the `claude` CLI is baked into the image and auth rides
+sandbox env only.
+
+**Claude model defaults:** under `pi` the invariant is "review is a different
+model FAMILY from implement" (ticket 06); under `claude` (single family) it
+degrades to "review is a different model from implement" — sonnet runs the
+default/implement stages, opus runs review. Per-stage overrides work exactly
+as for pi; rationale lives in `src/config.ts` next to
+`CLAUDE_DEFAULT_MODEL`. All model ids are prompt-time strings — a typo
+surfaces as a mid-pipeline failure, and there is deliberately no
+cross-validation against a provider catalog.
+
+**Building the claude image** — the UID/GID build-args are REQUIRED:
+Sandcastle's docker provider inspects the image's default user
+(`docker image inspect …{{.Config.User}}`) and refuses to start a sandbox on
+UID mismatch with the host user; building without the args makes every
+stage abort with `UID mismatch: image 'sandcastle:claude' …`:
+
+```bash
+docker build -f docker/claude.Dockerfile \
+  --build-arg AGENT_UID="$(id -u)" --build-arg AGENT_GID="$(id -g)" \
+  -t sandcastle:claude .
+```
+
+The Dockerfile mirrors sandcastle 0.12's Claude template (see its header).
+Alternative documented path: `sandcastle init --agent claude-code` in a
+scratch dir + `npx sandcastle docker build-image`. The pi image keeps
+working unchanged for provider `pi`.
+
+**Acceptance note — one-stage triage spike before relying on `claude`:**
+structured-output `<tag>…</tag>` compliance is prompt-enforced and
+model-dependent, so before relying on provider `claude`, run a single-item
+triage spike against a real repo (`agent.provider: "claude"`, an item with a
+trivial triage task, watch `wb status` / artifacts for a parseable
+`<triage>` verdict). Real end-to-end validation needs Docker +
+`ANTHROPIC_API_KEY` only — and that validation is NOT required for the
+factory's own test suite (the gated claude integration smoke is skipped
+without the env/image). Structured-output parse failures are already
+infra-class failures retried under `budgets.maxInfraRetries`.
+
 ## Knowledge base
 
 `factory/kb/global.md` and `factory/kb/projects/<repo>.md` are dated,
@@ -212,9 +283,15 @@ hand.
 
 - Tests: `npm test` — all pipeline logic runs above a single seam
   (`StageRunner`) against hermetic fake runners; the filesystem and SQLite
-  are used for real.
+  are used for real. Provider selection (pi vs claude) is covered by
+  hermetic adapter tests (`tests/agent-provider.test.ts`) that observe the
+  provider-factory dispatch and credential/staging gating — no Docker, no
+  Claude Code, no pi needed.
 - The one Sandcastle adapter integration test is gated on Docker
-  availability + `OLLAMA_API_KEY`; without them it is skipped.
+  availability + `OLLAMA_API_KEY`; without them it is skipped. A second,
+  equally optional claude smoke is gated on Docker + the
+  `sandcastle:claude` image + `ANTHROPIC_API_KEY` (or
+  `CLAUDE_CODE_OAUTH_TOKEN`); neither gated test ever blocks the suite.
 - Typecheck: `npm run typecheck`.
 
 ## Architecture notes

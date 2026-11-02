@@ -71,7 +71,7 @@ Human-in-the-loop is configurable per item and per stage: as items gain my trust
 - The factory is an orchestrator in TypeScript (Node 22+, run with `tsx`), with pipeline state in SQLite (`better-sqlite3`).
 - Durability is stage-level, not turn-level: SQLite persists "which stage each item is on"; a stalled or crashed stage run is re-run (the Sandcastle/pi session resume capability may be used for in-stage recovery, but correctness never depends on it).
 - `pi-durable` was explicitly considered and rejected for MVP: its turn-level conversation durability and experimental API are not warranted when the recovery unit is the stage. This decision reverses if the factory grows to need long-lived durable conversations.
-- Sandcastle (`@ai-hero/sandcastle`) is the agent-execution engine: Docker sandbox provider, git worktree per item, named output branch, session capture. Its template scaffolding is a starting reference, not the runtime.
+- Sandcastle (`@ai-hero/sandcastle`) is the agent-execution engine: Docker sandbox provider, git worktree per item, named output branch, session capture. Its template scaffolding is a starting reference, not the runtime. Besides the default pi runtime, the adapter also supports Claude Code as a config-selected agent runtime (`agent.provider: "claude"`); its auth reaches the sandbox via env only (`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`).
 - The orchestrator runs on the host (macOS via OrbStack/Docker). Only agent stages are containerized.
 
 **Pipeline**
@@ -97,7 +97,7 @@ Human-in-the-loop is configurable per item and per stage: as items gain my trust
 
 **Configuration & models**
 
-- One config file defines: per-stage Ollama Cloud model mapping, default model, factory root paths, rework/retry budgets.
+- One config file defines: agent provider (`agent.provider`: `pi` default, `claude` supported), per-provider default and per-stage model mapping, factory root paths, rework/retry budgets.
 - Model mapping structure exists from day one (triage / spec / implement / test / review keyed to model IDs), but all stages default to one model (DeepSeek V4 Pro); differentiation is a config edit. Candidate mapping when diversified: triage/test — DeepSeek V4 Flash; spec/implement — DeepSeek V4 Pro; review — GLM 5.3 Flash (different family from implement).
 - `gh` is assumed pre-authenticated on the host.
 
@@ -116,7 +116,7 @@ Human-in-the-loop is configurable per item and per stage: as items gain my trust
 
 **Testing seams**
 
-- Exactly one new seam: the StageRunner boundary. The orchestrator (state machine, gates, rework loop, parking, CLI behavior) depends on an interface "run a stage for an item, get a stage result (pass/fail/artifacts/feedback)". The Sandcastle+pi Docker adapter is one implementation of that port.
+- Exactly one new seam: the StageRunner boundary. The orchestrator (state machine, gates, rework loop, parking, CLI behavior) depends on an interface "run a stage for an item, get a stage result (pass/fail/artifacts/feedback)". The Sandcastle Docker adapter is one implementation of that port, config-selectable between the pi and Claude Code agent runtimes; everything above the seam is provider-agnostic.
 - All pipeline logic is tested above the seam with fake stage runners driving scenarios (pass-first-time, gate-reject-then-rework-park, triage needs-human, infra-failure parking).
 - The Sandcastle adapter gets one thin integration test, gated on Docker availability.
 - The filesystem and SQLite are used for real (temp directories, real database) — they are concrete infrastructure; faking them would test the fake.

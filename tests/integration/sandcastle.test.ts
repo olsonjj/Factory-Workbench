@@ -9,7 +9,7 @@ import {
   claim,
   type TestHarness,
 } from "../helpers.js";
-import { SandcastleStageRunner, GhPrPublisher, ollamaEnv } from "../../src/adapters/sandcastle.js";
+import { SandcastleStageRunner, GhPrPublisher, ollamaEnv, claudeEnv } from "../../src/adapters/sandcastle.js";
 import { loadConfig } from "../../src/config.js";
 
 /**
@@ -27,6 +27,27 @@ try {
 
 const gated = dockerAvailable && !!process.env.OLLAMA_API_KEY;
 const d = gated ? describe : describe.skip;
+
+/**
+ * OPTIONAL claude-provider smoke (ticket: gated, never required for the
+ * factory's own suite to pass). Real end-to-end claude validation needs
+ * Docker + a claude-enabled image (docker/claude.Dockerfile) +
+ * ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN) — nothing on the host.
+ * Structured-output `<tag>…</tag>` compliance is prompt-enforced and
+ * model-dependent, so this is exactly the one-stage triage spike the
+ * README recommends before relying on provider `claude`.
+ */
+let claudeImageAvailable = false;
+try {
+  if (dockerAvailable && (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_CODE_OAUTH_TOKEN)) {
+    execFileSync("docker", ["image", "inspect", "sandcastle:claude"], { timeout: 10_000, stdio: "pipe" });
+    claudeImageAvailable = true;
+  }
+} catch {
+  claudeImageAvailable = false;
+}
+const claudeGated = dockerAvailable && claudeImageAvailable && !!(process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_CODE_OAUTH_TOKEN);
+const dc = claudeGated ? describe : describe.skip;
 
 let harness: TestHarness;
 let repoDir: string;
@@ -117,4 +138,51 @@ describe("adapter environment gating", () => {
       expect(dockerAvailable).toBe(true);
     }
   });
+});
+
+let claudeHarness: TestHarness;
+let claudeRepoDir: string;
+
+dc("integration: sandcastle adapter, provider claude (requires docker + sandcastle:claude image + ANTHROPIC_API_KEY)", () => {
+  beforeAll(() => {
+    claudeHarness = createHarness();
+    claudeHarness.config.agent.provider = "claude";
+    claudeHarness.config.models = { default: "claude-sonnet-4-6" };
+    claudeHarness.config.sandbox.imageName = "sandcastle:claude";
+    claudeRepoDir = mkdtempSync(path.join(os.tmpdir(), "factory-int-claude-repo-"));
+    const git = (args: [] | string[]): void => execFileSync("git", args, { cwd: claudeRepoDir });
+    fs.writeFileSync(path.join(claudeRepoDir, "README.md"), "# integration repo\n");
+    git(["init", "-b", "main"]);
+    git(["add", "."]);
+    execFileSync(
+      "git",
+      ["-C", claudeRepoDir, "-c", "user.name=wb", "-c", "user.email=wb@factory.workbench", "commit", "-m", "init", "-q"],
+      {},
+    );
+  });
+
+  afterAll(() => {
+    claudeHarness?.cleanup();
+  });
+
+  it("triage stage (claude provider) returns a real verdict for a well-formed item", async () => {
+    // Wired exactly like the production CLI: agentEnvFor picks the claude
+    // credential passthrough under provider claude.
+    const runner = new SandcastleStageRunner({ config: claudeHarness.config, env: claudeEnv() });
+    const result = await runner.runStage({
+      stage: "triage",
+      item: {
+        id: 1,
+        slug: "claude-integration",
+        title: "Add a HELLO constant",
+        repo: claudeRepoDir,
+        base: "main",
+        approvals: [],
+        body: "Add a file src/hello.ts exporting `export const HELLO = 'world';`.",
+        branchName: "factory/claude-integration",
+      },
+      kb: { global: "", project: "" },
+    });
+    expect(["pass", "reject", "needs-human", "gate-fail", "infra-fail"]).toContain(result.outcome);
+  }, 300_000);
 });

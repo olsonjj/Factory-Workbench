@@ -89,7 +89,8 @@ export interface StageRequest {
 
 /**
  * THE seam. Above this line: state machine, gates, rework loops, parking, CLI.
- * Below this line: one implementation per execution engine (Sandcastle+pi).
+ * Below this line: one implementation per execution engine (the Sandcastle
+ * adapter, config-selectable between the pi and Claude Code agent runtimes).
  */
 export interface StageRunner {
   runStage(req: StageRequest): Promise<StageResult>;

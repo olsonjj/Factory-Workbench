@@ -33,16 +33,38 @@ export interface KbConfig {
   maxProjectChars: number;
 }
 
+/** Agent provider backing every agent stage. Sandcastle adapter below the seam. */
+export type AgentProviderName = "pi" | "claude";
+
+export interface AgentConfig {
+  provider: AgentProviderName;
+}
+
 export interface FactoryConfig {
   /** Factory root directory (self-contained, movable). */
   root: string;
   models: StageModels;
+  agent: AgentConfig;
   budgets: Budgets;
   sandbox: SandboxConfig;
   kb: KbConfig;
 }
 
 export const DEFAULT_MODEL = "deepseek-v4-pro:0813";
+
+/**
+ * Claude Code model defaults (provider "claude"). Under `pi` the review-model
+ * invariant is "review is a different model FAMILY from implement" (ticket 06:
+ * the review gate must not share the implementer's blind spots). Claude is a
+ * single model family, so under provider `claude` that invariant degrades to
+ * "review is a different model from implement": sonnet runs the
+ * default/implement stages and opus runs review. Like the Ollama ids, these
+ * are prompt-time/CLI-time strings — a typo surfaces only as a mid-pipeline
+ * failure (same as invariant 2 below), and per-stage overrides in
+ * factory.config.json win over these defaults exactly as for pi.
+ */
+export const CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-6";
+export const CLAUDE_DEFAULT_REVIEW_MODEL = "claude-opus-4-8";
 
 /**
  * Model-selection rationale for the LIVE factory.config.json (2026-10):
@@ -80,6 +102,7 @@ export const DEFAULT_CONFIG: Omit<FactoryConfig, "root"> = {
     // (ticket 06) to avoid shared blind spots. Overridable per config file.
     review: "glm-5.3-flash",
   },
+  agent: { provider: "pi" },
   budgets: {
     maxGateAttempts: 3,
     maxInfraRetries: 3,
@@ -122,6 +145,9 @@ const configSchema = z.object({
     retryBackoffMs: z.number().int().nonnegative(),
   }),
   sandbox: z.object({ imageName: z.string().min(1) }),
+  agent: z.object({
+    provider: z.enum(["pi", "claude"]),
+  }),
   kb: z.object({
     maxGlobalChars: z.number().int().positive(),
     maxProjectChars: z.number().int().positive(),
@@ -147,12 +173,19 @@ export function loadConfig(rootOverride?: string, cwd: string = process.cwd()): 
       if (typeof raw.root === "string" && raw.root.length > 0) candidate = raw.root;
     }
   }
+  // Provider must be derived BEFORE the models merge so the model defaults
+  // are provider-scoped: provider "claude" swaps in the Claude default ids
+  // (which per-stage overrides in the config file still win over, unchanged).
+  const provider: AgentProviderName = raw.agent?.provider ?? "pi";
   const config: FactoryConfig = {
     root: candidate,
     models: {
-      ...DEFAULT_CONFIG.models,
+      ...(provider === "claude"
+        ? { default: CLAUDE_DEFAULT_MODEL, review: CLAUDE_DEFAULT_REVIEW_MODEL }
+        : DEFAULT_CONFIG.models),
       ...(raw.models ?? {}),
     },
+    agent: { provider },
     budgets: {
       ...DEFAULT_CONFIG.budgets,
       ...(raw.budgets ?? {}),
@@ -182,6 +215,8 @@ export function ensureConfigFile(root: string): boolean {
   const defaults = {
     ...DEFAULT_CONFIG,
     root,
+    // "agent": { "provider": "pi" } rides along from DEFAULT_CONFIG — the
+    // generated file must carry the provider knob so operators discover it.
     models: {
       default: DEFAULT_MODEL,
       // Review deliberately runs a different model family from implement to

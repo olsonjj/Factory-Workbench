@@ -14,7 +14,7 @@ import type { ItemRecord } from "../types.js";
 import { authorItem, type NewOptions } from "../new.js";
 import { makeRealIO } from "../prompt.js";
 import { Orchestrator, matchAnswers } from "../pipeline.js";
-import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, ollamaEnv } from "../adapters/sandcastle.js";
+import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, agentEnvFor } from "../adapters/sandcastle.js";
 import { parseIntervalSeconds, startWatch, type WatchState } from "../watch.js";
 import { runGc, GitGcScanner, GitGcReaper, renderGcHuman, renderGcJson, type GcFlags } from "../gc.js";
 import { sleep } from "../util.js";
@@ -36,14 +36,14 @@ function openFactory(rootOverride?: string): {
   const release = acquireFactoryLock(root);
   try {
     const db = new FactoryDb(root);
-    const runner = new SandcastleStageRunner({ config, env: ollamaEnv() });
+    const runner = new SandcastleStageRunner({ config, env: agentEnvFor(config) });
     const claimReport = scanInbox(paths, db);
     const orch = new Orchestrator({
       db,
       paths,
       config,
       runner,
-      curator: new SandcastleCurator({ config, env: ollamaEnv() }),
+      curator: new SandcastleCurator({ config, env: agentEnvFor(config) }),
       publisher: new GhPrPublisher(),
       sleep,
     });
