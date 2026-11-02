@@ -178,9 +178,9 @@ in the generated file):
   "root": "/path/to/factory",
   "agent": { "provider": "claude" },
   "models": {
-    "default": "claude-sonnet-4-6",
-    "implement": "claude-sonnet-4-6",
-    "review": "claude-opus-4-8"
+    "default": "claude-sonnet-5-5",
+    "implement": "claude-sonnet-5-5",
+    "review": "claude-opus-5-5"
   },
   "budgets": { "maxGateAttempts": 3, "maxInfraRetries": 3, "retryBackoffMs": 5000 },
   "sandbox": { "imageName": "sandcastle:claude" }
@@ -220,7 +220,7 @@ SQLite, inbox/KB, gates, PR publishing — is provider-agnostic.
 |---|---|---|
 | Credential env (host → sandbox) | `OLLAMA_API_KEY` / `OLLAMA_CLOUD_API_KEY` | `ANTHROPIC_API_KEY` **or** `CLAUDE_CODE_OAUTH_TOKEN` (whichever is set) |
 | Sandbox image | `sandcastle:local` (`npx sandcastle docker build-image`) | a claude-enabled image, e.g. `sandcastle:claude`, set via `sandbox.imageName` |
-| Default models | Ollama Cloud ids (`src/config.ts`) | `claude-sonnet-4-6` default, `claude-opus-4-8` review |
+| Default models | Ollama Cloud ids (`src/config.ts`) | `claude-sonnet-5-5` default, `claude-opus-5-5` review |
 | pi-config staging (agent-dir mounts, npm prefix) | yes | no — claude needs only env injection |
 
 Only the provider's own credential env vars are ever passed into a sandbox
@@ -235,9 +235,12 @@ model FAMILY from implement" (ticket 06); under `claude` (single family) it
 degrades to "review is a different model from implement" — sonnet runs the
 default/implement stages, opus runs review. Per-stage overrides work exactly
 as for pi; rationale lives in `src/config.ts` next to
-`CLAUDE_DEFAULT_MODEL`. All model ids are prompt-time strings — a typo
-surfaces as a mid-pipeline failure, and there is deliberately no
-cross-validation against a provider catalog.
+`CLAUDE_DEFAULT_MODEL`. Under `claude`, every `models.*` entry must be a
+`claude-*` id or a Claude Code alias (`sonnet` / `opus` / `haiku`), checked
+at startup — so switching a `wb init`-generated config (which carries Ollama
+ids) to `claude` means replacing or removing its `models` entries too.
+Beyond that shape check there is no validation against a model catalog; a
+typo in a `claude-*` id still surfaces mid-pipeline.
 
 **Building the claude image** — the UID/GID build-args are REQUIRED:
 Sandcastle's docker provider inspects the image's default user

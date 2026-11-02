@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import * as os from "node:os";
 import * as path from "node:path";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { loadConfig, CONFIG_FILE_NAME, DEFAULT_MODEL, modelFor, CLAUDE_DEFAULT_MODEL, CLAUDE_DEFAULT_REVIEW_MODEL } from "../src/config.js";
+import { loadConfig, CONFIG_FILE_NAME, DEFAULT_MODEL, modelFor, CLAUDE_DEFAULT_MODEL, CLAUDE_DEFAULT_REVIEW_MODEL, isClaudeModelId } from "../src/config.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -115,31 +115,62 @@ describe("agent provider config", () => {
       configFile,
       JSON.stringify({
         agent: { provider: "claude" },
-        models: { triage: "claude-haiku-4-5", review: "claude-haiku-4-5" },
+        models: { triage: "claude-haiku-5-5", review: "claude-haiku-5-5" },
       }),
       "utf8",
     );
     const { config } = loadConfig(root);
-    expect(modelFor(config.models, "triage")).toBe("claude-haiku-4-5");
-    expect(modelFor(config.models, "review")).toBe("claude-haiku-4-5");
+    expect(modelFor(config.models, "triage")).toBe("claude-haiku-5-5");
+    expect(modelFor(config.models, "review")).toBe("claude-haiku-5-5");
     // Unoverridden stages keep the claude defaults.
     expect(modelFor(config.models, "implement")).toBe(CLAUDE_DEFAULT_MODEL);
   });
 
-  it("an explicit models.default wins over the provider defaults (no cross-validation)", () => {
-    // Documented operator responsibility: a claude-provider config may pin an
-    // Ollama id explicitly — the config layer does not special-case it.
+  it("an explicit Claude models.default wins over the provider defaults", () => {
     const root = tmpRoot();
-    const configFile = path.join(root, CONFIG_FILE_NAME);
     writeFileSync(
-      configFile,
-      JSON.stringify({ agent: { provider: "claude" }, models: { default: "deepseek-v4-pro:0813" } }),
+      path.join(root, CONFIG_FILE_NAME),
+      JSON.stringify({ agent: { provider: "claude" }, models: { default: "opus" } }),
       "utf8",
     );
     const { config } = loadConfig(root);
-    expect(config.agent.provider).toBe("claude");
-    expect(config.models.default).toBe("deepseek-v4-pro:0813");
+    expect(config.models.default).toBe("opus");
     // The claude review default still applies (only default was overridden).
     expect(config.models.review).toBe(CLAUDE_DEFAULT_REVIEW_MODEL);
+  });
+
+  it("provider claude rejects leftover Ollama ids from a pi-generated config, naming each stage", () => {
+    const root = tmpRoot();
+    const configFile = path.join(root, CONFIG_FILE_NAME);
+    // Shape wb init writes, with only the provider flipped.
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        agent: { provider: "claude" },
+        models: { default: "deepseek-v4-pro:0813", review: "glm-5.3-flash" },
+      }),
+      "utf8",
+    );
+    expect(() => loadConfig(root)).toThrow(/models\.default: "deepseek-v4-pro:0813", models\.review: "glm-5\.3-flash"/);
+    expect(() => loadConfig(root)).toThrow(configFile);
+  });
+
+  it("provider pi does not apply the Claude id check", () => {
+    const root = tmpRoot();
+    writeFileSync(
+      path.join(root, CONFIG_FILE_NAME),
+      JSON.stringify({ agent: { provider: "pi" }, models: { default: "deepseek-v4-pro:0813" } }),
+      "utf8",
+    );
+    expect(loadConfig(root).config.models.default).toBe("deepseek-v4-pro:0813");
+  });
+
+  it("isClaudeModelId accepts claude-* ids and aliases, rejects others", () => {
+    for (const ok of ["claude-sonnet-5-5", "claude-opus-5-5", "sonnet", "opus", "haiku", "opusplan", "sonnet[1m]", "claude-opus-5-5[1m]"]) {
+      expect(isClaudeModelId(ok), ok).toBe(true);
+    }
+    for (const bad of ["deepseek-v4-pro:0813", "glm-5.3-flash", "gpt-5", "", "Sonnet", "claude-"]) {
+      expect(isClaudeModelId(bad), bad).toBe(false);
+    }
   });
 });

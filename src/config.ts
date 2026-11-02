@@ -58,13 +58,14 @@ export const DEFAULT_MODEL = "deepseek-v4-pro:0813";
  * the review gate must not share the implementer's blind spots). Claude is a
  * single model family, so under provider `claude` that invariant degrades to
  * "review is a different model from implement": sonnet runs the
- * default/implement stages and opus runs review. Like the Ollama ids, these
- * are prompt-time/CLI-time strings — a typo surfaces only as a mid-pipeline
- * failure (same as invariant 2 below), and per-stage overrides in
- * factory.config.json win over these defaults exactly as for pi.
+ * default/implement stages and opus runs review. Full ids rather than the
+ * `sonnet`/`opus` aliases so usage.model records exactly what ran. Per-stage
+ * overrides in factory.config.json win over these defaults exactly as for pi;
+ * loadConfig rejects non-Claude ids under provider `claude` (see
+ * isClaudeModelId) so a leftover Ollama id fails at startup, not mid-pipeline.
  */
-export const CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-6";
-export const CLAUDE_DEFAULT_REVIEW_MODEL = "claude-opus-4-8";
+export const CLAUDE_DEFAULT_MODEL = "claude-sonnet-5-5";
+export const CLAUDE_DEFAULT_REVIEW_MODEL = "claude-opus-5-5";
 
 /**
  * Model-selection rationale for the LIVE factory.config.json (2026-10):
@@ -116,6 +117,11 @@ export const DEFAULT_CONFIG: Omit<FactoryConfig, "root"> = {
 export function modelFor(models: StageModels, stage: string): string {
   const override = (models as unknown as Record<string, string | undefined>)[stage];
   return override && override.length > 0 ? override : models.default;
+}
+
+/** A model id Claude Code's `--model` accepts: a `claude-*` id or an alias, optionally `[1m]`-suffixed. */
+export function isClaudeModelId(model: string): boolean {
+  return /^(claude-[a-z0-9.-]+|sonnet|opus|haiku|opusplan)(\[1m\])?$/.test(model);
 }
 
 export const CONFIG_FILE_NAME = "factory.config.json";
@@ -203,6 +209,20 @@ export function loadConfig(rootOverride?: string, cwd: string = process.cwd()): 
   if (!parsed.success) {
     const detail = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
     throw new Error(`invalid factory config ${configFile}: ${detail}`);
+  }
+  if (parsed.data.agent.provider === "claude") {
+    // A config generated under pi (wb init) carries Ollama ids in models.*,
+    // which win over the claude defaults; catch that here.
+    const bad = Object.entries(parsed.data.models)
+      .filter(([, id]) => typeof id === "string" && !isClaudeModelId(id))
+      .map(([stage, id]) => `models.${stage}: "${id}"`);
+    if (bad.length > 0) {
+      throw new Error(
+        `invalid factory config ${configFile}: agent.provider is "claude" but ${bad.join(", ")} ` +
+          `${bad.length === 1 ? "is not a Claude model id" : "are not Claude model ids"} ` +
+          `(use claude-* ids or sonnet/opus/haiku, or remove the entry to use the claude defaults)`,
+      );
+    }
   }
   return { config: parsed.data, root: candidate, configFile };
 }

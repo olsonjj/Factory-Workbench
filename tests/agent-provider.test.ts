@@ -112,10 +112,10 @@ afterEach(() => {
 
 describe("agentFor: provider dispatch", () => {
   it("dispatches to the claude factory with model and env, not to pi", () => {
-    const agent = agentFor("claude", "claude-sonnet-4-6", { ANTHROPIC_API_KEY: "k" });
+    const agent = agentFor("claude", "claude-sonnet-5-5", { ANTHROPIC_API_KEY: "k" });
     expect(agent).toBe(claudeSentinel);
     expect(claudeSpy).toHaveBeenCalledTimes(1);
-    expect(claudeSpy).toHaveBeenCalledWith("claude-sonnet-4-6", { env: { ANTHROPIC_API_KEY: "k" } });
+    expect(claudeSpy).toHaveBeenCalledWith("claude-sonnet-5-5", { env: { ANTHROPIC_API_KEY: "k" } });
     expect(piSpy).not.toHaveBeenCalled();
   });
 
@@ -143,7 +143,7 @@ describe("SandcastleStageRunner.wtRun wiring", () => {
         await (runner as unknown as { wtRun: (o: unknown) => Promise<unknown> }).wtRun({
           wt,
           slug: "claude-item",
-          model: "claude-sonnet-4-6",
+          model: "claude-sonnet-5-5",
           prompt: "p",
         });
       });
@@ -156,7 +156,7 @@ describe("SandcastleStageRunner.wtRun wiring", () => {
         hooks?: { sandbox: { onSandboxReady: unknown[] } };
       };
       expect(arg.agent).toBe(claudeSentinel);
-      expect(claudeSpy).toHaveBeenCalledWith("claude-sonnet-4-6", { env: { ANTHROPIC_API_KEY: "k" } });
+      expect(claudeSpy).toHaveBeenCalledWith("claude-sonnet-5-5", { env: { ANTHROPIC_API_KEY: "k" } });
       expect(piSpy).not.toHaveBeenCalled();
       // NO pi-config mounts for claude (the docker factory got no mounts key).
       expect(arg.sandbox.options).not.toHaveProperty("mounts");

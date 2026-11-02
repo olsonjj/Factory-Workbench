@@ -147,7 +147,7 @@ dc("integration: sandcastle adapter, provider claude (requires docker + sandcast
   beforeAll(() => {
     claudeHarness = createHarness();
     claudeHarness.config.agent.provider = "claude";
-    claudeHarness.config.models = { default: "claude-sonnet-4-6" };
+    claudeHarness.config.models = { default: "claude-sonnet-5-5" };
     claudeHarness.config.sandbox.imageName = "sandcastle:claude";
     claudeRepoDir = mkdtempSync(path.join(os.tmpdir(), "factory-int-claude-repo-"));
     const git = (args: [] | string[]): void => execFileSync("git", args, { cwd: claudeRepoDir });
