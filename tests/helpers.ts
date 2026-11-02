@@ -28,6 +28,7 @@ export function createHarness(budgetOverrides: Partial<FactoryConfig["budgets"]>
   const config: FactoryConfig = {
     root,
     models: { default: "test-model" },
+    agent: { provider: "pi" },
     budgets: {
       maxGateAttempts: 3,
       maxInfraRetries: 3,

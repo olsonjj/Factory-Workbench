@@ -320,6 +320,7 @@ describe("P1-8: lazy staging + dispose", () => {
       const config: FactoryConfig = {
         root,
         models: { default: "m" },
+        agent: { provider: "pi" },
         budgets: { maxGateAttempts: 3, maxInfraRetries: 3, retryBackoffMs: 0 },
         sandbox: { imageName: "sandcastle:local" },
         kb: { maxGlobalChars: 24000, maxProjectChars: 24000 },

@@ -3,21 +3,23 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
 import { z } from "zod";
-import { createWorktree, pi } from "@ai-hero/sandcastle";
+import { createWorktree, pi, claudeCode } from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
-import type { Worktree, RunResult, SandboxHooks } from "@ai-hero/sandcastle";
+import type { Worktree, RunResult, SandboxHooks, AgentProvider } from "@ai-hero/sandcastle";
 
 /** Read a structured-output payload from a run result. */
 function outputOf<T>(result: RunResult): T {
   return (result as unknown as { output: T }).output;
 }
-import { modelFor, type FactoryConfig } from "../config.js";
+import { modelFor, type AgentProviderName, type FactoryConfig } from "../config.js";
 import type { ItemContext, KbSnapshot, StageRequest, StageResult, StageRunner, CuratorRequest, CuratorRunner } from "../types.js";
 
 /**
  * The real StageRunner implementation below the seam: every agent stage runs
- * as `pi` inside a Sandcastle Docker (OrbStack-compatible) sandbox bound to a
- * git worktree of the target repo. Nothing above the seam knows any of this.
+ * a configured agent provider (`agent.provider`: `pi` default, `claude`
+ * supported — see agentFactories/agentFor) inside a Sandcastle Docker
+ * (OrbStack-compatible) sandbox bound to a git worktree of the target repo.
+ * Nothing above the seam knows any of this.
  */
 
 export const TriageVerdict = z.object({
@@ -60,9 +62,10 @@ export class StructuredOutputParseError extends Error {
   }
 }
 
+/** Agent text parsed from the run's stream. sandcastle 0.12's IterationResult
+ *  carries no text; RunResult.stdout is the only stream-derived source. */
 function lastIterationText(result: RunResult): string {
-  const last = [...(result.iterations ?? [])].reverse().find((i) => typeof (i as { result?: unknown }).result === "string");
-  return ((last as { result?: string } | undefined)?.result ?? "");
+  return result.stdout ?? "";
 }
 
 /**
@@ -128,6 +131,17 @@ function extractTagContent(text: string, tag: string): string | undefined {
   return last;
 }
 
+/**
+ * Agents quoting JS template literals inside JSON strings write \` (observed
+ * from Claude on triage and review), which JSON rejects. Drop the backslash
+ * from escapes JSON doesn't define; valid pairs (\\ \" \n \uXXXX …) are
+ * consumed whole, so they are never altered. Only used after a strict parse
+ * has already failed.
+ */
+export function dropInvalidJsonEscapes(text: string): string {
+  return text.replace(/\\([\s\S])/g, (pair, ch: string) => ('"\\/bfnrtu'.includes(ch) ? pair : ch));
+}
+
 export function parseStructured<T>(result: RunResult, tag: string, schema: z.ZodType<T>, agentText?: string): T {
   const raw = extractTagContent(agentText || lastIterationText(result), tag);
   if (raw === undefined) {
@@ -137,7 +151,11 @@ export function parseStructured<T>(result: RunResult, tag: string, schema: z.Zod
   try {
     parsed = JSON.parse(raw.trim());
   } catch (cause) {
-    throw new StructuredOutputParseError(tag, cause);
+    try {
+      parsed = JSON.parse(dropInvalidJsonEscapes(raw.trim()));
+    } catch {
+      throw new StructuredOutputParseError(tag, cause);
+    }
   }
   const check = schema.safeParse(parsed);
   if (!check.success) {
@@ -152,6 +170,30 @@ export function parseStructuredString(result: RunResult, tag: string, agentText?
     throw new StructuredOutputParseError(tag, "tag not found in agent output");
   }
   return raw.trim();
+}
+
+export type AgentProviderFactory = (
+  model: string,
+  options?: { env?: Record<string, string> },
+) => AgentProvider;
+
+/**
+ * The single provider-selection point: wtRun and wtRunScratch both call
+ * agentFor(). Mutable record so tests can swap factories for spies without
+ * vi.mock-ing the whole sandcastle module (which also exports
+ * createWorktree/docker the adapter needs for real).
+ */
+export const agentFactories: Record<AgentProviderName, AgentProviderFactory> = {
+  pi,
+  // No session capture: sandcastle would copy each run's full transcript to
+  // the host's ~/.claude/projects (outside the factory root, never wiped), and
+  // agentText reads the stream, not sessions, under claude.
+  claude: (model, options) => claudeCode(model, { ...options, captureSessions: false }),
+};
+
+/** Build the configured provider's agent for a run (the dispatch point). */
+export function agentFor(provider: AgentProviderName, model: string, env: Record<string, string>): AgentProvider {
+  return agentFactories[provider](model, { env });
 }
 
 const TRUST_BUT_VERIFY =
@@ -188,15 +230,23 @@ export class SandcastleStageRunner implements StageRunner {
   private runStartedAt = 0;
 
   private staging(): PiConfigStage | null {
-    return getPiConfigStage(this.config.root);
+    return piConfigStagingFor(this.config.agent.provider, this.config.root);
   }
 
-  /** Assistant text from the sandboxed pi session, with stream-parse fallback.
-   *  Deliberately NO staged-template fallback for the sessions dir: the
-   *  template never holds sessions (freshAgentDir creates them per run
+  /** Assistant text from the sandboxed agent, with the pi-only stream-parse
+   *  fallback. Deliberately NO staged-template fallback for the sessions dir:
+   *  the template never holds sessions (freshAgentDir creates them per run
    *  copy), so before any run there is nothing session-like to read — the
-   *  stream-parse fallback covers it. */
+   *  stream-parse fallback covers it.
+   *
+   *  Under claude the session-JSONL fallback is skipped entirely: it exists
+   *  for the pi 1.4 stream-format break, and installed sandcastle 0.12
+   *  parses the claude stream natively, so RunResult.stdout (via
+   *  lastIterationText) is authoritative. */
   private agentText(result: RunResult): string | undefined {
+    if (this.config.agent.provider !== "pi") {
+      return lastIterationText(result) || undefined;
+    }
     // Depends on wtRun/wtRunScratch having set sessionsDirOfLastRun.
     if (!this.sessionsDirOfLastRun) return lastIterationText(result) || undefined;
     const text = assistantTextFromSessions(
@@ -305,16 +355,24 @@ export class SandcastleStageRunner implements StageRunner {
 
   private async wtRun(opts: { wt: Worktree; slug: string; model: string; prompt: string }): Promise<RunResult> {
     const { wt, model, prompt } = opts;
-    const staged = this.staging();
-    const npmPrefix = staged ? this.ensureItemNpmPrefix(opts.slug) : null;
-    const agentDir = this.ensureItemAgentDir(opts.slug);
-    const mounts = piConfigMounts(agentDir, npmPrefix);
+    const provider = this.config.agent.provider;
+    const staged = this.staging(); // null under claude
+    // pi-only plumbing is gated on the provider explicitly (not just on
+    // staged-null): under claude neither the npm prefix nor the agent dir is
+    // ever created, so no pi-config mount exists at all.
+    const npmPrefix = provider === "pi" && staged ? this.ensureItemNpmPrefix(opts.slug) : null;
+    const agentDir = provider === "pi" ? this.ensureItemAgentDir(opts.slug) : null;
+    const mounts = provider === "pi" ? piConfigMounts(agentDir!, npmPrefix) : [];
     // Dependency install before the agent starts — Node projects only; see
-    // sandboxReadyHooksFor() for the rationale and the non-Node skip.
+    // sandboxReadyHooksFor() for the rationale and the non-Node skip. Applies
+    // to BOTH providers: a claude implement/test stage needs the worktree's
+    // node_modules exactly like pi does.
     const hooks = sandboxReadyHooksFor(wt.worktreePath);
-    const piEnv = { ...this.env, ...piEnvFor({ npmGlobalPrefixMount: npmPrefix !== null }) };
+    const env = provider === "claude"
+      ? this.env
+      : { ...this.env, ...piEnvFor({ npmGlobalPrefixMount: npmPrefix !== null }) };
     return wt.run({
-      agent: pi(model, { env: piEnv }),
+      agent: agentFor(provider, model, env),
       sandbox: docker({
         imageName: this.config.sandbox.imageName,
         ...(mounts.length > 0 ? { mounts } : {}),
@@ -598,7 +656,7 @@ export class SandcastleCurator implements CuratorRunner {
   }
 
   private staging(): PiConfigStage | null {
-    return getPiConfigStage(this.deps.config.root);
+    return piConfigStagingFor(this.deps.config.agent.provider, this.deps.config.root);
   }
 
   async propose(req: CuratorRequest): Promise<StageResult> {
@@ -657,39 +715,51 @@ Return the full proposal markdown inside a <proposal>...</proposal> tag.
 ${COMPLETE}`;
 
       const startedAt = Date.now();
+      const provider = this.deps.config.agent.provider;
       // Per-run writable agent-dir copy, same shape as the stage runner's
       // (pi must write its settings lock at read time); wiped in the finally
       // below, so nothing the curator run writes survives past the run.
-      const agentDir = path.join(config.root, "pi-config", "agents", "curator");
-      freshAgentDir(this.staging(), agentDir);
+      // Under claude there is no agent-dir staging at all — env is the only
+      // channel (credentials) and the claude stream parses natively, so no
+      // session files need to be read either.
+      let agentDir: string | null = null;
+      if (provider === "pi") {
+        agentDir = path.join(config.root, "pi-config", "agents", "curator");
+        freshAgentDir(this.staging(), agentDir);
+      }
       try {
         const result = await this.wtRunScratch({ scratch, agentDir, model, prompt, mounts });
         const text =
-          assistantTextFromSessions(path.join(agentDir, "sessions"), startedAt) ?? lastIterationText(result);
+          provider === "pi"
+            ? (assistantTextFromSessions(path.join(agentDir!, "sessions"), startedAt) ?? lastIterationText(result))
+            : (lastIterationText(result) || undefined);
         const proposal = parseStructuredString(result, "proposal", text || undefined);
         return { outcome: "pass", artifacts: [{ name: "proposal", content: proposal }] };
       } finally {
         // Same best-effort policy as the runner's dispose wipes: a cleanup
         // failure must not mask a completed curation (a throw in this
         // finally would override the return below).
-        rmRfBestEffort(agentDir);
+        if (agentDir) rmRfBestEffort(agentDir);
       }
     } finally {
       rmRfBestEffort(scratch);
     }
   }
 
-  private async wtRunScratch(opts: { scratch: string; agentDir: string; model: string; prompt: string; mounts: { hostPath: string; sandboxPath: string; readonly: true }[] }): Promise<RunResult> {
+  private async wtRunScratch(opts: { scratch: string; agentDir: string | null; model: string; prompt: string; mounts: { hostPath: string; sandboxPath: string; readonly: true }[] }): Promise<RunResult> {
     const { run } = await import("@ai-hero/sandcastle");
+    const provider = this.deps.config.agent.provider;
     const staged = this.staging();
-    const mounts = piConfigMounts(opts.agentDir, staged?.npmGlobalPrefixBase ?? null, "curator");
-    const env = { ...(this.deps.env ?? {}), ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefixBase }) };
+    const mounts = provider === "pi" ? piConfigMounts(opts.agentDir!, staged?.npmGlobalPrefixBase ?? null, "curator") : [];
+    const env = provider === "claude"
+      ? { ...(this.deps.env ?? {}) }
+      : { ...(this.deps.env ?? {}), ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefixBase }) };
     // Deliberately NO hooks.sandbox.onSandboxReady here (unlike wtRun): the
     // scratch cwd has no package.json (it only hosts read-only KB mounts), so
     // an npm install would fail and abort the run. Skipping is the designed
     // behavior — scratch runs make no code changes that need dependencies.
     return run({
-      agent: pi(opts.model, { env }),
+      agent: agentFor(provider, opts.model, env),
       sandbox: docker({
         imageName: this.deps.config.sandbox.imageName,
         mounts: [...mounts, ...opts.mounts],
@@ -740,6 +810,34 @@ export function ollamaEnv(): Record<string, string> {
     if (process.env[key]) env[key] = process.env[key]!;
   }
   return env;
+}
+
+/**
+ * Claude Code auth passthrough: ONLY the API-key/token vars forward, and the
+ * two are alternatives — whichever is set is used; neither is required at
+ * startup (a missing credential surfaces at agent-run time, mirroring
+ * ollamaEnv's behavior for OLLAMA_API_KEY).
+ *
+ * Deliberately provider-exclusive (same rationale as ollamaEnv): a `claude`
+ * run never receives OLLAMA_API_KEY, and a `pi` run never receives
+ * ANTHROPIC_API_KEY — a compromised stage must not read credentials
+ * unrelated to its own runtime. ANTHROPIC_BASE_URL is deliberately NOT
+ * forwarded either: passing a host endpoint through would let a compromised
+ * stage redirect model traffic to an attacker-chosen host (the same
+ * redirect-attack reasoning as OLLAMA_HOST in ollamaEnv). If a future config
+ * needs a custom endpoint, that is an explicit follow-up.
+ */
+export function claudeEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]) {
+    if (process.env[key]) env[key] = process.env[key]!;
+  }
+  return env;
+}
+
+/** Provider-aware credential passthrough for the CLI construction site. */
+export function agentEnvFor(config: Pick<FactoryConfig, "agent">): Record<string, string> {
+  return config.agent.provider === "claude" ? claudeEnv() : ollamaEnv();
 }
 
 /**
@@ -1078,6 +1176,21 @@ export function getPiConfigStage(factoryRoot: string): PiConfigStage | null {
   const fresh = preparePiConfigDir(factoryRoot);
   piConfigCache.set(factoryRoot, fresh);
   return fresh;
+}
+
+/** Only pi consumes the staged pi-config (agent-dir mounts, npm prefix);
+ *  claude runs purely on env injection. Exported for tests. */
+export function needsPiConfigStaging(provider: AgentProviderName): boolean {
+  return provider === "pi";
+}
+
+/**
+ * Same caching/path behavior as getPiConfigStage, but a no-op under claude:
+ * returns null WITHOUT calling getPiConfigStage (which has filesystem/npm
+ * side effects) and without touching the piConfigCache. Exported for tests.
+ */
+export function piConfigStagingFor(provider: AgentProviderName, factoryRoot: string): PiConfigStage | null {
+  return needsPiConfigStaging(provider) ? getPiConfigStage(factoryRoot) : null;
 }
 
 function realRepoPath(repo: string): string {

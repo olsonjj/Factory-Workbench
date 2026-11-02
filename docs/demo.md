@@ -3,8 +3,11 @@
 Prerequisites:
 
 - Docker (OrbStack or Docker Desktop) running, with the sandbox image built:
-  `npx sandcastle docker build-image`
-- `OLLAMA_API_KEY` exported on the host (Ollama Cloud)
+  `npx sandcastle docker build-image` (default pi provider; for
+  `agent.provider: "claude"` build the claude image instead — see README
+  "Choosing the agent provider")
+- `OLLAMA_API_KEY` exported on the host (Ollama Cloud) — or, for provider
+  `claude`, `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`
 - `gh` pre-authenticated (`gh auth status`)
 - A GitHub-hosted target repo you are allowed to push to, cloned locally
 
