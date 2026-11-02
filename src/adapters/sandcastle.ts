@@ -62,9 +62,10 @@ export class StructuredOutputParseError extends Error {
   }
 }
 
+/** Agent text parsed from the run's stream. sandcastle 0.12's IterationResult
+ *  carries no text; RunResult.stdout is the only stream-derived source. */
 function lastIterationText(result: RunResult): string {
-  const last = [...(result.iterations ?? [])].reverse().find((i) => typeof (i as { result?: unknown }).result === "string");
-  return ((last as { result?: string } | undefined)?.result ?? "");
+  return result.stdout ?? "";
 }
 
 /**
@@ -222,8 +223,8 @@ export class SandcastleStageRunner implements StageRunner {
    *
    *  Under claude the session-JSONL fallback is skipped entirely: it exists
    *  for the pi 1.4 stream-format break, and installed sandcastle 0.12
-   *  parses the claude stream natively, so lastIterationText is
-   *  authoritative. */
+   *  parses the claude stream natively, so RunResult.stdout (via
+   *  lastIterationText) is authoritative. */
   private agentText(result: RunResult): string | undefined {
     if (this.config.agent.provider !== "pi") {
       return lastIterationText(result) || undefined;

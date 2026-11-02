@@ -67,7 +67,7 @@ function fakeWorktree(): { wt: Worktree; run: ReturnType<typeof vi.fn>; dir: str
   // which both providers must keep receiving in worktree stages.
   fs.writeFileSync(path.join(dir, "package.json"), '{ "name": "wt" }');
   const run = vi.fn(async () => ({
-    iterations: [{ result: '<triage>{"outcome":"proceed","report":"r"}</triage>' }],
+    iterations: [{}], stdout: '<triage>{"outcome":"proceed","report":"r"}</triage>',
   }));
   const wt = { worktreePath: dir, run } as unknown as Worktree;
   return { wt, run, dir };
@@ -224,7 +224,7 @@ describe("SandcastleCurator provider wiring", () => {
 
   it("claude: no agent-dir staging, no pi mount, stream text is authoritative", async () => {
     runMock.mockResolvedValue({
-      iterations: [{ result: "<proposal>claude proposal</proposal>" }],
+      iterations: [{}], stdout: "<proposal>claude proposal</proposal>",
     });
     const root = tmpRoot();
     const curator = new SandcastleCurator({
@@ -252,7 +252,7 @@ describe("SandcastleCurator provider wiring", () => {
 
   it("pi: agent-dir staged and mounted, sessions fallback path intact", async () => {
     runMock.mockResolvedValue({
-      iterations: [{ result: "" }], // stream text empty → sessions fallback
+      iterations: [{}], stdout: "", // stream text empty → sessions fallback
     });
     const root = tmpRoot();
     const curator = new SandcastleCurator({
@@ -270,7 +270,7 @@ describe("SandcastleCurator provider wiring", () => {
         message: { role: "assistant", content: [{ type: "text", text: "<proposal>pi proposal</proposal>" }] },
       });
       fs.writeFileSync(path.join(sessions, "s.jsonl"), `${line}\n`);
-      return { iterations: [{ result: "" }] };
+      return { iterations: [{}], stdout: "" };
     });
     const result = await withSeededPiHome(async () => curator.propose(req));
     expect(result.outcome).toBe("pass");
