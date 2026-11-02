@@ -215,6 +215,13 @@ describe("SandcastleStageRunner.wtRun wiring", () => {
   });
 });
 
+describe("claude provider factory", () => {
+  it("disables sandcastle session capture so no transcripts land in host ~/.claude/projects", () => {
+    const agent = originalFactories.claude!("m", { env: {} }) as unknown as { captureSessions: boolean };
+    expect(agent.captureSessions).toBe(false);
+  });
+});
+
 describe("SandcastleCurator provider wiring", () => {
   const curatorRequest = (): CuratorRequest => ({
     projects: [],
@@ -298,7 +305,11 @@ describe("credential env passthrough", () => {
 
   beforeEach(() => {
     saved = {};
-    for (const key of KEYS) saved[key] = process.env[key];
+    for (const key of KEYS) {
+      saved[key] = process.env[key];
+      // Start clean: a developer's real exported credentials must not leak in.
+      delete process.env[key];
+    }
   });
 
   afterEach(() => {

@@ -170,7 +170,10 @@ export type AgentProviderFactory = (
  */
 export const agentFactories: Record<AgentProviderName, AgentProviderFactory> = {
   pi,
-  claude: (model, options) => claudeCode(model, options),
+  // No session capture: sandcastle would copy each run's full transcript to
+  // the host's ~/.claude/projects (outside the factory root, never wiped), and
+  // agentText reads the stream, not sessions, under claude.
+  claude: (model, options) => claudeCode(model, { ...options, captureSessions: false }),
 };
 
 /** Build the configured provider's agent for a run (the dispatch point). */
