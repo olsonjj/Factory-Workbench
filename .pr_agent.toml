@@ -1,0 +1,21 @@
+# PR-Agent review config for Factory-Workbench
+# Placed at repo root; loaded automatically on every PR.
+# Lessons below are distilled from factory/kb/projects/factory-1.md gate history.
+
+[pr_reviewer]
+require_tests_review = true
+require_security_scan = true
+extra_instructions = """
+Repo: Factory-Workbench (TypeScript, vitest, tsc). Specs live in specs/*.md and
+are the durable source of truth — a change to a spec-governed feature's behavior
+without a same-commit spec update is a review blocker, even if code and tests pass.
+- Interpreted-language string sinks (osascript/AppleScript, etc.): argv only
+  prevents shell injection; verify escaping for the interpreter that finally
+  consumes the string.
+- native deps (better-sqlite3) are platform-ABI-bound: never mount/symlink host
+  node_modules into sandboxed code paths.
+- Changes to src/adapters/*: note that gated docker+OLLAMA integration tests do
+  not run in CI — "tests pass" alone is insufficient for adapter changes.
+- Verify security rationale in comments/specs against the actual injection
+  surface; passing tests can legitimize a false premise.
+"""
