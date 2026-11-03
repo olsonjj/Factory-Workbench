@@ -9,7 +9,23 @@ import {
   claim,
   type TestHarness,
 } from "../helpers.js";
+import { 
+  createWorktree,
+  type Worktree,
+} from "@ai-hero/sandcastle";
 import { SandcastleStageRunner, GhPrPublisher, ollamaEnv, claudeEnv } from "../../src/adapters/sandcastle.js";
+
+/** Same realpath normalization the adapter does (realRepoPath is private):
+ *  on macOS /var, /tmp and friends are symlinks — sandcastle mounts the parent
+ *  .git at the literal path it is given, so an unnormalized temp dir leaves
+ *  the in-container gitdir chain dangling. */
+const realRepo = (repo: string): string => {
+  try {
+    return fs.realpathSync(repo);
+  } catch {
+    return repo;
+  }
+};
 import { loadConfig } from "../../src/config.js";
 
 /**
@@ -127,6 +143,98 @@ d("integration: sandcastle adapter (requires docker + OLLAMA_API_KEY)", () => {
     // the agent must surface the repo's actual evidence rather than parroting jest
     expect(spec).toMatch(/vitest|node|package\.json|not jest/);
   }, 300_000);
+
+  it("review runs both review.gates in a real sandbox: per-gate model override reaches the provider, pass case keeps combined review-verdict (ticket 11, PR-Agent PR #21 focus area)", async () => {
+    const { config } = loadConfig(undefined, harness.root);
+    config.review = { gates: [{ name: "quality" }, { name: "performance", model: "deepseek-v4.1-flash:1017" }] };
+    const runner = new SandcastleStageRunner({ config, env: ollamaEnv() });
+    // Real worktree, injected into the adapter's map so runStage uses it; the
+    // branch starts at base with a deliberately clean commit so the diff is
+    // reviewable but trivially defect-free.
+    const cleanWt = await createWorktree({
+      cwd: realRepo(repoDir),
+      branchStrategy: { type: "branch", branch: "factory/int-review-clean", baseBranch: "main" },
+    });
+    (runner as unknown as { worktrees: Map<string, Worktree> }).worktrees.set("int-review-clean", cleanWt as unknown as Worktree);
+    const wtPath = (cleanWt as unknown as { worktreePath: string }).worktreePath;
+    // A real, non-empty, defect-free change: an empty diff gets legitimately
+    // failed by the reviewer ("nothing to deliver") — observed live.
+    fs.mkdirSync(path.join(wtPath, "src"), { recursive: true });
+    fs.writeFileSync(
+      path.join(wtPath, "src", "hello.js"),
+      ["/** Pure, allocation-light helpers used by the test fixture. */", "function sum(numbers) {", "  let total = 0;", "  for (let i = 0; i < numbers.length; i++) total += numbers[i];", "  return total;", "}", "module.exports = { sum };"].join("\n"),
+    );
+    execFileSync("git", ["-C", wtPath, "add", "src/hello.js"], {});
+    execFileSync("git", ["-C", wtPath, "-c", "user.name=wb", "-c", "user.email=wb@factory.workbench", "commit", "-qm", "add clean sum helper"], {});
+    const result = await runner.runStage({
+      stage: "review",
+      item: { id: 2, slug: "int-review-clean", title: "Clean change", repo: repoDir, base: "main", approvals: [], body: "Empty change on a clean branch.", branchName: "factory/int-review-clean" },
+      kb: { global: "", project: "" },
+    });
+    // The wiring under test: BOTH gates ran inside the real sandbox, the
+    // per-gate model override resolved to its configured id, and the combined
+    // artifact kept the PR-body surface name. The verdict itself is
+    // model-dependent; a clean diff should pass, but either way the multi-gate
+    // artifacts are what this asserts (a gate-fail still saves per-gate verdicts).
+    expect(result.usage?.profiles).toEqual([
+      { name: "quality", model: config.models.review ?? config.models.default },
+      { name: "performance", model: "deepseek-v4.1-flash:1017" },
+    ]);
+    const names = result.artifacts.map((a) => a.name);
+    expect(names).toContain("review-verdict:quality");
+    if (result.outcome === "pass") {
+      expect(names).toContain("review-verdict:performance");
+      expect(names).toContain("review-verdict");
+      const combined = result.artifacts.find((a) => a.name === "review-verdict")!.content;
+      expect(combined).toContain("performance");
+    } else {
+      expect(result.outcome).toBe("gate-fail"); // tolerable model judgment on a clean diff
+    }
+  }, 600_000);
+
+  it("review fail-fast end-to-end in a real sandbox: an obvious perf defect fails a gate with profile-named feedback (ticket 11)", async () => {
+    const { config } = loadConfig(undefined, harness.root);
+    config.review = { gates: [{ name: "quality" }, { name: "performance", model: "deepseek-v4.1-flash:1017" }] };
+    const runner = new SandcastleStageRunner({ config, env: ollamaEnv() });
+    const flawWt = await createWorktree({
+      cwd: realRepo(repoDir),
+      branchStrategy: { type: "branch", branch: "factory/int-review-flaw", baseBranch: "main" },
+    });
+    const flawRunner = runner as unknown as { worktrees: Map<string, Worktree> };
+    flawRunner.worktrees.set("int-review-flaw", flawWt as unknown as Worktree);
+    const flawPath = (flawWt as unknown as { worktreePath: string }).worktreePath;
+    fs.writeFileSync(
+      path.join(flawPath, "flaw.js"),
+      [
+        "// Deliberately reviewable defect: sync I/O inside a tight loop.",
+        "const fs = require('node:fs');",
+        "module.exports.countWords = function countWords(lines) {",
+        "  let n = 0;",
+        "  for (const line of lines) {",
+        "    // reads the whole file (and the disk) once per line",
+        "    const text = fs.readFileSync('/etc/hostname', 'utf8');",
+        "    n += line.split(text.trim()).length - 1;",
+        "  }",
+        "  return n;",
+        "};",
+      ].join("\n"),
+    );
+    execFileSync("git", ["-C", flawPath, "add", "flaw.js"], {});
+    execFileSync("git", ["-C", flawPath, "-c", "user.name=wb", "-c", "user.email=wb@factory.workbench", "commit", "-qm", "add countWords with a per-line sync read"], {});
+    const result = await runner.runStage({
+      stage: "review",
+      item: { id: 3, slug: "int-review-flaw", title: "Perf-flawed change", repo: repoDir, base: "main", approvals: [], body: "Adds countWords with a sync read inside the loop.", branchName: "factory/int-review-flaw" },
+      kb: { global: "", project: "" },
+    });
+    // The perf lens exists to catch exactly this; a fail is the expected honest
+    // verdict. Either way the fail-fast mechanics are visible: the failed
+    // gate's per-gate artifact exists and the gate name rides the feedback.
+    expect(result.outcome).toBe("gate-fail");
+    const failedArtifact = result.artifacts.find((a) => a.name.startsWith("review-verdict:"));
+    expect(failedArtifact).toBeDefined();
+    expect(result.feedback ?? "").toMatch(/performance|quality/);
+    expect(result.artifacts.map((a) => a.name)).not.toContain("review-verdict"); // no combined verdict on a failed round
+  }, 600_000);
 });
 
 describe("adapter environment gating", () => {
