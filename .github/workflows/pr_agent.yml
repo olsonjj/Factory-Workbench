@@ -29,5 +29,8 @@ jobs:
           OPENAI__KEY: ${{ secrets.OLLAMA_API_KEY }}
 
           # --- Model config ---
-          CONFIG__MODEL: openai/qwen3-coder:480b-cloud
+          CONFIG__MODEL: openai/glm-5.3-flash:cloud
+          # avoid falling back to OpenAI's default model, which we don't have
+          # a key for (must differ from CONFIG__MODEL)
+          CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: '128000'
