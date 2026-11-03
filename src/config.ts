@@ -1,6 +1,7 @@
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
+import type { StageUsage } from "./types.js";
 
 export interface StageModels {
   default: string;
@@ -40,10 +41,36 @@ export interface AgentConfig {
   provider: AgentProviderName;
 }
 
+/** One sequential review gate (ticket 11). Prompt text is built into the
+ *  adapter per gate name; the gate's extraInstructions are appended verbatim. */
+export interface ReviewGate {
+  /** Unique profile name; built-in lenses exist for "quality" and "performance",
+   *  unknown names get a generic lens paragraph (custom names stay legal). */
+  name: string;
+  /** Model id for this gate; defaults to models.review, then models.default. */
+  model?: string;
+  /** Appended verbatim to the gate's built-in prompt — the KB-lesson channel. */
+  extraInstructions?: string;
+}
+
+/** Review-stage profile set. Absent ⇒ one implicit "quality" gate on
+ *  models.review (byte-identical to pre-ticket-11 behavior). */
+export interface ReviewConfig {
+  gates: ReviewGate[];
+}
+
+export interface ReviewGateProfile {
+  name: string;
+  model: string;
+  extraInstructions?: string;
+}
+
 export interface FactoryConfig {
   /** Factory root directory (self-contained, movable). */
   root: string;
   models: StageModels;
+  /** Multi-profile review gates (ticket 11). Absent = single quality gate. */
+  review?: ReviewConfig;
   agent: AgentConfig;
   budgets: Budgets;
   sandbox: SandboxConfig;
@@ -119,6 +146,31 @@ export function modelFor(models: StageModels, stage: string): string {
   return override && override.length > 0 ? override : models.default;
 }
 
+/** Resolved review-gate profiles for an item run (ticket 11): name + model +
+ *  prompt addendum per gate, in config order. No review key ⇒ single implicit
+ *  "quality" gate on models.review — byte-identical legacy behavior. */
+export function reviewGateProfiles(config: FactoryConfig): ReviewGateProfile[] {
+  const fallback = modelFor(config.models, "review");
+  if (!config.review) return [{ name: "quality", model: fallback }];
+  return config.review.gates.map((gate) => ({
+    name: gate.name,
+    model: gate.model && gate.model.length > 0 ? gate.model : fallback,
+    ...(gate.extraInstructions ? { extraInstructions: gate.extraInstructions } : {}),
+  }));
+}
+
+/** StageUsage for a review stage run: profile attribution appears only when
+ *  more than one gate ran (single-gate runs keep the legacy usage shape). */
+export function reviewUsage(config: FactoryConfig): StageUsage {
+  const profiles = reviewGateProfiles(config);
+  return profiles.length > 1
+    ? {
+        model: profiles[0]!.model,
+        profiles: profiles.map(({ name, model }) => ({ name, model })),
+      }
+    : { model: profiles[0]!.model };
+}
+
 /** A model id Claude Code's `--model` accepts: a `claude-*` id or an alias, optionally `[1m]`-suffixed. */
 export function isClaudeModelId(model: string): boolean {
   return /^(claude-[a-z0-9.-]+|sonnet|opus|haiku|opusplan)(\[1m\])?$/.test(model);
@@ -143,6 +195,19 @@ const configSchema = z.object({
     review: z.string().min(1).optional(),
     curate: z.string().min(1).optional(),
   }),
+  review: z
+    .object({
+      gates: z
+        .array(
+          z.object({
+            name: z.string().min(1),
+            model: z.string().min(1).optional(),
+            extraInstructions: z.string().min(1).optional(),
+          }),
+        )
+        .min(1),
+    })
+    .optional(),
   budgets: z.object({
     maxGateAttempts: z.number().int().positive(),
     // nonnegative (not positive): 0 is a legitimate way to disable automatic
@@ -191,6 +256,7 @@ export function loadConfig(rootOverride?: string, cwd: string = process.cwd()): 
         : DEFAULT_CONFIG.models),
       ...(raw.models ?? {}),
     },
+    ...(raw.review ? { review: raw.review } : {}),
     agent: { provider },
     budgets: {
       ...DEFAULT_CONFIG.budgets,
@@ -210,12 +276,28 @@ export function loadConfig(rootOverride?: string, cwd: string = process.cwd()): 
     const detail = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
     throw new Error(`invalid factory config ${configFile}: ${detail}`);
   }
+  if (parsed.data.review) {
+    const names = parsed.data.review.gates.map((gate) => gate.name);
+    const dupes = names.filter((n, i) => names.indexOf(n) !== i);
+    if (dupes.length > 0) {
+      throw new Error(
+        `invalid factory config ${configFile}: duplicate review gate name${dupes.length === 1 ? "" : "s"}: ` +
+          `${[...new Set(dupes)].join(", ")}`,
+      );
+    }
+  }
   if (parsed.data.agent.provider === "claude") {
     // A config generated under pi (wb init) carries Ollama ids in models.*,
-    // which win over the claude defaults; catch that here.
-    const bad = Object.entries(parsed.data.models)
+    // which win over the claude defaults; catch that here — and the same for
+    // explicit per-gate review models.
+    const bad = (
+      Object.entries(parsed.data.models) as [string, string | undefined][]
+    )
       .filter(([, id]) => typeof id === "string" && !isClaudeModelId(id))
       .map(([stage, id]) => `models.${stage}: "${id}"`);
+    for (const [i, gate] of (parsed.data.review?.gates ?? []).entries()) {
+      if (gate.model && !isClaudeModelId(gate.model)) bad.push(`review.gates[${i}].model: "${gate.model}"`);
+    }
     if (bad.length > 0) {
       throw new Error(
         `invalid factory config ${configFile}: agent.provider is "claude" but ${bad.join(", ")} ` +

@@ -38,6 +38,9 @@ export interface StageUsage {
   model: string;
   inputTokens?: number;
   outputTokens?: number;
+  /** Per-gate model attribution, present only for multi-gate review runs
+   *  (ticket 11). `model` above is always the FIRST gate's model. */
+  profiles?: { name: string; model: string }[];
 }
 
 export interface StageResult {

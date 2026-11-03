@@ -218,6 +218,30 @@ setup, whose models are Ollama Cloud ids)
   stage's writes persist on host disk only until that item's next stage
   run replaces the copy) — the pi agent dir cannot be read-only since pi
   writes its settings lock at read time. `gh` must be pre-authenticated.
+- Review profiles (ticket 11): the review stage can run multiple
+  sequential gates, each with its own lens and optional model override:
+
+  ```json
+  "review": { "gates": [
+    { "name": "quality" },
+    { "name": "performance", "model": "deepseek-v4.1-flash-1017" }
+  ] }
+  ```
+
+  Gates run in config order and fail fast — the first failing gate stops
+  the round and its reasons rework to implement under the existing
+  `maxGateAttempts` budget (shared across review gates; budgeting the
+  item, not the lens). Built-in lenses: `quality` (code quality, security,
+  best practices — today's single-gate prompt) and `performance`
+  (allocations in hot paths, SQLite prepared-statement reuse / queries in
+  loops / transaction scope, sync I/O, redundant rescans). Unknown gate
+  names are legal and fall back to a generic lens — orient them via the
+  per-gate `extraInstructions`, which is also the channel for KB lessons
+  (keep it tight; it rides every review prompt). Omitting the `review`
+  key gives exactly today's single quality gate. Per-gate verdicts are
+  saved as `review-verdict:<name>` artifacts; a combined `review-verdict`
+  covers the PR body surface as before. Per-gate model attribution rides
+  `usage.profiles`.
 
 ### Choosing the agent provider
 
@@ -244,7 +268,8 @@ model FAMILY from implement" (ticket 06); under `claude` (single family) it
 degrades to "review is a different model from implement" — sonnet runs the
 default/implement stages, opus runs review. Per-stage overrides work exactly
 as for pi; rationale lives in `src/config.ts` next to
-`CLAUDE_DEFAULT_MODEL`. Under `claude`, every `models.*` entry must be a
+`CLAUDE_DEFAULT_MODEL`. Under `claude`, every `models.*` entry — and any
+explicit `review.gates[].model` — must be a
 `claude-*` id or a Claude Code alias (`sonnet` / `opus` / `haiku`), checked
 at startup — so switching a `wb init`-generated config (which carries Ollama
 ids) to `claude` means replacing or removing its `models` entries too.

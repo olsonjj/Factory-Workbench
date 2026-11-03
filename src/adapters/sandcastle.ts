@@ -11,8 +11,8 @@ import type { Worktree, RunResult, SandboxHooks, AgentProvider } from "@ai-hero/
 function outputOf<T>(result: RunResult): T {
   return (result as unknown as { output: T }).output;
 }
-import { modelFor, type AgentProviderName, type FactoryConfig } from "../config.js";
-import type { ItemContext, KbSnapshot, StageRequest, StageResult, StageRunner, CuratorRequest, CuratorRunner } from "../types.js";
+import { modelFor, reviewGateProfiles, reviewUsage, type AgentProviderName, type FactoryConfig, type ReviewGateProfile } from "../config.js";
+import type { ItemContext, KbSnapshot, StageArtifact, StageRequest, StageResult, StageRunner, CuratorRequest, CuratorRunner } from "../types.js";
 
 /**
  * The real StageRunner implementation below the seam: every agent stage runs
@@ -269,7 +269,10 @@ export class SandcastleStageRunner implements StageRunner {
     const model = modelFor(this.config.models, req.stage);
     const wt = await this.worktreeFor(req.item);
     const result = await this.dispatch(req, model, wt);
-    return { ...result, durationMs: Date.now() - started, usage: { model } };
+    // Review-stage usage carries per-gate model attribution for multi-gate
+    // runs (ticket 11); every other stage keeps the single-model shape.
+    const usage = req.stage === "review" ? reviewUsage(this.config) : { model };
+    return { ...result, durationMs: Date.now() - started, usage };
   }
 
   private async dispatch(req: StageRequest, model: string, wt: Worktree): Promise<StageResult> {
@@ -517,30 +520,70 @@ Return your verdict as JSON inside a <test>...</test> tag:
     return { outcome: "pass", artifacts: [{ name: "test-report", content: v.report }], fix: v.fix ?? undefined };
   }
 
-  private async runReview(req: StageRequest, model: string, wt: Worktree): Promise<StageResult> {
-    const prompt = `You are the review gate of a software factory. Review the changes on this branch against ${JSON.stringify(req.item.base)} for:
-1. Code quality
-2. Security (input validation, injection, secrets, auth)
-3. Best practices for this codebase
+  private async runReview(req: StageRequest, _model: string, wt: Worktree): Promise<StageResult> {
+    const profiles = reviewGateProfiles(this.config);
+    // Single-gate configs (including the implicit default): byte-identical
+    // legacy behavior — one invocation, one `review-verdict` artifact.
+    if (profiles.length === 1) {
+      return this.runReviewGate(req, profiles[0]!, wt, { artifactName: "review-verdict", singleGate: true, header: false });
+    }
+    // Multi-gate (ticket 11): sequential, fail fast — a failing lens stops the
+    // round, because later profiles cannot change the round's outcome anyway.
+    const gateArtifacts: StageArtifact[] = [];
+    const passNotes: string[] = [];
+    let prSummary: string | undefined;
+    for (const profile of profiles) {
+      const gate = await this.runReviewGate(req, profile, wt, {
+        artifactName: `review-verdict:${profile.name}`,
+        singleGate: false,
+        header: true,
+      });
+      if (gate.outcome === "gate-fail") {
+        const firstFail = profiles.findIndex((p) => p.name === profile.name) === 0;
+        const report =
+          (firstFail ? "" : "earlier gates passed, then ") + `review gate '${profile.name}' failed`;
+        const verdictContent = gate.artifacts[0]?.content ?? "";
+        return {
+          outcome: "gate-fail",
+          artifacts: [...gateArtifacts, ...gate.artifacts],
+          report: verdictContent ? [report, verdictContent].join("\n\n") : report,
+          feedback: `[review gate '${profile.name}' failed] ${gate.feedback ?? verdictContent}`,
+          lesson: gate.lesson,
+          fix: gate.fix,
+        };
+      }
+      gateArtifacts.push(...gate.artifacts);
+      passNotes.push(`## review gate '${profile.name}' — pass\n\n${gate.artifacts[0]?.content ?? "(no findings)"}`);
+      prSummary = gate.prSummary ?? prSummary;
+    }
+    const combined = `# review — ${profiles.length} gates: ${profiles.map((p) => p.name).join(", ")}\n\n${passNotes.join("\n\n")}`;
+    return {
+      outcome: "pass",
+      artifacts: [...gateArtifacts, { name: "review-verdict", content: combined }],
+      prSummary,
+    };
+  }
 
-Run \`git diff ${req.item.base}...HEAD\` to see the merged diff. Read surrounding code as needed.
-
-${TRUST_BUT_VERIFY}
-
-Return your verdict as JSON inside a <review>...</review> tag:
-- verdict: "pass" | "fail"
-- findings: your review notes (required, this is the audit-trail artifact)
-- lesson: only when you fail — what went wrong, as a durable lesson for future runs
-- fix: only when you fail — concrete fix instructions for the implementer
-- prSummary: one line summarizing the outcome of the whole pipeline for this item`;
-
-    const result = await this.wtRun({ wt, slug: req.item.slug, model, prompt });
+  /** One review-gate agent invocation for the given profile. `singleGate`
+   *  produces the legacy prompt byte-for-byte; multi-gate prompts carry the
+   *  profile name and (when configured) the gate's extraInstructions. */
+  private async runReviewGate(
+    req: StageRequest,
+    profile: ReviewGateProfile,
+    wt: Worktree,
+    opts: { artifactName: string; singleGate: boolean; header: boolean },
+  ): Promise<StageResult> {
+    const prompt = this.reviewPrompt(req, profile, opts.singleGate);
+    const result = await this.wtRun({ wt, slug: req.item.slug, model: profile.model, prompt });
     const v = parseStructured(result, "review", ReviewVerdict, this.agentText(result));
+    const content = opts.header
+      ? `# review gate '${profile.name}': ${v.verdict}\n\n${v.findings}`
+      : v.findings;
     if (v.verdict === "fail") {
       return {
         outcome: "gate-fail",
-        artifacts: [{ name: "review-verdict", content: v.findings }],
-        report: v.findings,
+        artifacts: [{ name: opts.artifactName, content }],
+        report: content,
         feedback: v.fix ?? v.findings,
         lesson: v.lesson ?? v.findings,
         fix: v.fix ?? undefined,
@@ -548,9 +591,44 @@ Return your verdict as JSON inside a <review>...</review> tag:
     }
     return {
       outcome: "pass",
-      artifacts: [{ name: "review-verdict", content: v.findings }],
+      artifacts: [{ name: opts.artifactName, content }],
       prSummary: v.prSummary ?? undefined,
     };
+  }
+
+  /** The review lens axes for a gate name. "quality" is the pre-ticket-11
+   *  lens; "performance" is the Workbench-specific lens (ticket 11); unknown
+   *  gate names are legal and ride the generic lens + extraInstructions. */
+  private reviewGateAxes(name: string): string {
+    if (name === "performance") {
+      return [
+        "1. Performance: allocations in hot paths, per-event/per-tick work, unbounded memory or file growth",
+        "2. Data access: better-sqlite3 prepared-statement reuse, queries inside loops, transaction scope (batch heavy work inside one transaction)",
+        "3. I/O: synchronous work on the host event loop, redundant full-reads/rescans (inbox scanning, KB loading, watch change detection)",
+        "4. Ignore style preferences unless they are a concrete performance defect with a realistic trigger; be certain before flagging, or say what remains uncertain",
+      ].join("\n");
+    }
+    const base = "1. Code quality\n2. Security (input validation, injection, secrets, auth)\n3. Best practices for this codebase";
+    return name === "quality" ? base : `${base}\n4. The '${name}' review lens: focus findings through it, guided by the extra instructions below (if none are given, judge it as general code quality)`;
+  }
+
+  private reviewPrompt(req: StageRequest, profile: ReviewGateProfile, singleGate: boolean): string {
+    const role = singleGate
+      ? "You are the review gate of a software factory."
+      : `You are the '${profile.name}' review gate of a software factory (multi-gate review).`;
+    return `${role} Review the changes on this branch against ${JSON.stringify(req.item.base)} for:
+${this.reviewGateAxes(profile.name)}
+
+Run \`git diff ${req.item.base}...HEAD\` to see the merged diff. Read surrounding code as needed.
+
+${TRUST_BUT_VERIFY}${profile.extraInstructions ? `\nExtra instructions:\n${profile.extraInstructions}\n` : ""}
+
+Return your verdict as JSON inside a <review>...</review> tag:
+- verdict: "pass" | "fail"
+- findings: your review notes (required, this is the audit-trail artifact)
+- lesson: only when you fail — what went wrong, as a durable lesson for future runs
+- fix: only when you fail — concrete fix instructions for the implementer
+- prSummary: one line summarizing the outcome of the whole pipeline for this item`;
   }
 
   /** Release worktrees on process end; branches and commits survive. */

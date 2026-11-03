@@ -24,14 +24,14 @@
 
 **Blocked by:** 06: Test stage + review gate + real rework loop (done).
 
-**Status:** in progress
+**Status:** in progress (PR pending review)
 
-- [ ] Config schema + resolution: default single "quality" profile equals `models.review`; explicit gates resolve models and are validated (duplicates/empty rejected)
-- [ ] Scenario test: two-gate review runs both prompts in order (quality then performance) and saves `review-verdict` + `review-verdict:performance` artifacts on pass
-- [ ] Scenario test: performance gate failing short-circuits, names the profile in feedback, routes rework to implement, and does not run later profiles
-- [ ] Scenario test: the default (no `review` key) path is byte-identical in behavior — one agent invocation, unchanged prompt text, unchanged artifact name
-- [ ] Scenario test: `extraInstructions` from config reach the review prompt
-- [ ] Usage records `profiles` for multi-gate review runs and stays unchanged for single-gate
-- [ ] Live config (`factory/factory.config.json`) gains the two-gate review section
-- [ ] README config section documents `review.gates`
-- [ ] Full suite green + tsc clean
+- [x] Config schema + resolution: default single "quality" profile equals `models.review`; explicit gates resolve models and are validated (duplicates/empty rejected)
+- [x] Scenario test: two-gate review runs both prompts in order (quality then performance) and saves `review-verdict` + `review-verdict:performance` artifacts on pass
+- [x] Scenario test: performance gate failing short-circuits, names the profile in feedback, routes rework to implement, and does not run later profiles
+- [x] Scenario test: the default (no `review` key) path is byte-identical in behavior — one agent invocation, unchanged prompt text, unchanged artifact name
+- [x] Scenario test: `extraInstructions` from config reach the review prompt
+- [x] Usage records `profiles` for multi-gate review runs and stays unchanged for single-gate
+- [x] Live config (`factory/factory.config.json`) gains the two-gate review section
+- [x] README config section documents `review.gates`
+- [x] Full suite green + tsc clean
