@@ -212,8 +212,9 @@ shown with example gates)
 - Multi-profile review gates (ticket 11): an optional `review.gates` list
   configures sequential review gates, each with its own lens. `name` picks
   the lens — built-in `quality` (the classic three-axis review) and
-  `performance` (Workbench perf lens); any other name is legal and builds
-  from a generic lens guided by the gate's `extraInstructions`. `model`
+  `performance` (Workbench perf lens); any other name is legal (lowercase
+  alphanumeric with single hyphens — names land in artifact filenames) and
+  builds from a generic lens guided by the gate's `extraInstructions`. `model`
   optionally overrides the gate's model (default `models.review`), and
   `extraInstructions` are appended verbatim to the gate's prompt (the
   KB-lesson channel). With no `review` key, exactly one implicit `quality`

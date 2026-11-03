@@ -30,6 +30,7 @@ import {
   REVIEW_PROFILE_PROMPTS,
   SandcastleStageRunner,
   agentFactories,
+  buildReviewPrompt,
   type AgentProviderFactory,
 } from "../src/adapters/sandcastle.js";
 import {
@@ -231,6 +232,31 @@ describe("ticket 11: review-gate config", () => {
     expect(() => loadConfig(root)).toThrow(/review\.gates/);
   });
 
+  it("loadConfig throws on gate names that are not path-safe: '/', '..', a newline", () => {
+    // Gate names are interpolated into artifact filenames
+    // (`review-verdict:<name>`), so the schema must reject path separators,
+    // traversal segments, and control characters — non-empty is not enough
+    // (KB lesson 2026-11-02 22:31). Rejected even under valid-looking lists.
+    for (const bad of ["qua/lity", "..", "quality\nshadow", "Quality", "-lead", "trail-"] as const) {
+      const root = tmpRoot();
+      fs.writeFileSync(
+        path.join(root, CONFIG_FILE_NAME),
+        JSON.stringify({ review: { gates: [{ name: bad }] } }),
+        "utf8",
+      );
+      expect(() => loadConfig(root)).toThrow(/invalid factory config/);
+      expect(() => loadConfig(root)).toThrow(/gate name must be lowercase alphanumeric with single hyphens/);
+    }
+    // Hyphenated lowercase names are the legal custom form.
+    const root = tmpRoot();
+    fs.writeFileSync(
+      path.join(root, CONFIG_FILE_NAME),
+      JSON.stringify({ review: { gates: [{ name: "data-migrations" }] } }),
+      "utf8",
+    );
+    expect(loadConfig(root).config.review?.gates[0]?.name).toBe("data-migrations");
+  });
+
   it("provider claude: rejects a non-Claude per-gate model, accepts a gate without a model", () => {
     const root = tmpRoot();
     const configFile = path.join(root, CONFIG_FILE_NAME);
@@ -287,6 +313,25 @@ describe("ticket 11: REVIEW_PROFILE_PROMPTS built-in lens bodies", () => {
       expect(body).toContain("__REVIEW_BASE__");
       expect(body).toContain("Run `git diff __REVIEW_BASE__...HEAD` to see the merged diff. Read surrounding code as needed.");
     }
+  });
+
+  it("buildReviewPrompt substitutes the base in ONE pass: a base containing the raw token is not re-substituted", () => {
+    // Regression (rework fix): with chained replaceAll calls, the first pass
+    // inserted JSON.stringify(base) and the second pass re-matched the raw
+    // token INSIDE that inserted JSON form, corrupting the quoted base.
+    const base = 'evil"__REVIEW_BASE__';
+    const prompt = buildReviewPrompt({ name: "quality" }, base);
+    // Byte-exact against the legacy template built from its literals: the
+    // intro carries the JSON-quoted base exactly once, the diff line the raw base.
+    expect(prompt).toBe(legacyReviewPrompt(base));
+    expect(prompt).toContain(`against ${JSON.stringify(base)} for:`);
+    expect(prompt).toContain(`Run \`git diff ${base}...HEAD\` to see the merged diff. Read surrounding code as needed.`);
+    // The inserted JSON form survived intact (no second-pass corruption).
+    expect(prompt).toContain(JSON.stringify(base));
+    // Same property for the generic-lens fallback.
+    const generic = buildReviewPrompt({ name: "migrations", extraInstructions: "Check FKs." }, base);
+    expect(generic).toContain(`against ${JSON.stringify(base)} for a general quality pass`);
+    expect(generic).toContain(`Run \`git diff ${base}...HEAD\``);
   });
 });
 

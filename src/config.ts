@@ -183,7 +183,17 @@ const configSchema = z.object({
       gates: z
         .array(
           z.object({
-            name: z.string().min(1),
+            // Path-safe charset: gate names are interpolated into artifact
+            // FILENAMES (`review-verdict:<name>`) — a "/", "..", or newline
+            // must never reach a path segment (KB lesson 2026-11-02 22:31:
+            // non-empty is not enough when the value becomes a filename).
+            name: z
+              .string()
+              .min(1)
+              .regex(
+                /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/,
+                "gate name must be lowercase alphanumeric with single hyphens",
+              ),
             model: z.string().min(1).optional(),
             extraInstructions: z.string().min(1).optional(),
           }),

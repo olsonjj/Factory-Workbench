@@ -277,9 +277,14 @@ const REVIEW_VERDICT_SCHEMA_BLOCK = `Return your verdict as JSON inside a <revie
  *  With the implicit quality gate and no extraInstructions this is exactly
  *  the legacy single-prompt review text. Exported for tests. */
 export function buildReviewPrompt(gate: ReviewGate, base: string): string {
-  const lens = (REVIEW_PROFILE_PROMPTS[gate.name] ?? genericReviewLens(gate.name))
-    .replaceAll(REVIEW_BASE_JSON_TOKEN, JSON.stringify(base))
-    .replaceAll(REVIEW_BASE_TOKEN, base);
+  // Single-pass substitution: a regex replacer never rescans its own output,
+  // so a base that itself contains a token (e.g. "__REVIEW_BASE__") cannot
+  // have its JSON-quoted form re-matched by the raw-token substitution —
+  // chained replaceAll calls would corrupt exactly that case (rework fix).
+  const lens = (REVIEW_PROFILE_PROMPTS[gate.name] ?? genericReviewLens(gate.name)).replace(
+    /__REVIEW_BASE_JSON__|__REVIEW_BASE__/g,
+    (token) => (token === REVIEW_BASE_JSON_TOKEN ? JSON.stringify(base) : base),
+  );
   const sections: string[] = [lens];
   if (gate.extraInstructions !== undefined) {
     sections.push(`## Extra instructions from config (profile "${gate.name}")\n\n${gate.extraInstructions}`);
