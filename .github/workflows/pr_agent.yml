@@ -1,6 +1,21 @@
 # PR-Agent: AI code review on PRs (auto-runs on open/reopened/ready-for-review,
 # skips drafts, manual commands like /review /improve /ask available per PR).
 # LLM: Ollama Cloud via its OpenAI-compatible endpoint.
+#
+# Security notes:
+# - The action is digest-pinned. The upstream action repo's wrapper (action.yaml)
+#   only pins a wrapper file; the real runtime is the Docker Hub image
+#   `pragent/pr-agent:github_action`, a MUTABLE rolling tag. Pinning the digest
+#   of the immutable versioned tag `0.49.0-github_action` is what actually pins
+#   the executing code. Upstream SECURITY.md recommends exactly this, and the
+#   image publishes GitHub Artifact Attestations:
+#   gh attestation verify "oci://index.docker.io/pragent/pr-agent@sha256:<digest>" --repo The-PR-Agent/pr-agent
+#   To upgrade: check https://github.com/The-PR-Agent/pr-agent/releases, then
+#   resolve the new digest:
+#   docker buildx imagetools inspect pragent/pr-agent:<ver>-github_action --format '{{.Manifest.Digest}}'
+# - Comments (issue_comment) are restricted to OWNER/MEMBER/COLLABORATOR so
+#   strangers on this public repo can't burn Ollama API credits via /commands
+#   or inject content into the LLM's posted output.
 name: PR Agent
 
 on:
@@ -11,8 +26,24 @@ on:
 
 jobs:
   pr_agent_job:
-    # never trigger on the bot's own comments
-    if: ${{ github.event.sender.type != 'Bot' }}
+    # - never trigger on the bot's own comments
+    # - skip draft PRs (WIP code shouldn't be shipped to the LLM provider)
+    # - issue_comment (commands like /review): only from OWNER/MEMBER/COLLABORATOR
+    #   and only on PRs — the only trigger where a non-collaborator gets our
+    #   secrets loaded into the run (fork PRs don't)
+    if: >
+      github.event.sender.type != 'Bot' &&
+      (
+        (
+          github.event_name == 'pull_request' &&
+          !github.event.pull_request.draft
+        ) ||
+        (
+          github.event_name == 'issue_comment' &&
+          github.event.issue.pull_request != null &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+        )
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -20,7 +51,8 @@ jobs:
       pull-requests: write
     steps:
       - name: PR Agent action step
-        uses: the-pr-agent/pr-agent@v0.49.0
+        # digest of immutable tag pragent/pr-agent:0.49.0-github_action on Docker Hub
+        uses: docker://pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
