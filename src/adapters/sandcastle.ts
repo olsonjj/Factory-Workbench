@@ -40,7 +40,20 @@ export const TestVerdict = z.object({
 
 export const ReviewVerdict = z.object({
   verdict: z.enum(["pass", "fail"]),
-  findings: z.string(),
+  // deepseek-v4-pro:0813 sometimes returns findings as an array (one entry per
+  // finding: plain strings or {finding/header/file/...} objects) instead of a
+  // string — observed live in item #18's review gate (2026-11-03, two rounds,
+  // each burning 3 infra retries then parking). Accept and coerce; same
+  // brittleness class as the nullish lesson/fix leniencies of 2026-10-27.
+  findings: z
+    .union([z.string(), z.array(z.union([z.string(), z.record(z.string(), z.unknown())]))])
+    .transform((f) =>
+      typeof f === "string"
+        ? f
+        : f
+            .map((entry) => (typeof entry === "string" ? entry : JSON.stringify(entry)))
+            .join("\n"),
+    ),
   lesson: z.string().nullish(),
   fix: z.string().nullish(),
   prSummary: z.string().nullish(),

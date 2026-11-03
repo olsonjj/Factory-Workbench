@@ -91,3 +91,33 @@ describe("parseStructured: invalid JSON escapes from quoted template literals", 
     ).toThrow(StructuredOutputParseError);
   });
 });
+
+describe("parseStructured: review findings array coercion (2026-11-03 item #18 finding)", () => {
+  it("array-of-strings findings are coerced to one string, joined by newlines", () => {
+    const v = parseStructured(
+      {} as RunResult,
+      "review",
+      ReviewVerdict,
+      '<review>{ "verdict": "pass", "findings": ["first note on the loop", "second note on io"] }</review>',
+    );
+    expect(v.findings).toBe("first note on the loop\nsecond note on io");
+  });
+
+  it("array-of-objects findings are coerced via JSON.stringify per entry", () => {
+    const v = parseStructured(
+      {} as RunResult,
+      "review",
+      ReviewVerdict,
+      '<review>{ "verdict": "fail", "findings": [{ "header": "Possible Bug", "file": "src/x.ts" }, "prose entry"] }</review>',
+    );
+    expect(v.verdict).toBe("fail");
+    expect(v.findings).toContain('"header":"Possible Bug"');
+    expect(v.findings).toContain("prose entry");
+  });
+
+  it("a missing findings field is still rejected (typed strictness intact)", () => {
+    expect(() =>
+      parseStructured({} as RunResult, "review", ReviewVerdict, '<review>{ "verdict": "pass" }</review>'),
+    ).toThrow(StructuredOutputParseError);
+  });
+});
