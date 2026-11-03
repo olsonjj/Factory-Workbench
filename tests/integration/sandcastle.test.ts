@@ -26,6 +26,32 @@ const realRepo = (repo: string): string => {
     return repo;
   }
 };
+
+import { StructuredOutputParseError } from "../../src/adapters/sandcastle.js";
+import type { StageRequest, StageResult } from "../../src/types.js";
+
+/** Production-parity retry for the e2e review tests: model-output drift and
+ *  sandbox-mount races surface as StructuredOutputParseError / transient
+ *  container errors — infra-class failures that the real pipeline absorbs
+ *  under `maxInfraRetries`; the gated tests mirror that budget (3 attempts).
+ *  A genuine wiring failure (non-transient) rethrows immediately. */
+async function runStageWithRetry(runner: SandcastleStageRunner, req: StageRequest, attempts = 3): Promise<StageResult> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await runner.runStage(req);
+    } catch (err) {
+      lastErr = err;
+      const message = String(err);
+      const transient =
+        err instanceof StructuredOutputParseError || /ENOENT|not a git repository/.test(message);
+      if (!transient) throw err;
+      console.error(`[gated e2e] transient infra/output drift (attempt ${attempt}/${attempts}): ${message.split("\n")[0]}`);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+  throw lastErr;
+}
 import { loadConfig } from "../../src/config.js";
 
 /**
@@ -166,7 +192,7 @@ d("integration: sandcastle adapter (requires docker + OLLAMA_API_KEY)", () => {
     );
     execFileSync("git", ["-C", wtPath, "add", "src/hello.js"], {});
     execFileSync("git", ["-C", wtPath, "-c", "user.name=wb", "-c", "user.email=wb@factory.workbench", "commit", "-qm", "add clean sum helper"], {});
-    const result = await runner.runStage({
+    const result = await runStageWithRetry(runner, {
       stage: "review",
       item: { id: 2, slug: "int-review-clean", title: "Clean change", repo: repoDir, base: "main", approvals: [], body: "Empty change on a clean branch.", branchName: "factory/int-review-clean" },
       kb: { global: "", project: "" },
@@ -221,7 +247,7 @@ d("integration: sandcastle adapter (requires docker + OLLAMA_API_KEY)", () => {
     );
     execFileSync("git", ["-C", flawPath, "add", "flaw.js"], {});
     execFileSync("git", ["-C", flawPath, "-c", "user.name=wb", "-c", "user.email=wb@factory.workbench", "commit", "-qm", "add countWords with a per-line sync read"], {});
-    const result = await runner.runStage({
+    const result = await runStageWithRetry(runner, {
       stage: "review",
       item: { id: 3, slug: "int-review-flaw", title: "Perf-flawed change", repo: repoDir, base: "main", approvals: [], body: "Adds countWords with a sync read inside the loop.", branchName: "factory/int-review-flaw" },
       kb: { global: "", project: "" },

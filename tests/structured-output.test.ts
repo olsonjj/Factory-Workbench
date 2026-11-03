@@ -121,3 +121,23 @@ describe("parseStructured: review findings array coercion (2026-11-03 item #18 f
     ).toThrow(StructuredOutputParseError);
   });
 });
+
+describe("parseStructured: JSON salvage for fenced/prose-wrapped payload drift (2026-11-03 finding)", () => {
+  const verdict = { verdict: "pass", findings: "clean" };
+
+  it("a ```json-fenced payload inside the tag parses", () => {
+    const text = '<review>Here is my assessment:\n\n```json\n' + JSON.stringify(verdict, null, 2) + '\n```\n</review>';
+    expect(parseStructured({} as RunResult, "review", ReviewVerdict, text)).toMatchObject(verdict);
+  });
+
+  it("a payload preceded by prose (e.g. `**verdict:** ...`) parses via brace extraction", () => {
+    const text = '<review>**verdict:** pass with no findings\n\n{"verdict": "pass", "findings": "clean"}\n</review>';
+    expect(parseStructured({} as RunResult, "review", ReviewVerdict, text)).toMatchObject(verdict);
+  });
+
+  it("prose with no JSON object anywhere still throws (no guessing)", () => {
+    expect(() =>
+      parseStructured({} as RunResult, "review", ReviewVerdict, "<review>**verdict:** pass, no findings at all</review>"),
+    ).toThrow(StructuredOutputParseError);
+  });
+});

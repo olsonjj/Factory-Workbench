@@ -155,6 +155,40 @@ export function dropInvalidJsonEscapes(text: string): string {
   return text.replace(/\\([\s\S])/g, (pair, ch: string) => ('"\\/bfnrtu'.includes(ch) ? pair : ch));
 }
 
+/**
+ * Last-ditch JSON salvage for structured-output drift observed live from cloud
+ * models (2026-11-03 item-run integration tests): a <review>/<test> payload
+ * wrapped in Markdown code fences, preceded by prose, or both. Returns a
+ * string that JSON.parses, or undefined when nothing sane is found. More
+ * exotic drift (markdown-bold KEYS inside the object) stays unparseable and
+ * surfaces as an infra-class failure — deliberately: the prompt asks for a
+ * JSON object, and silent key-rewriting would cross from resilience into
+ * guessing.
+ */
+export function salvageJsonPayload(text: string): string | undefined {
+  const candidates: string[] = [];
+  const fence = /```(?:json)?\s*\n?([\s\S]*?)```/.exec(text);
+  if (fence?.[1]) candidates.push(fence[1].trim());
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first !== -1 && last > first) candidates.push(text.slice(first, last + 1));
+  if (first !== -1 && last > first && fence?.[1]) {
+    const inner = fence[1];
+    const s = inner.indexOf("{");
+    const e = inner.lastIndexOf("}");
+    if (s !== -1 && e > s) candidates.push(inner.slice(s, e + 1).trim());
+  }
+  for (const candidate of candidates) {
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}
+
 export function parseStructured<T>(result: RunResult, tag: string, schema: z.ZodType<T>, agentText?: string): T {
   const raw = extractTagContent(agentText || lastIterationText(result), tag);
   if (raw === undefined) {
@@ -163,11 +197,19 @@ export function parseStructured<T>(result: RunResult, tag: string, schema: z.Zod
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw.trim());
-  } catch (cause) {
+  } catch {
     try {
       parsed = JSON.parse(dropInvalidJsonEscapes(raw.trim()));
-    } catch {
-      throw new StructuredOutputParseError(tag, cause);
+    } catch (cause) {
+      const salvaged = salvageJsonPayload(raw);
+      if (salvaged === undefined) {
+        throw new StructuredOutputParseError(tag, cause instanceof Error ? cause : String(cause));
+      }
+      try {
+        parsed = JSON.parse(salvaged);
+      } catch (salvageCause) {
+        throw new StructuredOutputParseError(tag, salvageCause instanceof Error ? salvageCause : String(salvageCause));
+      }
     }
   }
   const check = schema.safeParse(parsed);
