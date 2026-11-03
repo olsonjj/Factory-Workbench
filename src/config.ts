@@ -40,11 +40,28 @@ export interface AgentConfig {
   provider: AgentProviderName;
 }
 
+/** One review gate (ticket 11). Sequential per the spec; fail-fast. */
+export interface ReviewGate {
+  /** Unique, non-empty lens name ("quality"/"performance" built in; unknown names legal and built from a generic lens). */
+  name: string;
+  /** Optional model override; defaults to models.review then models.default. */
+  model?: string;
+  /** Appended verbatim to the built-in prompt as its own section (KB-lesson channel). */
+  extraInstructions?: string;
+}
+
+export interface ReviewConfig {
+  /** At least one gate (enforced by the schema). */
+  gates: ReviewGate[];
+}
+
 export interface FactoryConfig {
   /** Factory root directory (self-contained, movable). */
   root: string;
   models: StageModels;
   agent: AgentConfig;
+  /** Multi-profile review gates (ticket 11). Absent ⇒ one implicit "quality" gate. */
+  review?: ReviewConfig;
   budgets: Budgets;
   sandbox: SandboxConfig;
   kb: KbConfig;
@@ -119,6 +136,13 @@ export function modelFor(models: StageModels, stage: string): string {
   return override && override.length > 0 ? override : models.default;
 }
 
+/** Review gates for a config: explicit gates verbatim, else exactly one
+ *  implicit "quality" gate (ticket 11) — byte-identical legacy behavior for
+ *  configs without a `review` key. The gate's model resolves at runtime. */
+export function resolveReviewGates(config: Pick<FactoryConfig, "review">): ReviewGate[] {
+  return config.review?.gates ?? [{ name: "quality" }];
+}
+
 /** A model id Claude Code's `--model` accepts: a `claude-*` id or an alias, optionally `[1m]`-suffixed. */
 export function isClaudeModelId(model: string): boolean {
   return /^(claude-[a-z0-9.-]+|sonnet|opus|haiku|opusplan)(\[1m\])?$/.test(model);
@@ -154,6 +178,19 @@ const configSchema = z.object({
   agent: z.object({
     provider: z.enum(["pi", "claude"]),
   }),
+  review: z
+    .object({
+      gates: z
+        .array(
+          z.object({
+            name: z.string().min(1),
+            model: z.string().min(1).optional(),
+            extraInstructions: z.string().min(1).optional(),
+          }),
+        )
+        .min(1),
+    })
+    .optional(),
   kb: z.object({
     maxGlobalChars: z.number().int().positive(),
     maxProjectChars: z.number().int().positive(),
@@ -192,6 +229,9 @@ export function loadConfig(rootOverride?: string, cwd: string = process.cwd()): 
       ...(raw.models ?? {}),
     },
     agent: { provider },
+    // Multi-profile review gates (ticket 11): pass through verbatim — zod
+    // validates the shape below; the duplicate-name check is post-parse.
+    ...(raw.review ? { review: { gates: raw.review.gates } } : {}),
     budgets: {
       ...DEFAULT_CONFIG.budgets,
       ...(raw.budgets ?? {}),
@@ -210,12 +250,33 @@ export function loadConfig(rootOverride?: string, cwd: string = process.cwd()): 
     const detail = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
     throw new Error(`invalid factory config ${configFile}: ${detail}`);
   }
+  // Duplicate gate names: zod cannot express uniqueness; exact-string dedupe
+  // (names are case-sensitive as-is).
+  if (parsed.data.review) {
+    const seen = new Set<string>();
+    for (const gate of parsed.data.review.gates) {
+      if (seen.has(gate.name)) {
+        throw new Error(`invalid factory config ${configFile}: review.gates: duplicate gate name "${gate.name}"`);
+      }
+      seen.add(gate.name);
+    }
+  }
   if (parsed.data.agent.provider === "claude") {
     // A config generated under pi (wb init) carries Ollama ids in models.*,
-    // which win over the claude defaults; catch that here.
-    const bad = Object.entries(parsed.data.models)
-      .filter(([, id]) => typeof id === "string" && !isClaudeModelId(id))
-      .map(([stage, id]) => `models.${stage}: "${id}"`);
+    // which win over the claude defaults; catch that here. Per-gate review
+    // model overrides are held to the same rule; a gate with NO model is
+    // legal (it resolves at runtime from models.review → models.default,
+    // both already validated).
+    const bad = [
+      ...Object.entries(parsed.data.models)
+        .filter(([, id]) => typeof id === "string" && !isClaudeModelId(id))
+        .map(([stage, id]) => `models.${stage}: "${id}"`),
+      ...(parsed.data.review?.gates ?? []).flatMap((gate, i) =>
+        gate.model !== undefined && !isClaudeModelId(gate.model)
+          ? [`review.gates[${i}] ("${gate.name}"): "${gate.model}"`]
+          : [],
+      ),
+    ];
     if (bad.length > 0) {
       throw new Error(
         `invalid factory config ${configFile}: agent.provider is "claude" but ${bad.join(", ")} ` +
