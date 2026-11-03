@@ -191,6 +191,12 @@ in the generated file):
     "implement": "claude-sonnet-5-5",
     "review": "claude-opus-5-5"
   },
+  "review": {
+    "gates": [
+      { "name": "quality" },
+      { "name": "performance", "model": "claude-haiku-5-5", "extraInstructions": "..." }
+    ]
+  },
   "budgets": { "maxGateAttempts": 3, "maxInfraRetries": 3, "retryBackoffMs": 5000 },
   "sandbox": { "imageName": "sandcastle:claude" }
 }
@@ -198,10 +204,28 @@ in the generated file):
 
 (the variant above is the `claude` one; omit the `agent` section — or set it to
 `"pi"` — and keep `sandbox.imageName: "sandcastle:local"` for the default pi
-setup, whose models are Ollama Cloud ids)
+setup, whose models are Ollama Cloud ids; the `review` block is optional and
+shown with example gates)
 
 - All stages default to one model; the per-stage override mechanism is the
   mapping structure above.
+- Multi-profile review gates (ticket 11): an optional `review.gates` list
+  configures sequential review gates, each with its own lens. `name` picks
+  the lens — built-in `quality` (the classic three-axis review) and
+  `performance` (Workbench perf lens); any other name is legal (lowercase
+  alphanumeric with single hyphens — names land in artifact filenames) and
+  builds from a generic lens guided by the gate's `extraInstructions`. `model`
+  optionally overrides the gate's model (default `models.review`), and
+  `extraInstructions` are appended verbatim to the gate's prompt (the
+  KB-lesson channel). With no `review` key, exactly one implicit `quality`
+  gate runs — legacy behavior. Gates run sequentially inside one review
+  stage and fail fast: the first failing gate stops later gates and the
+  whole stage gate-fails under the shared `budgets.maxGateAttempts` budget
+  (keyed on the `review` stage). On a full pass, per-gate verdicts are
+  saved as `review-verdict:<name>` artifacts plus a combined
+  `review-verdict` artifact (the PR body's review surface); the stage
+  history records `usage.profiles` (one `{ name, model }` per gate, and
+  `usage.model` is the first gate's model).
 - Model selection rationale (JSON config files can't carry comments, so it
   is documented in `src/config.ts` next to `DEFAULT_MODEL`): the default
   slot is the best value-per-token model in the Ollama Cloud catalog and

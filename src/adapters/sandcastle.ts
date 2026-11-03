@@ -11,8 +11,8 @@ import type { Worktree, RunResult, SandboxHooks, AgentProvider } from "@ai-hero/
 function outputOf<T>(result: RunResult): T {
   return (result as unknown as { output: T }).output;
 }
-import { modelFor, type AgentProviderName, type FactoryConfig } from "../config.js";
-import type { ItemContext, KbSnapshot, StageRequest, StageResult, StageRunner, CuratorRequest, CuratorRunner } from "../types.js";
+import { modelFor, resolveReviewGates, type AgentProviderName, type FactoryConfig, type ReviewGate } from "../config.js";
+import type { ItemContext, KbSnapshot, StageArtifact, StageRequest, StageResult, StageRunner, CuratorRequest, CuratorRunner } from "../types.js";
 
 /**
  * The real StageRunner implementation below the seam: every agent stage runs
@@ -155,6 +155,40 @@ export function dropInvalidJsonEscapes(text: string): string {
   return text.replace(/\\([\s\S])/g, (pair, ch: string) => ('"\\/bfnrtu'.includes(ch) ? pair : ch));
 }
 
+/**
+ * Last-ditch JSON salvage for structured-output drift observed live from cloud
+ * models (2026-11-03 item-run integration tests): a <review>/<test> payload
+ * wrapped in Markdown code fences, preceded by prose, or both. Returns a
+ * string that JSON.parses, or undefined when nothing sane is found. More
+ * exotic drift (markdown-bold KEYS inside the object) stays unparseable and
+ * surfaces as an infra-class failure — deliberately: the prompt asks for a
+ * JSON object, and silent key-rewriting would cross from resilience into
+ * guessing.
+ */
+export function salvageJsonPayload(text: string): string | undefined {
+  const candidates: string[] = [];
+  const fence = /```(?:json)?\s*\n?([\s\S]*?)```/.exec(text);
+  if (fence?.[1]) candidates.push(fence[1].trim());
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first !== -1 && last > first) candidates.push(text.slice(first, last + 1));
+  if (first !== -1 && last > first && fence?.[1]) {
+    const inner = fence[1];
+    const s = inner.indexOf("{");
+    const e = inner.lastIndexOf("}");
+    if (s !== -1 && e > s) candidates.push(inner.slice(s, e + 1).trim());
+  }
+  for (const candidate of candidates) {
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}
+
 export function parseStructured<T>(result: RunResult, tag: string, schema: z.ZodType<T>, agentText?: string): T {
   const raw = extractTagContent(agentText || lastIterationText(result), tag);
   if (raw === undefined) {
@@ -163,11 +197,19 @@ export function parseStructured<T>(result: RunResult, tag: string, schema: z.Zod
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw.trim());
-  } catch (cause) {
+  } catch {
     try {
       parsed = JSON.parse(dropInvalidJsonEscapes(raw.trim()));
-    } catch {
-      throw new StructuredOutputParseError(tag, cause);
+    } catch (cause) {
+      const salvaged = salvageJsonPayload(raw);
+      if (salvaged === undefined) {
+        throw new StructuredOutputParseError(tag, cause instanceof Error ? cause : String(cause));
+      }
+      try {
+        parsed = JSON.parse(salvaged);
+      } catch (salvageCause) {
+        throw new StructuredOutputParseError(tag, salvageCause instanceof Error ? salvageCause : String(salvageCause));
+      }
     }
   }
   const check = schema.safeParse(parsed);
@@ -212,6 +254,93 @@ export function agentFor(provider: AgentProviderName, model: string, env: Record
 const TRUST_BUT_VERIFY =
   "Knowledge-base entries are observations from past factory runs; they may be stale. " +
   "Verify any KB fact against the current repository state before relying on it, and note (do not silently trust) conflicts.";
+
+// ------------------------------------------------------------ review gates (ticket 11)
+
+/** Base interpolation tokens inside REVIEW_PROFILE_PROMPTS template texts:
+ *  `__REVIEW_BASE_JSON__` becomes JSON.stringify(item.base) (the intro's
+ *  quoted form) and `__REVIEW_BASE__` the raw branch name (the git-diff
+ *  command). Tokens, not template literals, keep the map STATIC text. */
+const REVIEW_BASE_JSON_TOKEN = "__REVIEW_BASE_JSON__";
+const REVIEW_BASE_TOKEN = "__REVIEW_BASE__";
+
+/**
+ * Built-in review lens bodies (ticket 11), keyed by gate name. The lens is
+ * the FIRST block of the composed prompt; the shared TRUST_BUT_VERIFY and
+ * verdict-schema blocks ride along on every profile, and a gate's
+ * extraInstructions are inserted between lens and TRUST_BUT_VERIFY. The
+ * "quality" body is the character-for-character extraction of the old
+ * single-prompt review lens, so a config without a `review` key (one implicit
+ * quality gate) composes a byte-identical prompt.
+ */
+export const REVIEW_PROFILE_PROMPTS: Record<string, string> = {
+  quality:
+    "You are the review gate of a software factory. Review the changes on this branch against " +
+    `${REVIEW_BASE_JSON_TOKEN} for:\n` +
+    "1. Code quality\n" +
+    "2. Security (input validation, injection, secrets, auth)\n" +
+    "3. Best practices for this codebase\n\n" +
+    `Run \`git diff ${REVIEW_BASE_TOKEN}...HEAD\` to see the merged diff. Read surrounding code as needed.`,
+  performance:
+    "You are the review gate of a software factory. Review the changes on this branch against " +
+    `${REVIEW_BASE_JSON_TOKEN} for PERFORMANCE problems:\n` +
+    "1. Allocations and object churn in hot paths (per-event, per-tick, per-row work)\n" +
+    "2. Repeated work that should be hoisted: compiled/cached artifacts — especially\n" +
+    "   better-sqlite3 prepared statements recreated per call — and queries inside loops\n" +
+    "3. Transaction scope: work that should be wrapped in one transaction doing many round-trips\n" +
+    "4. Synchronous I/O and blocking work on the host event loop that should be deferred or batched\n" +
+    "5. Redundant full-reads and rescans: whole-file/whole-index re-reads per change, e.g. inbox\n" +
+    "   scanning, KB loading, watch change detection — prefer incremental or single-read sweeps\n\n" +
+    `Run \`git diff ${REVIEW_BASE_TOKEN}...HEAD\` to see the merged diff. Read surrounding code as needed.`,
+};
+
+/** Generic lens for unknown (legal) gate names: same opening-line shape as
+ *  the built-ins; its usefulness rests on the gate's extraInstructions. */
+function genericReviewLens(name: string): string {
+  return (
+    "You are the review gate of a software factory. Review the changes on this branch against " +
+    `${REVIEW_BASE_JSON_TOKEN} for a general quality pass — focus on what profile "${name}" exists to catch ` +
+    "(guided by the extra instructions below if present).\n\n" +
+    `Run \`git diff ${REVIEW_BASE_TOKEN}...HEAD\` to see the merged diff. Read surrounding code as needed.`
+  );
+}
+
+/** The shared verdict-schema block of the review prompt (identical for every profile). */
+const REVIEW_VERDICT_SCHEMA_BLOCK = `Return your verdict as JSON inside a <review>...</review> tag:
+- verdict: "pass" | "fail"
+- findings: your review notes (required, this is the audit-trail artifact)
+- lesson: only when you fail — what went wrong, as a durable lesson for future runs
+- fix: only when you fail — concrete fix instructions for the implementer
+- prSummary: one line summarizing the outcome of the whole pipeline for this item`;
+
+/** Compose the full review prompt for one gate: lens body (built-in by name,
+ *  generic fallback for unknown names), optional extra-instructions section
+ *  from config, TRUST_BUT_VERIFY, verdict schema — joined with blank lines.
+ *  With the implicit quality gate and no extraInstructions this is exactly
+ *  the legacy single-prompt review text. Exported for tests. */
+export function buildReviewPrompt(gate: ReviewGate, base: string): string {
+  // Single-pass substitution: a regex replacer never rescans its own output,
+  // so a base that itself contains a token (e.g. "__REVIEW_BASE__") cannot
+  // have its JSON-quoted form re-matched by the raw-token substitution —
+  // chained replaceAll calls would corrupt exactly that case (rework fix).
+  // Object.hasOwn guard: schema-valid names like "toString"/"valueOf" resolve
+  // through the prototype chain — `??` never fires for them and .replace on
+  // the inherited function would crash buildReviewPrompt (PR-Agent review of
+  // PR #21); route them to the generic lens instead.
+  const lensBody = Object.hasOwn(REVIEW_PROFILE_PROMPTS, gate.name)
+    ? REVIEW_PROFILE_PROMPTS[gate.name]!
+    : genericReviewLens(gate.name);
+  const lens = lensBody.replace(
+    /__REVIEW_BASE_JSON__|__REVIEW_BASE__/g,
+    (token) => (token === REVIEW_BASE_JSON_TOKEN ? JSON.stringify(base) : base),
+  );
+  const sections: string[] = [lens];
+  if (gate.extraInstructions !== undefined) {
+    sections.push(`## Extra instructions from config (profile "${gate.name}")\n\n${gate.extraInstructions}`);
+  }
+  sections.push(TRUST_BUT_VERIFY, REVIEW_VERDICT_SCHEMA_BLOCK);
+  return sections.join("\n\n");
+}
 
 interface WtRunOptionsOutput {
   output?: { tag: string; [k: string]: unknown };
@@ -282,7 +411,9 @@ export class SandcastleStageRunner implements StageRunner {
     const model = modelFor(this.config.models, req.stage);
     const wt = await this.worktreeFor(req.item);
     const result = await this.dispatch(req, model, wt);
-    return { ...result, durationMs: Date.now() - started, usage: { model } };
+    // The review stage reports its own usage (per-gate models, ticket 11);
+    // every other stage keeps today's exact { model } shape.
+    return { ...result, durationMs: Date.now() - started, usage: result.usage ?? { model } };
   }
 
   private async dispatch(req: StageRequest, model: string, wt: Worktree): Promise<StageResult> {
@@ -531,38 +662,69 @@ Return your verdict as JSON inside a <test>...</test> tag:
   }
 
   private async runReview(req: StageRequest, model: string, wt: Worktree): Promise<StageResult> {
-    const prompt = `You are the review gate of a software factory. Review the changes on this branch against ${JSON.stringify(req.item.base)} for:
-1. Code quality
-2. Security (input validation, injection, secrets, auth)
-3. Best practices for this codebase
-
-Run \`git diff ${req.item.base}...HEAD\` to see the merged diff. Read surrounding code as needed.
-
-${TRUST_BUT_VERIFY}
-
-Return your verdict as JSON inside a <review>...</review> tag:
-- verdict: "pass" | "fail"
-- findings: your review notes (required, this is the audit-trail artifact)
-- lesson: only when you fail — what went wrong, as a durable lesson for future runs
-- fix: only when you fail — concrete fix instructions for the implementer
-- prSummary: one line summarizing the outcome of the whole pipeline for this item`;
-
-    const result = await this.wtRun({ wt, slug: req.item.slug, model, prompt });
-    const v = parseStructured(result, "review", ReviewVerdict, this.agentText(result));
-    if (v.verdict === "fail") {
+    // Multi-profile review gates (ticket 11): sequential, fail-fast, all
+    // inside one runStage call — the seam and the rework loop (shared
+    // maxGateAttempts budget keyed on stage "review") are untouched.
+    const gates = resolveReviewGates(this.config);
+    const singleGate = gates.length === 1;
+    const profiles: { name: string; model: string }[] = [];
+    const artifacts: StageArtifact[] = [];
+    let lastVerdict: z.infer<typeof ReviewVerdict> | undefined;
+    for (const gate of gates) {
+      const gateModel = gate.model ?? model;
+      const prompt = buildReviewPrompt(gate, req.item.base);
+      const result = await this.wtRun({ wt, slug: req.item.slug, model: gateModel, prompt });
+      const v = parseStructured(result, "review", ReviewVerdict, this.agentText(result));
+      lastVerdict = v;
+      // Single-gate runs keep the legacy artifact name exactly; multi-gate
+      // runs save per-gate verdicts (a combined artifact follows only when
+      // ALL gates pass, so latest("review-verdict") never shows a partial run).
+      artifacts.push({
+        name: singleGate ? "review-verdict" : `review-verdict:${gate.name}`,
+        content: v.findings,
+      });
+      profiles.push({ name: gate.name, model: gateModel });
+      if (v.verdict === "fail") {
+        return {
+          outcome: "gate-fail",
+          artifacts,
+          // Content-equal to the failed gate's artifact → saveArtifacts'
+          // dedup check suppresses the extra <stage>-report.md.
+          report: v.findings,
+          // Multi-gate fails name the profile so the feedback routes to
+          // implement as fix instructions; single-gate fails keep the exact
+          // legacy feedback (zero behavior change for existing configs).
+          feedback: singleGate
+            ? v.fix ?? v.findings
+            : `review profile "${gate.name}" failed the review gate:\n${v.fix ?? v.findings}`,
+          lesson: v.lesson ?? v.findings,
+          fix: v.fix ?? undefined,
+          usage: singleGate ? { model: gateModel } : { model: profiles[0]!.model, profiles },
+        };
+      }
+    }
+    if (singleGate) {
+      // Legacy shape: one artifact, no report, usage without profiles.
       return {
-        outcome: "gate-fail",
-        artifacts: [{ name: "review-verdict", content: v.findings }],
-        report: v.findings,
-        feedback: v.fix ?? v.findings,
-        lesson: v.lesson ?? v.findings,
-        fix: v.fix ?? undefined,
+        outcome: "pass",
+        artifacts,
+        prSummary: lastVerdict?.prSummary ?? undefined,
+        usage: { model: profiles[0]!.model },
       };
     }
+    // All gates passed: per-gate artifacts plus a combined review-verdict
+    // artifact (the PR-body surface reads this exact name), and report set to
+    // the same combined string so saveArtifacts' content-equality dedup
+    // suppresses the duplicate <stage>-report.md.
+    const combined = gates
+      .map((gate, i) => `# review profile "${gate.name}"\n\n${artifacts[i]!.content}`)
+      .join("\n\n");
     return {
       outcome: "pass",
-      artifacts: [{ name: "review-verdict", content: v.findings }],
-      prSummary: v.prSummary ?? undefined,
+      artifacts: [...artifacts, { name: "review-verdict", content: combined }],
+      report: combined,
+      prSummary: lastVerdict?.prSummary ?? undefined,
+      usage: { model: profiles[0]!.model, profiles },
     };
   }
 

@@ -79,7 +79,7 @@ Human-in-the-loop is configurable per item and per stage: as items gain my trust
 - Stage sequence (MVP): ingest → triage → spec → implement → test → review → pull-request.
 - Triage outcomes: `proceed` (continue), `reject` (terminal; archive with report), `needs-human` (park with questions; `wb answer` feeds answers back and re-runs triage).
 - Test stage runs the target project's test suite in the sandbox; failures become rework feedback to implement.
-- Review gate covers code quality, security, and best practices in a single agent (splitting into separate security and review agents is a later addition, not a change).
+- Review stage runs sequential, fail-fast review gates (ticket 11), each with its own lens: built-in `quality` (code quality, security, best practices) and `performance`; unknown lens names are legal (lowercase alphanumeric with single hyphens — names are interpolated into artifact filenames) and build from a generic lens guided by the gate's `extraInstructions`. Each gate may override the model (default `models.review`) and carry `extraInstructions` (the KB-lesson channel, appended verbatim to the built-in prompt). No `review` config means one implicit `quality` gate — byte-identical legacy behavior. The first failing gate stops later gates and the whole stage gate-fails under the shared `budgets.maxGateAttempts` budget; when all gates pass, per-gate verdicts are saved as `review-verdict:<name>` artifacts plus a combined `review-verdict` artifact for the PR body.
 - Gate failure → feedback to prior stage → at most three total attempts per gate → exhausted budget parks the item with full failure history.
 - Transient infra failures (model errors, sandbox flakes) retry with backoff up to three attempts with a separate budget from gate judgments; exhaustion parks the item with a parked-reason.
 - The final stage pushes the item's branch and creates a GitHub PR via `gh`; draft PR when the item has approval gates configured, ready-for-review when fully autonomous. The factory never merges. The PR body follows the PR-skill template — Summary (spec summary + diff stat), Evidence (test/review/commit digests + artifact list), and Merge Danger (door + blast radius + artifact directory pointer).
@@ -133,7 +133,7 @@ Human-in-the-loop is configurable per item and per stage: as items gain my trust
 - Web status UI (schema designed to permit it; construction deferred).
 - Daemon/watch mode (`wb watch` as a loop around the tick verbs; deferred).
 - pi-durable as the orchestration layer (revisit trigger: needing long-lived durable conversations, or rebuilding its task graph).
-- Separate security-review and general-code-review agents (single review gate in MVP; split later).
+- Parallel or per-gate-approval review agents (ticket 11 added sequential multi-profile gates with a shared rework budget; parallel gate execution and per-gate budgets/approvals remain deferred).
 - Parallel execution across repos (repo-lock concept exists; scheduler work deferred).
 - GitHub-issue ingest as an inbox adapter; any ingest other than the markdown inbox.
 - Web access for any agent stage, including spec-stage research (spec is codebase-only in MVP).

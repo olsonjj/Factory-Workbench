@@ -38,6 +38,10 @@ export interface StageUsage {
   model: string;
   inputTokens?: number;
   outputTokens?: number;
+  /** Per-gate review profiles (name + resolved model), present only on
+   *  multi-gate review runs (ticket 11). `usage.model` stays the FIRST
+   *  gate's model so judge-swap dashboards keep their semantics. */
+  profiles?: { name: string; model: string }[];
 }
 
 export interface StageResult {
