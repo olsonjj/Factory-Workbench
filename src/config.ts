@@ -140,7 +140,12 @@ export function modelFor(models: StageModels, stage: string): string {
  *  implicit "quality" gate (ticket 11) — byte-identical legacy behavior for
  *  configs without a `review` key. The gate's model resolves at runtime. */
 export function resolveReviewGates(config: Pick<FactoryConfig, "review">): ReviewGate[] {
-  return config.review?.gates ?? [{ name: "quality" }];
+  // loadConfig enforces gates.min(1); the empty-array fallback covers
+  // programmatic (non-loadConfig) configs — resolve to the implicit quality
+  // gate instead of dereferencing an empty profiles array in runReview
+  // (PR-Agent review of PR #21).
+  const gates = config.review?.gates;
+  return gates && gates.length > 0 ? gates : [{ name: "quality" }];
 }
 
 /** A model id Claude Code's `--model` accepts: a `claude-*` id or an alias, optionally `[1m]`-suffixed. */
@@ -191,7 +196,7 @@ const configSchema = z.object({
               .string()
               .min(1)
               .regex(
-                /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/,
+                /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
                 "gate name must be lowercase alphanumeric with single hyphens",
               ),
             model: z.string().min(1).optional(),

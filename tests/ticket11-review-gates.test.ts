@@ -201,6 +201,12 @@ describe("ticket 11: review-gate config", () => {
     });
   });
 
+  it("resolveReviewGates: an empty gates array falls back to the implicit quality gate (defensive for programmatic configs — loadConfig already rejects it)", () => {
+    // PR-Agent review of PR #21: with an empty array, runReview's all-pass
+    // branch would dereference profiles[0] on nothing and crash the stage.
+    expect(resolveReviewGates({ review: { gates: [] } })).toEqual([{ name: "quality" }]);
+  });
+
   it("loadConfig throws on duplicate gate names, naming the config file", () => {
     const root = tmpRoot();
     const configFile = path.join(root, CONFIG_FILE_NAME);
@@ -237,7 +243,7 @@ describe("ticket 11: review-gate config", () => {
     // (`review-verdict:<name>`), so the schema must reject path separators,
     // traversal segments, and control characters — non-empty is not enough
     // (KB lesson 2026-11-02 22:31). Rejected even under valid-looking lists.
-    for (const bad of ["qua/lity", "..", "quality\nshadow", "Quality", "-lead", "trail-"] as const) {
+    for (const bad of ["qua/lity", "..", "quality\nshadow", "Quality", "-lead", "trail-", "a--b"] as const) {
       const root = tmpRoot();
       fs.writeFileSync(
         path.join(root, CONFIG_FILE_NAME),
@@ -332,6 +338,26 @@ describe("ticket 11: REVIEW_PROFILE_PROMPTS built-in lens bodies", () => {
     const generic = buildReviewPrompt({ name: "migrations", extraInstructions: "Check FKs." }, base);
     expect(generic).toContain(`against ${JSON.stringify(base)} for a general quality pass`);
     expect(generic).toContain(`Run \`git diff ${base}...HEAD\``);
+  });
+  it("buildReviewPrompt falls back to the generic lens for prototype-chain keys (toString/valueOf/constructor)", () => {
+    // Regression (PR-Agent review of PR #21): `REVIEW_PROFILE_PROMPTS[gate.name] ?? ...`
+    // is a prototype-chain lookup — schema-valid inherited names resolve to
+    // functions, the ?? never fires, and .replace on the function crashes.
+    for (const name of ["toString", "valueOf", "constructor"]) {
+      const prompt = buildReviewPrompt({ name }, "main");
+      expect(prompt).toContain(`profile "${name}"`);
+      expect(prompt).toContain("Run `git diff main...HEAD` to see the merged diff");
+    }
+    // And a normal unknown name lands on the same generic-lens shape: the
+    // inherited-key names get exactly the same treatment as ordinary unknowns.
+    const proto = buildReviewPrompt({ name: "toString" }, "main");
+    const ordinary = buildReviewPrompt({ name: "unknownlens" }, "main");
+    expect(proto).toContain("general quality pass");
+    expect(ordinary).toContain("general quality pass");
+    expect(proto).toContain(`profile "toString"`);
+    expect(ordinary).toContain(`profile "unknownlens"`);
+    // Neither resolved to a built-in body (the quality lens text is absent).
+    expect(proto).not.toContain("1. Code quality");
   });
 });
 

@@ -281,7 +281,14 @@ export function buildReviewPrompt(gate: ReviewGate, base: string): string {
   // so a base that itself contains a token (e.g. "__REVIEW_BASE__") cannot
   // have its JSON-quoted form re-matched by the raw-token substitution —
   // chained replaceAll calls would corrupt exactly that case (rework fix).
-  const lens = (REVIEW_PROFILE_PROMPTS[gate.name] ?? genericReviewLens(gate.name)).replace(
+  // Object.hasOwn guard: schema-valid names like "toString"/"valueOf" resolve
+  // through the prototype chain — `??` never fires for them and .replace on
+  // the inherited function would crash buildReviewPrompt (PR-Agent review of
+  // PR #21); route them to the generic lens instead.
+  const lensBody = Object.hasOwn(REVIEW_PROFILE_PROMPTS, gate.name)
+    ? REVIEW_PROFILE_PROMPTS[gate.name]!
+    : genericReviewLens(gate.name);
+  const lens = lensBody.replace(
     /__REVIEW_BASE_JSON__|__REVIEW_BASE__/g,
     (token) => (token === REVIEW_BASE_JSON_TOKEN ? JSON.stringify(base) : base),
   );
