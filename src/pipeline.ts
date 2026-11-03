@@ -7,6 +7,7 @@ import type { FactoryPaths } from "./paths.js";
 import { artifactDir, itemDir } from "./paths.js";
 import type { FactoryConfig } from "./config.js";
 import { parseItemMarkdown } from "./frontmatter.js";
+import type { BaseFreshnessChecker, BaseFreshnessResult } from "./baseFreshness.js";
 import { appendEntry, chunkKbLayer, globalKbFile, kbDigestIndex, loadKbSnapshot, projectKbFile, readKbFile, repoSlug, type KbDigestIndex } from "./kb.js";
 import { stamp } from "./util.js";
 
@@ -31,6 +32,9 @@ export interface TickEntry {
   fromStage: StageName;
   status: ItemStatus;
   detail: string;
+  /** False when this entry recorded no state change (stale-base skip):
+   *  `resume`'s inner loop must not see skips as progress or it spins. */
+  changed?: boolean;
 }
 
 export interface TickReport {
@@ -50,6 +54,8 @@ export interface OrchestratorDeps {
   sleep: (ms: number) => Promise<void>;
   /** Safety cap for `resume`'s inner tick loop (default 500). */
   maxResumeTicks?: number;
+  /** Stale-base freshness gate; null/undefined = no checking (tests). */
+  baseCheck?: BaseFreshnessChecker | null;
 }
 
 export class Orchestrator {
@@ -61,6 +67,11 @@ export class Orchestrator {
   private readonly publisher: PrPublisher;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly maxResumeTicks: number;
+  private readonly baseCheck: BaseFreshnessChecker | null;
+  /** Per-invocation memo: one check per (repo, base); cache hits return the
+   *  recorded action without re-warning. A `wb run`/`wb resume` invocation
+   * constructs a fresh Orchestrator, so instance memory = invocation scope. */
+  private readonly freshnessResults = new Map<string, BaseFreshnessResult>();
 
   constructor(deps: OrchestratorDeps) {
     this.db = deps.db;
@@ -71,6 +82,7 @@ export class Orchestrator {
     this.publisher = deps.publisher;
     this.sleep = deps.sleep;
     this.maxResumeTicks = deps.maxResumeTicks ?? 500;
+    this.baseCheck = deps.baseCheck ?? null;
   }
 
   // ------------------------------------------------------------------ tick
@@ -86,7 +98,7 @@ export class Orchestrator {
         entry = this.parkUnexpectedError(item, err);
       }
       report.entries.push(entry);
-      report.changed = true;
+      if (entry.changed !== false) report.changed = true;
     }
     return report;
   }
@@ -344,6 +356,10 @@ export class Orchestrator {
     }
 
     const fromStage = refreshed.stage;
+
+    const skip = this.freshnessGate(refreshed);
+    if (skip) return skip;
+
     if (fromStage === "pr") {
       return this.runPrStage(refreshed);
     }
@@ -374,11 +390,66 @@ export class Orchestrator {
     return item;
   }
 
+  /** Stale-base gate: one check per (repo, base) per invocation, before the
+   *  first worktree use per item per round (agent stages create worktrees
+   *  inside runStage; the PR stage consumes item.base on the host). Returns
+   *  a skip TickEntry or null (proceed/warn-and-proceed). */
+  private freshnessGate(item: ItemRecord): TickEntry | null {
+    if (!this.baseCheck) return null;
+    const repoPath = resolveRepoPath(item.repo);
+    const key = `${repoPath}@${item.base}`;
+    let result = this.freshnessResults.get(key);
+    if (!result) {
+      try {
+        result = this.baseCheck.check(repoPath, item.base);
+      } catch (err) {
+        // An unexpected checker throw is a warn-and-proceed, never an item
+        // failure — consistent with the infra philosophy.
+        const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+        console.error(`factory: ${item.slug}: base freshness check failed (${message}) — proceeding (factory stays usable offline)`);
+        result = { action: "warn", localTip: null, upstreamTip: null, message };
+      }
+      this.freshnessResults.set(key, result);
+      if (result.action === "warn") {
+        // Warn once per repo+base per invocation (memoized hit above does not
+        // re-print).
+        console.error(`factory: ${item.slug}: ${result.message} — proceeding (factory stays usable offline)`);
+      }
+    }
+    if (result.action !== "skip") return null;
+    const detail = {
+      reason: "stale-base",
+      base: item.base,
+      localTip: result.localTip,
+      upstreamTip: result.upstreamTip,
+      repo: repoPath,
+      remedy: "git pull",
+    };
+    // Status & stage UNCHANGED: the item stays queued and is claimable next
+    // round after the operator pulls. Reusing parkedReason on a queued item
+    // is safe: renderCard parks by status, not parkedReason.
+    this.db.updateItem(item.id, { parkedReason: "stale-base", parkedDetail: detail });
+    this.db.appendHistory(item.id, "base-stale", item.stage, detail);
+    return {
+      id: item.id,
+      slug: item.slug,
+      fromStage: item.stage,
+      status: item.status,
+      changed: false,
+      detail: `stale base: ${item.base} (${result.localTip}) is behind origin/${item.base} (${result.upstreamTip}); remedy: git pull in ${repoPath} — item stays queued; re-run after pulling`,
+    };
+  }
+
   private async runAgentStage(item: ItemRecord): Promise<TickEntry> {
     const stage = item.stage;
     // Persist before execution: a crash between execute and record re-runs the
-    // whole stage (stage-level idempotency).
-    this.db.updateItem(item.id, { status: "running" });
+    // whole stage (stage-level idempotency). A prior stale-base skip's marker
+    // is cleared here (the base was pulled); without this the marker would
+    // linger through a later gate-fail rework.
+    this.db.updateItem(item.id, {
+      status: "running",
+      ...(item.parkedReason === "stale-base" ? { parkedReason: null, parkedDetail: null } : {}),
+    });
     this.db.appendHistory(item.id, "stage-start", stage, { attempt: attemptNo(item, stage) });
 
     let repoLockAcquired = false;

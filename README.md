@@ -118,6 +118,15 @@ and writes nothing, so it works while `wb run` (or any other wb command) is
 active — it reports the lock holder (`factory command in progress (pid …)`)
 and any inbox files still awaiting claim instead of failing.
 
+Before an item's first stage run of a round, `wb run`/`wb resume` check the
+item's base branch (`base:` front-matter, typically `main`) against its
+upstream: a best-effort `git fetch origin` runs on the host, and if the
+local base is strictly behind `origin/<base>` the item is skipped for that
+round and reported (local vs upstream tips) instead of working against a
+base missing already-merged work. A failed fetch — offline, no remote — only
+warns and proceeds, so the factory stays usable offline. The factory never
+pulls; the remedy is on your side: `git pull` the target repo, then re-run.
+
 `wb gc` (spec: `specs/wb-gc.spec.md`) is read-only the same way: it never
 takes the lock, creates no `factory.db`, and mutates nothing, so it is safe
 to run anytime. With `--apply` it becomes a write verb (factory lock taken)

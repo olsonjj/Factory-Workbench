@@ -161,7 +161,12 @@ export type HistoryEvent =
   | "rejected-by-human"
   | "pr-created"
   | "resurrected"
-  | "gc";
+  | "gc"
+  // Stale-base skip: local item.base is strictly behind origin/<base>; the
+  // item is NOT parked (status/stage unchanged, stays queued) — the operator
+  // remedy is `git pull` + re-run. Deliberately no OS notification: only
+  // `parked` rows notify in wb watch, and a skip is not a park.
+  | "base-stale";
 
 export interface HistoryRecord {
   ts: string;
