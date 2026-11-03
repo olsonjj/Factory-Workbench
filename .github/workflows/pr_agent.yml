@@ -31,8 +31,8 @@ jobs:
           # --- Model config ---
           CONFIG__MODEL: openai/glm-5.3-flash:cloud
           # /improve over large diffs can exceed the default 120s request
-          # timeout on Ollama Cloud
-          CONFIG__LLM_TIMEOUT: '600'
+          # timeout (config.ai_timeout) on Ollama Cloud
+          CONFIG__AI_TIMEOUT: '600'
           # avoid falling back to OpenAI's default model, which we don't have
           # a key for (must differ from CONFIG__MODEL)
           CONFIG__FALLBACK_MODELS: '[]'
