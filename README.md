@@ -38,9 +38,9 @@ state machine, gates, KB, PR publishing) is provider-agnostic.
   [claude image](#choosing-the-agent-provider) (for `agent.provider: "claude"`)
 - A provider credential exported on the host, injected into the sandbox agent
   sessions via env only (no agent install is needed on the host):
-  - `OLLAMA_API_KEY` for the default `pi` provider (Ollama Cloud), or
-  - `ANTHROPIC_API_KEY` **or** `CLAUDE_CODE_OAUTH_TOKEN` for `claude`
-    (Claude Code; whichever is set is used — never both required)
+  - `OLLAMA_API_KEY` or `OLLAMA_CLOUD_API_KEY` for the default `pi` provider
+    (Ollama Cloud), or
+  - `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` for `claude` (Claude Code)
 - `gh` CLI pre-authenticated on the host (`gh auth status`) — PR publishing
 
 ## Install
@@ -53,8 +53,8 @@ npm link               # exposes `wb` on your PATH
 # During development on wb itself, use `npm run wb -- run` (tsx, no rebuild).
 ```
 
-Note: `npm link` is inside your node version install (mise) — re-run it after
-upgrading Node. Without a link, invoke via `npm run wb -- <verb>`.
+If your Node version manager changes the active Node installation, re-run
+`npm link`. Without a link, invoke the CLI via `npm run wb -- <command>`.
 
 Initialize a factory root (self-contained and movable):
 
@@ -62,61 +62,100 @@ Initialize a factory root (self-contained and movable):
 wb init
 ```
 
-This creates a self-contained, movable root:
+This creates the initial directory layout and default config. State and
+runtime files appear as the factory is used:
 
 ```text
 factory/
-├── factory.config.json       # agent provider, per-stage models, budgets, sandbox image
+├── factory.config.json       # provider, models, review gates, budgets, sandbox, KB limits
 ├── inbox/                    # drop work items here
 ├── items/
 │   └── <slug>/
 │       ├── item.md           # the item's source of truth
 │       └── artifacts/        # triage report, spec, test log, review verdict, ...
 ├── archive/                  # triage-rejected items (resurrectable)
-├── kb/
-│   ├── global.md             # knowledge base: global layer
-│   └── projects/<repo>.md    # knowledge base: per-project layer
+├── kb/                       # global.md and projects/<repo>.md are added as needed
 ├── proposals/                # wb curate output — you apply by hand
 ├── logs/
-└── factory.db                # SQLite state; designed for direct UI reads
+├── factory.db                # SQLite state; created by the first DB-writing command
+└── pi-config/                # pi runtime staging; auth.json is never copied for sandbox use
 ```
 
 ## Usage
 
-Write a work item (see `wb template`):
+### Author a work item
+
+The fastest path is the interactive author, which validates the repository and
+writes the finished markdown directly into the inbox:
+
+```bash
+wb new
+```
+
+It prompts for title, repository (including previously used repos), base
+branch, approval stages, and description. For scripting, supply the required
+fields and a description non-interactively:
+
+```bash
+wb new "Implement the thing" \
+  --title "Implement the thing" \
+  --repo /path/to/target/repo \
+  --base main \
+  --approvals spec,review
+# Use --description-file <path> instead of the positional description, or pipe
+# the description on stdin. Omit --approvals for a fully autonomous item.
+```
+
+You can also write the file yourself (see `wb template`):
 
 ```markdown
 ---
 title: Implement the thing
 repo: /path/to/target/repo
 base: main
-approvals: []          # stages that stop for human approval, e.g. [spec, review]
+approvals: []          # allowed: triage, spec, implement, test, review
 ---
 
 Describe the task. This file is the item's source of truth.
 ```
 
-Drop it into `factory/inbox/`, then:
+Drop it into `factory/inbox/`, then run `wb run`.
 
-```bash
-wb run      # claim inbox + advance every actionable item one stage
-wb resume   # drive interrupted/human-rejected items until parked or done
-wb status   # everything the factory is doing, waiting on, or blocked by
-wb approve <id>          # release a parked approval gate
-wb reject <id> --reason "fix the X"   # feedback feeds the next agent run
-wb answer <id> -a "..."  # answer parked triage questions; triage re-runs
-wb retry <id>            # re-queue a malformed / infra-failed / exhausted-rework item
-wb curate [project]      # on-demand KB curation proposal (read-only)
-wb gc [--apply] [--json] # reconcile the DB against target repos' git state; report
-                          # leaked worktrees/branches (per-repo housekeeping) and, with
-                          # --apply, reap the safe subset (terminal items' worktrees and
-                          # stale-branch repairs; branches only under --delete-branches)
-```
+### Command reference
 
-`wb status` is always read-only: it takes no factory lock, claims nothing,
-and writes nothing, so it works while `wb run` (or any other wb command) is
-active — it reports the lock holder (`factory command in progress (pid …)`)
-and any inbox files still awaiting claim instead of failing.
+Every command that operates on a factory accepts `--root <dir>`. For commands
+other than `wb init`, `FACTORY_ROOT` is honored when `--root` is absent;
+otherwise wb reads `./factory/factory.config.json` and its `root` value,
+falling back to `./factory`. `wb init` uses `--root` or `./factory`; it does not
+read `FACTORY_ROOT` or an existing config's `root` value.
+
+| Command | What it does |
+|---|---|
+| `wb init [--root <dir>]` | Create the factory layout and default config. |
+| `wb template` | Print a work-item markdown template. |
+| `wb new [description]` | Author an item interactively or with `--title`, `--repo`, `--base`, `--approvals`, and `--description-file`. |
+| `wb run` | Claim inbox items and advance every actionable item by one stage. |
+| `wb resume` | Recover interrupted/rejected items and continue until they park or finish. |
+| `wb status [--all]` | Show items other than completed ones and their parked reasons; `--all` includes done items. |
+| `wb watch [--interval <seconds>]` | Poll read-only for new events, show a compact status card, and notify when items park (default: 5 seconds; Ctrl+C to stop). |
+| `wb approve <id-or-slug> [-n <note>]` | Release a parked approval gate. |
+| `wb reject <id-or-slug> -r <reason>` | Reject stage output; the reason becomes rework feedback. |
+| `wb answer <id-or-slug> -a <answers...>` | Answer parked triage questions in order; triage re-runs. |
+| `wb retry <id-or-slug>` | Re-queue malformed, infrastructure-failed, or exhausted-rework items. Fix malformed front-matter first. |
+| `wb curate [projects...]` | Write a KB curation proposal for selected projects, or all known projects. Never edits the KB itself. |
+| `wb gc [options]` | Reconcile factory state with target repos; report by default, reap safe resources with `--apply`. |
+
+`wb gc` also accepts `--json`, `--delete-branches`, `--force-branches`,
+`--force-dirty`, and `--force-orphans`. The mutating flags require `--apply`;
+`--force-branches` is meaningful only with `--delete-branches`. See the safety
+rules below or `wb gc --help`.
+
+`wb status`, `wb watch`, and report-mode `wb gc` are read-only: they take no
+factory lock, claim nothing, and do not create or write `factory.db`, so they
+work while another wb command is active. `status` also reports the lock holder
+and inbox files awaiting claim. `watch` only observes the factory—it does not
+advance items—and offers best-effort parked-item notifications on macOS and
+Linux.
 
 Before an item's first stage run of a round, `wb run`/`wb resume` check the
 item's base branch (`base:` front-matter, typically `main`) against its
@@ -141,8 +180,8 @@ PR). Orphans (worktrees no item row references) are report-only unless
 dirty state (a failed probe) holds like dirty, and admin-locked worktrees
 (`git worktree lock`) are reported as kept and never unlocked or reaped.
 
-What the operator sees — `wb status` shows every item's state, including *why*
-anything is parked:
+What the operator sees — `wb status` shows each item that is not done,
+including *why* anything is parked (add `--all` to include done items):
 
 ```text
 #2 add-dark-mode [awaiting-approval] stage=implement repo=/Users/me/projects/watchdog
@@ -158,11 +197,12 @@ anything is parked:
     gate attempts: review=3
 ```
 
-Pipeline: **triage → spec → implement → test → review → pull-request**.
+Pipeline: **triage → spec → implement → test → review → pr**.
 
 - Every agent stage runs in a Docker sandbox bound to a git worktree; commits
-  land on a named per-item branch (`factory/<slug>`). The host filesystem is
-  never touched beyond git plumbing.
+  land on a named per-item branch (`factory/<slug>`). Target-repository changes
+  stay in that worktree; host-side writes are limited to factory state and git
+  worktree/branch plumbing.
 - The test and review stages are gates: a failed gate sends its reasons back
   to the implementer, at most `budgets.maxGateAttempts` total attempts per
   gate, then the item parks with the full failure history.
@@ -178,70 +218,67 @@ Pipeline: **triage → spec → implement → test → review → pull-request**
 
 ## Configuration
 
-`factory/factory.config.json` (`wb init` writes this file with the defaults —
-including `"agent": { "provider": "pi" }` so the provider knob is discoverable
-in the generated file):
+`factory/factory.config.json` is created by `wb init`. This is the generated
+default configuration (with the machine-specific root path abbreviated):
 
 ```json
 {
   "root": "/path/to/factory",
-  "agent": { "provider": "claude" },
   "models": {
-    "default": "claude-sonnet-5-5",
-    "implement": "claude-sonnet-5-5",
-    "review": "claude-opus-5-5"
+    "default": "deepseek-v4-pro:0813",
+    "review": "glm-5.3-flash"
   },
-  "review": {
-    "gates": [
-      { "name": "quality" },
-      { "name": "performance", "model": "claude-haiku-5-5", "extraInstructions": "..." }
-    ]
-  },
+  "agent": { "provider": "pi" },
   "budgets": { "maxGateAttempts": 3, "maxInfraRetries": 3, "retryBackoffMs": 5000 },
-  "sandbox": { "imageName": "sandcastle:claude" }
+  "sandbox": { "imageName": "sandcastle:local" },
+  "kb": { "maxGlobalChars": 24000, "maxProjectChars": 24000 }
 }
 ```
 
-(the variant above is the `claude` one; omit the `agent` section — or set it to
-`"pi"` — and keep `sandbox.imageName: "sandcastle:local"` for the default pi
-setup, whose models are Ollama Cloud ids; the `review` block is optional and
-shown with example gates)
+All stages inherit `models.default` unless overridden by a stage key
+(`triage`, `spec`, `implement`, `test`, `review`, or `curate`). The generated
+pi defaults intentionally use a different model family for review. Judge model
+changes by cost per passed item, using the model and gate outcomes recorded in
+the factory DB, rather than benchmarks alone. Model IDs are not checked against
+a live catalog, so an unknown ID surfaces when its stage runs.
 
-- All stages default to one model; the per-stage override mechanism is the
-  mapping structure above.
-- Multi-profile review gates (ticket 11): an optional `review.gates` list
-  configures sequential review gates, each with its own lens. `name` picks
-  the lens — built-in `quality` (the classic three-axis review) and
-  `performance` (Workbench perf lens); any other name is legal (lowercase
-  alphanumeric with single hyphens — names land in artifact filenames) and
-  builds from a generic lens guided by the gate's `extraInstructions`. `model`
-  optionally overrides the gate's model (default `models.review`), and
-  `extraInstructions` are appended verbatim to the gate's prompt (the
-  KB-lesson channel). With no `review` key, exactly one implicit `quality`
-  gate runs — legacy behavior. Gates run sequentially inside one review
-  stage and fail fast: the first failing gate stops later gates and the
-  whole stage gate-fails under the shared `budgets.maxGateAttempts` budget
-  (keyed on the `review` stage). On a full pass, per-gate verdicts are
-  saved as `review-verdict:<name>` artifacts plus a combined
-  `review-verdict` artifact (the PR body's review surface); the stage
-  history records `usage.profiles` (one `{ name, model }` per gate, and
-  `usage.model` is the first gate's model).
-- Model selection rationale (JSON config files can't carry comments, so it
-  is documented in `src/config.ts` next to `DEFAULT_MODEL`): the default
-  slot is the best value-per-token model in the Ollama Cloud catalog and
-  runs the mechanical stages (triage/spec/test/curate); implement gets the
-  strongest long-horizon agent model for the family (GLM 5.3); review must
-  be a DIFFERENT model family from implement (ticket 06) so its blind
-  spots don't overlap, which is why it keeps DeepSeek V4 Pro. Judge model
-  swaps by cost per passed item (factory DB), not benchmark tables.
-- `OLLAMA_API_KEY` must be set on the host; only the Ollama Cloud API-key
-  env vars are passed into the sandbox `pi` sessions (never the host's
-  `auth.json`, which is not staged at all, or `OLLAMA_HOST`). Every
-  sandbox run mounts a writable per-run copy of the staged pi config — a
-  fresh, credential-free template copy precedes each run (a compromised
-  stage's writes persist on host disk only until that item's next stage
-  run replaces the copy) — the pi agent dir cannot be read-only since pi
-  writes its settings lock at read time. `gh` must be pre-authenticated.
+For multiple sequential review lenses, add an optional `review` block:
+
+```json
+{
+  "review": {
+    "gates": [
+      { "name": "quality" },
+      {
+        "name": "performance",
+        "model": "deepseek-v4-pro:0813",
+        "extraInstructions": "Focus on regressions in hot paths."
+      }
+    ]
+  }
+}
+```
+
+- **Review gates:** `name` selects built-in `quality` (the classic three-axis
+  review) or `performance` (Workbench performance lens). Any other unique,
+  path-safe name (lowercase alphanumeric segments joined by single hyphens)
+  uses a generic lens guided by `extraInstructions`. `model` overrides the
+  gate's model; otherwise it inherits `models.review`, then `models.default`.
+  With no `review` key, exactly one implicit `quality` gate runs. Gates execute
+  sequentially and fail fast within one review stage, sharing the stage's
+  `budgets.maxGateAttempts` budget. A single-gate run writes `review-verdict`;
+  a multi-gate run also writes `review-verdict:<name>` per gate and, after all
+  gates pass, a combined `review-verdict` for the PR body. Stage history records
+  each gate in `usage.profiles`; `usage.model` remains the first gate's model.
+- **KB prompt limits:** `kb.maxGlobalChars` and `kb.maxProjectChars` bound the
+  global and per-project layers loaded into full stages and curation batches.
+- **pi credentials and staging:** set `OLLAMA_API_KEY` or
+  `OLLAMA_CLOUD_API_KEY` on the host. Only those API-key vars reach sandboxed
+  pi sessions—never `OLLAMA_HOST` or the host's `auth.json`. Each run mounts a
+  fresh, writable copy of the minimal staged pi config (pi must write its
+  settings lock and session files). Writes in that copy persist only until the
+  item's next stage or runner cleanup; they never become durable agent state.
+  `gh` must be pre-authenticated on the host for PR publishing.
 
 ### Choosing the agent provider
 
@@ -257,23 +294,40 @@ SQLite, inbox/KB, gates, PR publishing — is provider-agnostic.
 | pi-config staging (agent-dir mounts, npm prefix) | yes | no — claude needs only env injection |
 
 Only the provider's own credential env vars are ever passed into a sandbox
-run (a `claude` run never sees `OLLAMA_API_KEY`, a `pi` run never sees
-`ANTHROPIC_API_KEY`; no endpoint vars like `OLLAMA_HOST` / `ANTHROPIC_BASE_URL`
+run (a `claude` run never sees Ollama credentials, a `pi` run never sees
+Claude credentials; no endpoint vars like `OLLAMA_HOST` / `ANTHROPIC_BASE_URL`
 are forwarded — same redirect-attack reasoning). No `claude` install is
 needed on the host: the `claude` CLI is baked into the image and auth rides
 sandbox env only.
 
-**Claude model defaults:** under `pi` the invariant is "review is a different
-model FAMILY from implement" (ticket 06); under `claude` (single family) it
-degrades to "review is a different model from implement" — sonnet runs the
-default/implement stages, opus runs review. Per-stage overrides work exactly
-as for pi; rationale lives in `src/config.ts` next to
-`CLAUDE_DEFAULT_MODEL`. Under `claude`, every `models.*` entry must be a
-`claude-*` id or a Claude Code alias (`sonnet` / `opus` / `haiku`), checked
-at startup — so switching a `wb init`-generated config (which carries Ollama
-ids) to `claude` means replacing or removing its `models` entries too.
-Beyond that shape check there is no validation against a model catalog; a
-typo in a `claude-*` id still surfaces mid-pipeline.
+To use Claude Code, change the generated config's provider, models, and image
+(keeping the existing `root`, `budgets`, and `kb` values):
+
+```json
+{
+  "agent": { "provider": "claude" },
+  "models": {
+    "default": "claude-sonnet-5-5",
+    "review": "claude-opus-5-5"
+  },
+  "sandbox": { "imageName": "sandcastle:claude" }
+}
+```
+
+Then export one of `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` and build
+the image as shown below. `implement` and the other unoverridden stages inherit
+`models.default`; per-stage and per-review-gate overrides work as they do for
+pi. You can also remove `models` entirely to use the Claude defaults.
+
+**Claude model defaults and validation:** under `pi` the intended invariant is
+"review is a different model FAMILY from implement"; under `claude` (a single
+family) it becomes "review is a different model from implement"—sonnet runs the
+default/implement stages and opus runs review. Under `claude`, every configured
+model must be a `claude-*` ID or an alias (`sonnet`, `opus`, `haiku`, or
+`opusplan`), optionally with a `[1m]` suffix. This is checked at startup, so
+switching a pi-generated config to `claude` requires replacing or removing its
+Ollama `models` entries. Beyond that shape check there is no live catalog
+validation; an unknown Claude ID still surfaces when a stage runs.
 
 **Building the claude image** — the UID/GID build-args are REQUIRED:
 Sandcastle's docker provider inspects the image's default user
@@ -295,13 +349,13 @@ working unchanged for provider `pi`.
 **Acceptance note — one-stage triage spike before relying on `claude`:**
 structured-output `<tag>…</tag>` compliance is prompt-enforced and
 model-dependent, so before relying on provider `claude`, run a single-item
-triage spike against a real repo (`agent.provider: "claude"`, an item with a
-trivial triage task, watch `wb status` / artifacts for a parseable
-`<triage>` verdict). Real end-to-end validation needs Docker +
-`ANTHROPIC_API_KEY` only — and that validation is NOT required for the
-factory's own test suite (the gated claude integration smoke is skipped
-without the env/image). Structured-output parse failures are already
-infra-class failures retried under `budgets.maxInfraRetries`.
+triage spike against a real repo with `agent.provider: "claude"` and a trivial
+triage task. Watch `wb status` and the item's artifacts for a parseable
+`<triage>` verdict. Real validation needs Docker, the built Claude image, and
+one supported Claude credential. It is not required for the factory's own test
+suite: the gated Claude integration smoke skips without the credential/image.
+Structured-output parse failures are infra-class failures retried under
+`budgets.maxInfraRetries`.
 
 ## Knowledge base
 
@@ -317,18 +371,17 @@ hand.
 
 ## Development
 
-- Tests: `npm test` — all pipeline logic runs above a single seam
-  (`StageRunner`) against hermetic fake runners; the filesystem and SQLite
-  are used for real. Provider selection (pi vs claude) is covered by
-  hermetic adapter tests (`tests/agent-provider.test.ts`) that observe the
-  provider-factory dispatch and credential/staging gating — no Docker, no
-  Claude Code, no pi needed.
-- The one Sandcastle adapter integration test is gated on Docker
-  availability + `OLLAMA_API_KEY`; without them it is skipped. A second,
-  equally optional claude smoke is gated on Docker + the
-  `sandcastle:claude` image + `ANTHROPIC_API_KEY` (or
-  `CLAUDE_CODE_OAUTH_TOKEN`); neither gated test ever blocks the suite.
-- Typecheck: `npm run typecheck`.
+- Tests: `npm test` — pipeline logic runs above the `StageRunner` seam against
+  hermetic fake runners, with real filesystem and SQLite access. Provider
+  selection (pi vs claude) is covered by hermetic adapter tests
+  (`tests/agent-provider.test.ts`) that verify provider dispatch and
+  credential/staging gating—no Docker, Claude Code, or pi required.
+- Docker-backed Sandcastle integration tests are optional. The pi tests require
+  Docker plus `OLLAMA_API_KEY`; the Claude smoke requires Docker, the
+  `sandcastle:claude` image, and `ANTHROPIC_API_KEY` or
+  `CLAUDE_CODE_OAUTH_TOKEN`. They skip when their requirements are unavailable.
+- Typecheck: `npm run typecheck`. Build: `npm run build`. CI runs both before
+  the test suite.
 
 ## Architecture notes
 
