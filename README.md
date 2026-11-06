@@ -123,9 +123,11 @@ Drop it into `factory/inbox/`, then run `wb run`.
 
 ### Command reference
 
-Every command that operates on a factory accepts `--root <dir>`. Without it,
-`FACTORY_ROOT` is honored; otherwise wb reads `./factory/factory.config.json`
-and its `root` value, falling back to `./factory`.
+Every command that operates on a factory accepts `--root <dir>`. For commands
+other than `wb init`, `FACTORY_ROOT` is honored when `--root` is absent;
+otherwise wb reads `./factory/factory.config.json` and its `root` value,
+falling back to `./factory`. `wb init` uses `--root` or `./factory`; it does not
+read `FACTORY_ROOT` or an existing config's `root` value.
 
 | Command | What it does |
 |---|---|
