@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import * as path from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import nodeProcess from "node:process";
 
 import { loadConfig, ensureConfigFile } from "../config.js";
@@ -22,6 +23,14 @@ import { runGc, GitGcScanner, GitGcReaper, renderGcHuman, renderGcJson, type GcF
 import { sleep } from "../util.js";
 
 const program = new Command("wb");
+
+// Version source of truth is the root package.json "version" field; never
+// hard-code it here.
+const packageVersion = (
+  JSON.parse(readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8")) as {
+    version: string;
+  }
+).version;
 
 interface StatusFlags { all?: boolean }
 
@@ -132,7 +141,8 @@ function logClaimReport(report: ReturnType<typeof scanInbox>): void {
 
 program
   .name("wb")
-  .description("A small, sequentially-processing software factory: markdown inbox in, reviewed pull request out.");
+  .description("A small, sequentially-processing software factory: markdown inbox in, reviewed pull request out.")
+  .version(packageVersion);
 
 program
   .command("init")

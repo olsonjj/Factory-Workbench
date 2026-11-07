@@ -151,6 +151,8 @@ read `FACTORY_ROOT` or an existing config's `root` value.
 `--force-branches` is meaningful only with `--delete-branches`. See the safety
 rules below or `wb gc --help`.
 
+`wb --version` (or `wb -V`) prints the CLI version and exits.
+
 `wb status`, `wb watch`, and report-mode `wb gc` are read-only: they take no
 factory lock, claim nothing, and do not create or write `factory.db`, so they
 work while another wb command is active. `status` also reports the lock holder
