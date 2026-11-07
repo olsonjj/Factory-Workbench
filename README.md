@@ -161,7 +161,11 @@ watching, and each of its actions (approve/reject/answer/retry, item authoring,
 Run/Resume) takes the lock only for the duration of that action, so the UI
 and the CLI can never interleave destructively. Run/Resume execute in the
 background and their progress arrives on the page over a server-sent event
-stream.
+stream. As a CSRF/DNS-rebinding guard, the API accepts only JSON requests
+whose Host/Origin match the bound localhost address, and artifact links are
+served only from real files under `items/` inside the factory root (no
+symlinks). `--port` must be an integer between 1 and 65535; a taken or
+invalid port exits with a friendly error.
 
 Before an item's first stage run of a round, `wb run`/`wb resume` check the
 item's base branch (`base:` front-matter, typically `main`) against its

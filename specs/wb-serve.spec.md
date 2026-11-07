@@ -145,7 +145,11 @@ refuse a fresh root, open the DB read-only, listen, print
 `wb serve — http://<host>:<port> · Ctrl+C to stop`, keep alive until SIGINT
 (clean exit 0; readonly DB closed). Production runners (`SandcastleStageRunner`,
 `SandcastleCurator`, `GhPrPublisher`) are constructed per mutating action,
-never at startup.
+never at startup. `--port` must be an integer 1–65535 (anything else: a
+friendly `wb serve: invalid port …` message and exit 1, before any listen);
+listen failures are friendly too — EADDRINUSE prints
+`wb serve: port <n> on <host> is already in use — pass --port <n> to pick another`
+and exits 1; other listen errors print `could not listen on <host>:<port> — <reason>`.
 
 ## Shared status layer (`src/status.ts`)
 
@@ -171,12 +175,34 @@ never at startup.
 ## HTTP surface (`createServeApp(deps)` → `{handler, flush, stop}`)
 
 `deps`: `{ root, paths, config, db (readonly), makeRunner, intervalMs? (0 = no
-timer, tests drive `flush()`), clock?, runMode? ("background" | "await") }`.
+timer, tests drive `flush()`), clock?, runMode? ("background" | "await"),
+bindHost? (the `--host` the server is bound to; the Host/Origin guard below
+also accepts it) }`.
 `makeRunner()` returns `{ runner, curator, publisher, baseCheck? }`; production
 omits `baseCheck` (the real `GitBaseFreshnessChecker` is used), tests pass a
 silently-proceeding checker (`tests/helpers.ts` rationale). Errors are JSON
-`{ error }` (+ field arrays / lock objects). Bodies over 2 MiB and non-JSON
-bodies are 400.
+`{ error }` (+ field arrays / lock objects). Bodies over 2 MiB → 400; non-JSON
+bodies → 400; non-`application/json` request Content-Type → 415.
+
+### Request hardening (CSRF / DNS rebinding)
+
+The localhost binding alone is not a browser boundary (KB 2026-11-06 16:28):
+HTML form POSTs from any page the operator merely visits reach the server with
+simple content types and no CORS preflight. Every `/api/*` request (any
+method) is therefore guarded before routing:
+
+- The Host header must be present and name `127.0.0.1`, `localhost`, or the
+  configured `--host` (`bindHost`; bracketed form accepted for IPv6), with a
+  port equal to the bound port — anything else → 403. This defeats DNS
+  rebinding (foreign hostnames never pass the allowlist) and CSRF pages
+  (which cannot forge Host).
+- An Origin header, when present, must equal `http://<Host header value>`
+  (trailing slash tolerated) — anything else → 403.
+- Mutating endpoints additionally require `Content-Type: application/json`
+  (a `; charset=` suffix is allowed); form-encoded / text/plain / missing →
+  415 before the body is parsed.
+- `GET /` serves the page itself without the API guard (static markup, no
+  data in it).
 
 | Method/Path | Result |
 |---|---|
@@ -204,8 +230,11 @@ the `item`-field backstop).
 ## Actions
 
 - Each action runs the CLI `withFactory` lifecycle minus the claim, with the
-  per-request lock. `approve`'s note maps to `-n`; `reject` requires a reason
-  (400 on empty, mirroring commander's `requiredOption`).
+  per-request lock. The runner + Orchestrator are constructed lazily, only by
+  the actions that drive stage transitions (approve/reject/answer/retry,
+  run/resume); the composer and the file drop take the lock + writable DB
+  only. `approve`'s note maps to `-n`; `reject` requires a reason (400 on
+  empty, mirroring commander's `requiredOption`).
 - `answer` deliberately diverges from the CLI's `matchAnswers`: the server
   validates each submitted `{question, answer}` pair against
   `parkedDetail.questions` by exact string equality (at least one pair,
@@ -252,8 +281,13 @@ failure one stderr line per failing poll (watch parity).
 `GET /api/artifact?path=<root-relative>`: missing path → 400; absolute or
 `..` segments → 403 (before resolving); `path.resolve(root, requested)` +
 `path.relative` prefix check → 403 on escape; the served prefix is
-allowlisted to `items/` → 403 otherwise; `statSync` file check → 404; served
-as `text/markdown; charset=utf-8` with `Cache-Control: no-store`.
+allowlisted to `items/` → 403 otherwise; an `lstat` file check → 404
+(lstat, not stat: a symlink is not a regular file here, so symlinks are
+rejected outright rather than followed); both sides are then `realpathSync`'d
+and the containment check is repeated on the real paths → 403 on escape (a
+symlinked intermediate directory cannot smuggle a file out of the root),
+404 if the real resolution fails; served as `text/markdown; charset=utf-8`
+with `Cache-Control: no-store`.
 
 ## Page (`PAGE_HTML`)
 
@@ -295,4 +329,10 @@ endpoint plus a concurrent run during a slow-stage execution; resume to
 completion with `capped: false`; SSE snapshot-then-delta with ids,
 no-change quiet, `afterId`/`Last-Event-ID` resumption without gaps or
 duplicates, fan-out of one poll to two clients; artifact containment
-(200/400/403/404 matrix).
+(200/400/403/404 matrix) plus symlink rejection (a symlink artifact → 404, a
+symlinked intermediate directory escaping the root → 403); request
+hardening: non-JSON content types → 415 (charset suffix allowed), foreign /
+wrong-port / absent Host and mismatched Origin on `/api/*` → 403 while the
+static page is served regardless; CLI entry (spawned): fresh-root refusal
+(exit 0), invalid `--port` (friendly message, exit 1), EADDRINUSE (friendly
+message, exit 1).

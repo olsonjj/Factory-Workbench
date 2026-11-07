@@ -17,7 +17,7 @@
 import * as http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import * as path from "node:path";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import nodeProcess from "node:process";
 
 import { loadConfig, type FactoryConfig } from "../config.js";
@@ -71,6 +71,10 @@ export interface ServeAppDeps {
   clock?: { now(): number };
   /** "background" (prod): run/resume answer 202 immediately. "await" (tests): answer after completion. */
   runMode?: "background" | "await";
+  /** The address the server is bound to (runServe passes `--host`). API requests
+   *  with a Host header naming anything other than 127.0.0.1 / localhost / this
+   *  host are rejected (CSRF + DNS-rebinding guard; see checkApiRequest). */
+  bindHost?: string;
 }
 
 export interface ServeApp {
@@ -250,17 +254,28 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
 
   // ------------------------------------------------------------ actions
 
-  /** Shared mutating-action scaffold: factory lock → writable DB → runner →
-   *  Orchestrator → body → dispose/close/release (the CLI `withFactory`
-   *  lifecycle, minus the inbox claim — claiming belongs to run). */
-  async function runAction<T>(body: (ctx: { db: FactoryDb; orch: Orchestrator }) => Promise<T> | T): Promise<T> {
+  /** Lock + writable DB only — for endpoints that need no orchestrator
+   *  (composer, drop): the runner wiring stays lazy, constructed only by the
+   *  actions that actually drive stages. The CLI `withFactory` lifecycle minus
+   *  the inbox claim — claiming belongs to run. */
+  async function withLockedDb<T>(body: (db: FactoryDb) => Promise<T> | T): Promise<T> {
     const release = acquireFactoryLock(deps.root);
     let db: FactoryDb | null = null;
-    let orch: Orchestrator | null = null;
     try {
       db = new FactoryDb(deps.root);
+      return await body(db);
+    } finally {
+      db?.close();
+      release();
+    }
+  }
+
+  /** Full mutating-action scaffold: withLockedDb plus the runner + Orchestrator
+   *  for endpoints that drive stage transitions. */
+  async function runAction<T>(body: (ctx: { db: FactoryDb; orch: Orchestrator }) => Promise<T> | T): Promise<T> {
+    return withLockedDb(async (db) => {
       const { runner, curator, publisher, baseCheck } = deps.makeRunner();
-      orch = new Orchestrator({
+      const orch = new Orchestrator({
         db,
         paths: deps.paths,
         config: deps.config,
@@ -270,17 +285,17 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
         sleep,
         baseCheck: baseCheck !== undefined ? baseCheck : new GitBaseFreshnessChecker(),
       });
-      return await body({ db, orch });
-    } finally {
       try {
-        await orch?.dispose();
-      } catch (err) {
-        // dispose must never block lock release or mask a successful action
-        console.error(`factory: runner dispose failed: ${err instanceof Error ? err.message : String(err)}`);
+        return await body({ db, orch });
+      } finally {
+        try {
+          await orch.dispose();
+        } catch (err) {
+          // dispose must never block lock release or mask a successful action
+          console.error(`factory: runner dispose failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
-      db?.close();
-      release();
-    }
+    });
   }
 
   /** Backgrounded run/resume (spec §6.2): lock acquired synchronously; the
@@ -347,6 +362,57 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     const item = db.getItem(id);
     if (!item) throw new HttpError(404, { error: `unknown item id ${id}` });
     return item;
+  }
+
+  /** Same-origin guard for `/api/*` requests (spec: Request hardening): the
+   *  Host header must name the loopback binding (or the configured --host)
+   *  with the bound port, and an Origin header, when present, must match it.
+   *  A CSRF page cannot forge Host, and a DNS-rebinding hostname never passes
+   *  the allowlist — the localhost binding plus this check is the boundary
+   *  (KB 2026-11-06 16:28). */
+  function checkApiRequest(req: IncomingMessage): void {
+    const localPort = (req.socket as { localPort?: number } | undefined)?.localPort;
+    const hostHeader = req.headers.host;
+    if (typeof hostHeader !== "string" || hostHeader.length === 0) {
+      throw new HttpError(403, { error: "missing Host header" });
+    }
+    const allowedHosts = new Set(["127.0.0.1", "localhost"]);
+    if (deps.bindHost && deps.bindHost.length > 0) {
+      allowedHosts.add(deps.bindHost);
+      if (deps.bindHost.includes(":")) allowedHosts.add(`[${deps.bindHost}]`);
+    }
+    let hostname: string;
+    let port: number;
+    if (hostHeader.startsWith("[")) {
+      // IPv6 hosts serialize bracketed: [::1]:7466
+      const close = hostHeader.indexOf("]");
+      if (close === -1) throw new HttpError(403, { error: "malformed Host header" });
+      hostname = hostHeader.slice(0, close + 1);
+      const rest = hostHeader.slice(close + 1);
+      port = rest.startsWith(":") ? Number(rest.slice(1)) : 80;
+    } else {
+      const colon = hostHeader.lastIndexOf(":");
+      if (colon === -1) {
+        hostname = hostHeader;
+        port = 80; // no port means the scheme default
+      } else {
+        hostname = hostHeader.slice(0, colon);
+        port = Number(hostHeader.slice(colon + 1));
+      }
+    }
+    if (!allowedHosts.has(hostname)) {
+      throw new HttpError(403, { error: `Host not allowed: ${hostname}` });
+    }
+    if (localPort !== undefined && port !== localPort) {
+      throw new HttpError(403, { error: "Host header does not match the served port" });
+    }
+    const origin = req.headers.origin;
+    if (origin !== undefined) {
+      const o = origin.replace(/\/+$/, "");
+      if (o !== `http://${hostHeader}`) {
+        throw new HttpError(403, { error: "Origin not allowed" });
+      }
+    }
   }
 
   async function handleItemAction(
@@ -478,8 +544,9 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     if (errors.length > 0) throw new HttpError(422, { errors });
 
     // authorItem is the single authoring path (same validation, serialization,
-    // slug rules, and exclusive-create as `wb new`).
-    const result = await runAction(async ({ db }) =>
+    // slug rules, and exclusive-create as `wb new`). No orchestrator is needed —
+    // the composer only writes the inbox file.
+    const result = await withLockedDb((db) =>
       authorItem({ title, repo, base, approvals: approvalsJoined, description }, db, deps.paths, serverAuthoringIO),
     );
     if (!result.ok) {
@@ -521,7 +588,7 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
         error: `invalid file name: ${filename} — expected a .md name like my-item.md`,
       });
     }
-    await runAction(async () => {
+    await withLockedDb(async () => {
       mkdirSync(deps.paths.inbox, { recursive: true });
       try {
         // Byte-exact, unparsed ("as-is"): claim/malformed semantics belong to
@@ -542,7 +609,9 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
 
   /** Artifact serving with containment (spec §6.4): reject absolute inputs
    *  and `..` segments before resolving, resolve+prefix-check against the
-   *  root, allowlist the served prefix to items/, then serve as markdown. */
+   *  root, allowlist the served prefix to items/, reject symlinks via lstat,
+   *  re-verify containment on the realpath'd pair (root, file) so symlinked
+   *  intermediate directories cannot escape, then serve as markdown. */
   function handleArtifact(url: URL, res: ServerResponse): void {
     const requested = url.searchParams.get("path");
     if (requested === null || requested.length === 0) {
@@ -563,21 +632,40 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
       sendJson(res, 403, { error: "only artifact files under items/ are served" });
       return;
     }
-    let isFile: boolean;
+    // lstat (not stat): a symlink is not a regular file here — symlinks are
+    // rejected outright rather than followed.
+    let st: ReturnType<typeof lstatSync> | null = null;
     try {
-      isFile = statSync(abs).isFile();
+      st = lstatSync(abs);
     } catch {
-      isFile = false;
+      st = null;
     }
-    if (!isFile) {
+    if (st === null || !st.isFile()) {
       sendJson(res, 404, { error: "no such artifact file" });
+      return;
+    }
+    // realpath hardening: intermediate directories may still be symlinks
+    // (lstat follows them). Resolve both sides and repeat the containment
+    // check on the real paths before reading.
+    let realAbs: string;
+    let realRoot: string;
+    try {
+      realAbs = realpathSync(abs);
+      realRoot = realpathSync(deps.root);
+    } catch {
+      sendJson(res, 404, { error: "no such artifact file" });
+      return;
+    }
+    const realRel = path.relative(realRoot, realAbs);
+    if (realRel === "" || realRel.startsWith("..") || path.isAbsolute(realRel)) {
+      sendJson(res, 403, { error: "path escapes the factory root" });
       return;
     }
     res.writeHead(200, {
       "Content-Type": "text/markdown; charset=utf-8",
       "Cache-Control": "no-store",
     });
-    res.end(readFileSync(abs));
+    res.end(readFileSync(realAbs));
   }
 
   async function handleRun(req: IncomingMessage, res: ServerResponse, kind: "run" | "resume"): Promise<void> {
@@ -598,6 +686,9 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://localhost");
     const method = req.method ?? "GET";
+    if (url.pathname.startsWith("/api/")) {
+      checkApiRequest(req);
+    }
     if (method === "GET" && url.pathname === "/") {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(PAGE_HTML);
@@ -674,6 +765,17 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  // Every mutating endpoint must receive exactly `application/json`: a CSRF
+  // page's form/text-plain POSTs use simple content types that would
+  // otherwise slip through (KB 2026-11-06 16:28). A charset suffix is allowed.
+  const contentType = req.headers["content-type"];
+  const mediaType =
+    typeof contentType === "string" ? contentType.split(";")[0]?.trim().toLowerCase() : undefined;
+  if (mediaType !== "application/json") {
+    return Promise.reject(
+      new HttpError(415, { error: "Content-Type must be application/json" }),
+    );
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -723,6 +825,16 @@ function defaultMakeRunner(config: FactoryConfig): NonNullable<ServeAppDeps["mak
   });
 }
 
+/** Parse `--port`: an integer in 1..65535 (default 7466). Throws a friendly
+ *  Error on anything else (runServe prints it and exits 1). */
+export function parseServePort(value: string | undefined): number {
+  const n = Number(value ?? String(DEFAULT_SERVE_PORT));
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    throw new Error(`invalid port "${value ?? String(DEFAULT_SERVE_PORT)}" — expected an integer between 1 and 65535`);
+  }
+  return n;
+}
+
 /**
  * `wb serve` entry point — mirrors the `watch` command's skeleton: resolve
  * config/root, refuse a fresh root exactly like status/watch, open the DB
@@ -735,6 +847,20 @@ export async function runServe(opts: {
   interval?: string;
 }): Promise<void> {
   const intervalSec = parseIntervalSeconds(opts.interval);
+  let port: number;
+  try {
+    port = parseServePort(opts.port);
+  } catch (err) {
+    console.error(`wb serve: ${err instanceof Error ? err.message : String(err)}`);
+    nodeProcess.exitCode = 1;
+    return;
+  }
+  const host = (opts.host ?? DEFAULT_SERVE_HOST).trim();
+  if (host.length === 0) {
+    console.error("wb serve: invalid host — a non-empty --host is required");
+    nodeProcess.exitCode = 1;
+    return;
+  }
   const { config, root } = loadConfig(opts.root);
   if (!existsSync(path.join(root, "factory.db"))) {
     console.log(`no factory.db in ${root} yet — it is created by any write command (e.g. \`wb new\` or \`wb run\`)`);
@@ -749,19 +875,31 @@ export async function runServe(opts: {
       db,
       makeRunner: defaultMakeRunner(config),
       intervalMs: intervalSec * 1000,
+      bindHost: host,
     });
-    const port = Number(opts.port ?? String(DEFAULT_SERVE_PORT));
-    const host = opts.host ?? DEFAULT_SERVE_HOST;
     const server = http.createServer((req, res) => app.handler(req, res));
-    server.listen(port, host);
-    console.log(`wb serve — http://${host}:${port} · Ctrl+C to stop`);
+    server.on("error", (err: NodeJS.ErrnoException) => {
+      // Friendly listen failures (EADDRINUSE, unresolvable host, ...) instead
+      // of a raw stack trace from the never-resolving command.
+      db.close();
+      if (err.code === "EADDRINUSE") {
+        console.error(`wb serve: port ${port} on ${host} is already in use — pass --port <n> to pick another`);
+      } else {
+        console.error(`wb serve: could not listen on ${host}:${port} — ${err.message}`);
+      }
+      nodeProcess.exit(1);
+    });
+    server.listen(port, host, () => {
+      console.log(`wb serve — http://${host}:${port} · Ctrl+C to stop`);
+    });
     nodeProcess.on("SIGINT", () => {
       app.stop();
       server.close();
       db.close();
       nodeProcess.exit(0);
     });
-    // Keep the command alive until Ctrl+C (mirror `wb watch`).
+    // Keep the command alive until Ctrl+C (mirror `wb watch`); listen
+    // failures terminate via the error handler above.
     await new Promise<never>(() => {});
   } finally {
     db.close();

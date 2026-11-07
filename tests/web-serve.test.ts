@@ -10,7 +10,10 @@ import { describe, it, expect, afterEach } from "vitest";
 import * as http from "node:http";
 import * as path from "node:path";
 import * as os from "node:os";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import * as net from "node:net";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import {
   createHarness,
   claim,
@@ -777,5 +780,236 @@ describe("wb serve: artifact containment", () => {
     }
     const noPath = await fetch(s.url + "/api/artifact");
     expect(noPath.status).toBe(400);
+  });
+});
+
+describe("wb serve: request hardening (CSRF and DNS rebinding)", () => {
+  /** Raw request with full header control (fetch forbids nothing here, but the
+   *  point is to send attacker-shaped headers verbatim). */
+  function rawRequest(
+    s: ServerHarness,
+    opts: { method?: string; urlPath: string; headers?: Record<string, string>; body?: string },
+  ): Promise<{ status: number; body: PostBody }> {
+    return new Promise((resolve, reject) => {
+      const u = new URL(s.url);
+      const req = http.request(
+        {
+          host: u.hostname,
+          port: u.port,
+          method: opts.method ?? "GET",
+          path: opts.urlPath,
+          headers: opts.headers,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString("utf8");
+            let parsed: PostBody = {};
+            try {
+              parsed = JSON.parse(text) as PostBody;
+            } catch {
+              parsed = { raw: text };
+            }
+            resolve({ status: res.statusCode ?? -1, body: parsed });
+          });
+        },
+      );
+      req.on("error", reject);
+      if (opts.body !== undefined) req.write(opts.body);
+      req.end();
+    });
+  }
+
+  it("rejects non-JSON content types on every mutating endpoint (415)", async () => {
+    const s = await makeServer();
+    const port = (s.server.address() as { port: number }).port;
+    // form-encoded (the CSRF shape) and text/plain → 415, before any parsing
+    for (const ct of ["application/x-www-form-urlencoded", "text/plain", "multipart/form-data"]) {
+      const r = await rawRequest(s, {
+        method: "POST",
+        urlPath: "/api/run",
+        headers: { "content-type": ct, host: `127.0.0.1:${port}` },
+        body: "title=x",
+      });
+      expect(r.status, ct).toBe(415);
+      expect(r.body.error).toContain("application/json");
+    }
+    // missing content type entirely → 415
+    const none = await rawRequest(s, {
+      method: "POST",
+      urlPath: "/api/items/1/approve",
+      headers: { host: `127.0.0.1:${port}` },
+      body: "{}",
+    });
+    expect(none.status).toBe(415);
+    // a charset suffix is allowed; the request then proceeds (404: unknown item 1)
+    const charset = await rawRequest(s, {
+      method: "POST",
+      urlPath: "/api/items/999999/approve",
+      headers: { "content-type": "application/json; charset=utf-8", host: `127.0.0.1:${port}` },
+      body: "{}",
+    });
+    expect(charset.status).toBe(404);
+  });
+
+  /** Handcrafted request over a raw socket (node's http client auto-inserts
+   *  a Host header, so the missing-Host case needs the wire itself). */
+  function rawSocketRequest(s: ServerHarness, raw: string): Promise<{ status: number; body: PostBody }> {
+    return new Promise((resolve, reject) => {
+      const u = new URL(s.url);
+      const sock = net.connect(Number(u.port), u.hostname, () => sock.write(raw));
+      let buf = "";
+      sock.on("data", (d) => {
+        buf += d.toString("utf8");
+      });
+      sock.on("end", () => {
+        const m = /^HTTP\/1.[01] (\d+)/.exec(buf);
+        const bodyStart = buf.indexOf("\r\n\r\n");
+        let parsed: PostBody = {};
+        try {
+          parsed = JSON.parse(bodyStart === -1 ? buf : buf.slice(bodyStart + 4)) as PostBody;
+        } catch {
+          parsed = { raw: buf };
+        }
+        resolve({ status: m ? Number(m[1]) : -1, body: parsed });
+      });
+      sock.on("error", reject);
+    });
+  }
+
+  it("rejects non-localhost Host headers and mismatched Origins on API requests (403)", async () => {
+    const s = await makeServer();
+    const port = (s.server.address() as { port: number }).port;
+    const good = `127.0.0.1:${port}`;
+    // a DNS-rebinding hostname never passes the allowlist
+    const rebinding = await rawRequest(s, {
+      method: "GET",
+      urlPath: "/api/status",
+      headers: { host: `evil.example:${port}` },
+    });
+    expect(rebinding.status).toBe(403);
+    // wrong port in the Host header
+    const wrongPort = await rawRequest(s, {
+      method: "GET",
+      urlPath: "/api/status",
+      headers: { host: "127.0.0.1:1" },
+    });
+    expect(wrongPort.status).toBe(403);
+    // missing Host header entirely (handcrafted on the wire; node's client
+    // always adds one). node's own HTTP/1.1 parser refuses host-less requests
+    // (400) before the handler; the guard's 403 covers anything that slips past.
+    const noHost = await rawSocketRequest(
+      s,
+      "GET /api/status HTTP/1.1\r\nConnection: close\r\n\r\n",
+    );
+    expect([400, 403]).toContain(noHost.status);
+    // an Origin that names anywhere else is refused even with a good Host
+    const evilOrigin = await rawRequest(s, {
+      method: "POST",
+      urlPath: "/api/items/999999/approve",
+      headers: { "content-type": "application/json", host: good, origin: "http://evil.example" },
+      body: "{}",
+    });
+    expect(evilOrigin.status).toBe(403);
+    // the matching same-origin pair passes the guard (then 404: unknown item)
+    const sameOrigin = await rawRequest(s, {
+      method: "POST",
+      urlPath: "/api/items/999999/approve",
+      headers: { "content-type": "application/json", host: good, origin: `http://${good}` },
+      body: "{}",
+    });
+    expect(sameOrigin.status).toBe(404);
+    // a correct localhost Host is equally fine
+    const local = await rawRequest(s, {
+      method: "GET",
+      urlPath: "/api/status",
+      headers: { host: `localhost:${port}` },
+    });
+    expect(local.status).toBe(200);
+  });
+
+  it("serves the static page itself without the API Host guard", async () => {
+    const s = await makeServer();
+    const page = await rawRequest(s, { method: "GET", urlPath: "/", headers: { host: "evil.example" } });
+    expect(page.status).toBe(200); // static markup; no data in it
+  });
+});
+
+describe("wb serve: artifact symlink hardening", () => {
+  it("rejects symlinks and symlinked directories escaping the root", async () => {
+    const s = await makeServer();
+    const slug = "link-item";
+    const artDir = path.join(s.h.paths.items, slug, "artifacts");
+    s.h.writeFile(path.join(artDir, "real.md"), "# real\n");
+    // decoy outside the factory root
+    const outside = mkdtempSync(path.join(os.tmpdir(), "wb-serve-decoy-"));
+    extraDirs.push(outside);
+    writeFileSync(path.join(outside, "secret.md"), "# secret\n");
+    // a symlink as the artifact file itself → 404 (lstat: not a regular file)
+    symlinkSync(path.join(outside, "secret.md"), path.join(artDir, "outside.md"));
+    // a symlink to a file inside the root is still rejected (no symlinks at all)
+    symlinkSync(path.join(artDir, "real.md"), path.join(artDir, "inside.md"));
+    // a symlinked intermediate directory: passes lstat, caught by realpath containment
+    symlinkSync(outside, path.join(artDir, "escape-dir"));
+    const get = async (p: string) =>
+      (await fetch(s.url + "/api/artifact?path=" + encodeURIComponent(p))).status;
+    expect(await get(`items/${slug}/artifacts/real.md`)).toBe(200);
+    expect(await get(`items/${slug}/artifacts/outside.md`)).toBe(404);
+    expect(await get(`items/${slug}/artifacts/inside.md`)).toBe(404);
+    expect(await get(`items/${slug}/artifacts/escape-dir/secret.md`)).toBe(403);
+  });
+});
+
+describe("wb serve: CLI entry (spawn, external behavior)", () => {
+  const cliPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "cli", "index.ts");
+  const roots: string[] = [];
+
+  function runServeCli(args: string[]): { stdout: string; stderr: string; status: number } {
+    const res = spawnSync("node", ["--import", "tsx", cliPath, "serve", ...args], {
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    return { stdout: res.stdout ?? "", stderr: res.stderr ?? "", status: res.status ?? -1 };
+  }
+
+  afterEach(() => {
+    while (roots.length > 0) rmSync(roots.pop()!, { recursive: true, force: true });
+  });
+
+  it("refuses a fresh root exactly like status/watch (exit 0, friendly message)", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "wb-serve-fresh-"));
+    roots.push(root);
+    const { stdout, status } = runServeCli(["--root", root]);
+    expect(status).toBe(0);
+    expect(stdout).toContain(`no factory.db in ${root} yet`);
+  });
+
+  it("rejects an invalid --port with a friendly message and exit 1", () => {
+    const h = createHarness();
+    const bad = runServeCli(["--root", h.root, "--port", "not-a-port"]);
+    expect(bad.status).toBe(1);
+    expect(bad.stderr).toContain("wb serve: invalid port");
+    expect(bad.stderr).toContain("between 1 and 65535");
+    const zero = runServeCli(["--root", h.root, "--port", "0"]);
+    expect(zero.status).toBe(1);
+    expect(zero.stderr).toContain("invalid port");
+    h.cleanup();
+  });
+
+  it("reports EADDRINUSE friendly and exits 1 when the port is taken", async () => {
+    const h = createHarness();
+    const blocker = http.createServer();
+    await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+    const port = (blocker.address() as { port: number }).port;
+    try {
+      const res = runServeCli(["--root", h.root, "--port", String(port)]);
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("already in use");
+      expect(res.stderr).toContain("--port");
+    } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+      h.cleanup();
+    }
   });
 });
