@@ -877,12 +877,16 @@ function renderRunState(p) {
     ? running.map(function (it) { return '#' + it.id + ' ' + esc(it.slug) + ' · ' + esc(it.stage || ''); }).join(' · ')
     : '(pid ' + esc(lock.pid) + ')'; // live lock, no running item (a bounded CLI action holds it)
   el.innerHTML =
-    '<div class="rounded-full ring-1 ' + STATUS_PILL.running + ' text-xs px-3 py-1 inline-flex items-center gap-1.5 cursor-pointer" title="factory pid ' + esc(lock.pid) + '">' +
+    // A <button> (not a div): keyboard users can Tab to the pill and press
+    // Enter/Space for the same scroll-and-flash action. The preflight resets
+    // button chrome (border 0, transparent bg, inherited font), so the pill
+    // renders identically to the former div.
+    '<button type="button" class="rounded-full ring-1 ' + STATUS_PILL.running + ' text-xs px-3 py-1 inline-flex items-center gap-1.5 cursor-pointer" title="factory pid ' + esc(lock.pid) + '">' +
     '<span class="h-1.5 w-1.5 rounded-full bg-blue-500 animate-pulse"></span>' +
     '<span class="text-[10px] font-semibold tracking-widest">RUNNING</span>' +
     '<span>· ' + frag + '</span>' +
     '<span class="font-mono tabular-nums" id="run-clock">' + fmtMMSS(runAnchor.ageMs) + '</span>' +
-    '</div>';
+    '</button>';
   el.classList.remove('hidden');
 }
 
