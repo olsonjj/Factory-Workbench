@@ -1412,3 +1412,33 @@ describe("wb serve: SSE read resilience + backpressure", () => {
     await s.stop();
   });
 });
+
+describe("wb serve: large snapshots reach healthy readers (no cut-on-connect livelock)", () => {
+  it("delivers a large snapshot in full to an actively-draining reader, then keeps updating (default cap)", async () => {
+    const s = await makeServer(); // production default cap (2 MiB)
+    s.h.inboxFile("big-payload", { title: "Big payload", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    claim(s.h);
+    const id = s.h.db.listItems()[0]!.id;
+    // One item whose status payload is ~0.5 MB — comfortably over the socket
+    // high-water mark (write() reports backpressure mid-chunk) yet under the
+    // cap. A healthy reader must receive it in full; a naive write→cut gate
+    // would disconnect on connect and never recover (livelock).
+    const bigError = "z".repeat(512 * 1024);
+    s.h.db.updateItem(id, {
+      status: "infrastructure-failure", stage: "test", parkedReason: "infra-budget",
+      parkedDetail: { error: bigError },
+    });
+    const stream = connectEvents(s);
+    await stream.waitUntil((n) => n >= 1, 10000); // the (only) connect event: the snapshot
+    const snapshotEvent = stream.events.find((e) => e.event === "status")!;
+    const payload = JSON.parse(snapshotEvent.data) as { items: { id: number; parkedDetail?: { error?: string } }[] };
+    const delivered = payload.items.find((i) => i.id === id);
+    expect(delivered?.parkedDetail?.error).toBe(bigError); // nothing truncated, nothing dropped
+    // The connection survives the big snapshot: a later tick still delivers.
+    s.h.db.appendHistory(id, "stage-pass", "test", { nextStage: "review" });
+    s.app.flush();
+    await stream.waitUntil((n) => n >= 2, 10000);
+    expect(stream.events.some((e) => e.event === "history")).toBe(true);
+    stream.abort();
+  });
+});
