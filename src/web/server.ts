@@ -17,12 +17,13 @@
 import * as http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import * as path from "node:path";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import nodeProcess from "node:process";
 
 import { loadConfig, type FactoryConfig } from "../config.js";
 import { makePaths, type FactoryPaths } from "../paths.js";
-import { FactoryDb, type HistoryFeedRow } from "../db.js";
+import { FactoryDb, type HistoryFeedRow, type WatchSnapshot } from "../db.js";
 import {
   acquireFactoryLock,
   FactoryBusyError,
@@ -39,7 +40,7 @@ import { scanInbox } from "../inbox.js";
 import { GitBaseFreshnessChecker, type BaseFreshnessChecker } from "../baseFreshness.js";
 import { parseIntervalSeconds } from "../watch.js";
 import { sleep } from "../util.js";
-import { buildStatusPayload, classifyInbox, type StatusPayload } from "../status.js";
+import { buildStatusPayload, statusFingerprint, type StatusPayload } from "../status.js";
 import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, agentEnvFor } from "../adapters/sandcastle.js";
 import { PAGE_HTML } from "./page.js";
 
@@ -47,6 +48,11 @@ export const DEFAULT_SERVE_PORT = 7466;
 export const DEFAULT_SERVE_HOST = "127.0.0.1";
 /** Bodies larger than this are rejected before parsing (composer markdown, drops). */
 export const MAX_BODY_BYTES = 2 * 1024 * 1024;
+/** Reconnect replay cap: a client returning after a long disconnect gets at
+ *  most this many missed history rows; anything older is dropped in favor of
+ *  the fresh `status` snapshot, which is authoritative for current state
+ *  (bounds the replay query; rework finding 6). */
+export const MAX_SSE_REPLAY_ROWS = 500;
 /** From the 5th consecutive failing DB read, surface once per failing poll (watch parity). */
 const READ_FAILURE_NOTICE_THRESHOLD = 5;
 /** Strict CSP emitted on every response (page, API JSON, SSE, artifacts,
@@ -135,18 +141,12 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     return buildStatusPayload({ root: deps.root, paths: deps.paths, db: deps.db, clock });
   }
 
-  /** Fingerprint over (items' id/status/stage/parkedReason/parkedDetail/feedback/updatedAt
-   *  + claimable inbox filenames + lock pid/ts): the "did anything change"
-   *  signal for the per-client status resend decision. */
-  function fingerprintOf(
-    items: Pick<ItemRecord, "id" | "status" | "stage" | "parkedReason" | "parkedDetail" | "feedback" | "updatedAt">[],
-    claimable: string[],
-    lock: { pid: number; ts: number } | null,
-  ): string {
-    const itemPart = items
-      .map((i) => [i.id, i.status, i.stage, i.parkedReason, JSON.stringify(i.parkedDetail), i.feedback, i.updatedAt].join("|"))
-      .join(";");
-    return [itemPart, claimable.join(","), lock ? `${lock.pid}@${lock.ts}` : "-"].join("§");
+  /** One payload per tick, built from the read snapshot the poller already
+   *  holds (rework finding 2): the snapshot's items and `maxHistoryId` are
+   *  reused; the payload build adds only the artifacts/known-repos reads and
+   *  the inbox scan + lock read, each exactly once per tick. */
+  function payloadFromSnapshot(snap: WatchSnapshot): StatusPayload {
+    return buildStatusPayload({ root: deps.root, paths: deps.paths, db: deps.db, clock, snapshot: snap });
   }
 
   function writeHistoryEvent(res: ServerResponse, row: HistoryFeedRow, slug: string): void {
@@ -168,8 +168,9 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     res.write(`event: status\ndata: ${JSON.stringify(payload)}\n\n`);
   }
 
-  /** SSE connect: optional replay (afterId / Last-Event-ID), then one full
-   *  status snapshot. Read-only; no factory lock. */
+  /** SSE connect: optional bounded replay (afterId / Last-Event-ID), then one
+   *  full status snapshot. Read-only; no factory lock. The payload is built
+   *  once from the same snapshot read — no second items/inbox/lock pass. */
   function handleEvents(req: IncomingMessage, res: ServerResponse, url: URL): void {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -185,33 +186,49 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
       if (typeof header === "string" && Number.isInteger(Number(header))) afterId = Number(header);
     }
     const snap = deps.db.getWatchSnapshot(null);
+    const payload = payloadFromSnapshot(snap);
     const byId = new Map(snap.items.map((i) => [i.id, i] as const));
     let last = snap.maxHistoryId ?? 0;
     if (afterId !== null) {
-      // Replay exactly the missed rows before the status event (no gaps, no duplicates).
-      for (const row of deps.db.getHistorySince(afterId)) {
+      // Replay exactly the missed rows before the status event (no gaps, no
+      // duplicates), bounded to the most recent MAX_SSE_REPLAY_ROWS rows —
+      // beyond that the snapshot below is the whole truth.
+      const missed = deps.db.getHistorySince(afterId);
+      const replay = missed.length > MAX_SSE_REPLAY_ROWS ? missed.slice(-MAX_SSE_REPLAY_ROWS) : missed;
+      for (const row of replay) {
         writeHistoryEvent(res, row, byId.get(row.item_id)?.slug ?? "(unknown)");
         last = Math.max(last, row.id);
       }
     }
-    const payload = statusPayload();
     sendStatus(res, payload);
     const client: SseClient = {
       res,
       lastEventId: Math.max(afterId ?? 0, last),
-      fingerprint: fingerprintOf(payload.items, payload.inbox.claimable, payload.lock),
+      fingerprint: statusFingerprint(payload),
     };
     clients.add(client);
+    // Advance the poller's cursor to the least-ahead connected client so the
+    // first tick after an idle (zero-client) period never re-fetches rows
+    // everyone has already seen. Safe because every client's position is ≥ the
+    // cursor (connect snapshots deliver everything up to `last`; per-tick
+    // delivery never falls behind the fetched window).
+    cursor = Math.max(cursor, Math.min(...[...clients].map((c) => c.lastEventId)));
     res.on("close", () => clients.delete(client));
   }
 
   /**
    * One poll tick — the single DB poll fanned out to every connected client.
+   * Zero clients ⇒ zero work: no snapshot read, no payload build (rework
+   * finding 3 — an idle open tab must not cost a whole-store rescan).
    * DB read failures are swallowed (counter + stderr notice from the 5th),
-   * mirroring `wb watch`'s pollOnce; clients stay open.
+   * mirroring `wb watch`'s pollOnce; clients stay open. The payload is built
+   * ONCE from the tick's snapshot and the fingerprint derived from it; each
+   * client receives the history rows past its own position plus a `status`
+   * event iff its fingerprint is stale.
    */
   function flush(): void {
-    let snap: ReturnType<FactoryDb["getWatchSnapshot"]>;
+    if (clients.size === 0) return;
+    let snap: WatchSnapshot;
     try {
       snap = deps.db.getWatchSnapshot(cursor);
       consecutiveReadFailures = 0;
@@ -222,6 +239,9 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
       }
       return;
     }
+    cursor = snap.maxHistoryId ?? cursor;
+    const payload = payloadFromSnapshot(snap);
+    const fingerprint = statusFingerprint(payload);
     const byId = new Map(snap.items.map((i) => [i.id, i] as const));
     for (const client of clients) {
       for (const row of snap.historySince) {
@@ -229,17 +249,6 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
         client.lastEventId = row.id;
         writeHistoryEvent(client.res, row, byId.get(row.item_id)?.slug ?? "(unknown)");
       }
-    }
-    cursor = snap.maxHistoryId ?? cursor;
-    if (clients.size === 0) return;
-    // Status resend: compute the change fingerprint once, resend the full
-    // payload to every client whose copy is stale (no client-side merge).
-    const claimable = classifyInbox(deps.db, deps.paths.inbox).claimable;
-    const lock = readLockInfo(deps.root);
-    const fingerprint = fingerprintOf(snap.items, claimable, lock);
-    if (![...clients].some((c) => c.fingerprint !== fingerprint)) return;
-    const payload = statusPayload();
-    for (const client of clients) {
       if (client.fingerprint === fingerprint) continue;
       sendStatus(client.res, payload);
       client.fingerprint = fingerprint;
@@ -620,8 +629,10 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
    *  and `..` segments before resolving, resolve+prefix-check against the
    *  root, allowlist the served prefix to items/, reject symlinks via lstat,
    *  re-verify containment on the realpath'd pair (root, file) so symlinked
-   *  intermediate directories cannot escape, then serve as markdown. */
-  function handleArtifact(url: URL, res: ServerResponse): void {
+   *  intermediate directories cannot escape, then serve as markdown. The
+   *  containment checks stay synchronous; the file read itself is async so a
+   *  large artifact never blocks the tick loop (rework finding 5). */
+  async function handleArtifact(url: URL, res: ServerResponse): Promise<void> {
     const requested = url.searchParams.get("path");
     if (requested === null || requested.length === 0) {
       sendJson(res, 400, { error: "path query parameter is required" });
@@ -670,11 +681,20 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
       sendJson(res, 403, { error: "path escapes the factory root" });
       return;
     }
+    let bytes: Buffer;
+    try {
+      bytes = await readFile(realAbs);
+    } catch {
+      // Verified regular file a moment ago; it vanished (or became unreadable)
+      // between the check and the read.
+      sendJson(res, 404, { error: "no such artifact file" });
+      return;
+    }
     res.writeHead(200, {
       "Content-Type": "text/markdown; charset=utf-8",
       "Cache-Control": "no-store",
     });
-    res.end(readFileSync(realAbs));
+    res.end(bytes);
   }
 
   async function handleRun(req: IncomingMessage, res: ServerResponse, kind: "run" | "resume"): Promise<void> {
@@ -717,7 +737,7 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
       return;
     }
     if (method === "GET" && url.pathname === "/api/artifact") {
-      handleArtifact(url, res);
+      await handleArtifact(url, res);
       return;
     }
     if (method === "POST" && url.pathname === "/api/items") {

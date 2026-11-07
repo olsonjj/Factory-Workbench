@@ -22,8 +22,16 @@ import type { FactoryPaths } from "./paths.js";
 
 /** Classify unclaimed inbox files without mutating anything (read-only peer of `scanInbox`).
  *  Matches scanInbox's skip rule via the shared `claimBlocked` predicate and
- *  shares `listInboxFiles`, so "awaiting claim" means `wb run` will actually claim it. */
-export function classifyInbox(db: FactoryDb, inboxDir: string): {
+ *  shares `listInboxFiles`, so "awaiting claim" means `wb run` will actually claim it.
+ *  `opts.bySlug`: an in-memory slug → item map (e.g. the items a caller already
+ *  read from a `getWatchSnapshot`); when present it replaces the per-file
+ *  `db.findBySlug` lookup so a per-tick caller pays one query, not one per
+ *  inbox file (rework finding 2). */
+export function classifyInbox(
+  db: FactoryDb,
+  inboxDir: string,
+  opts: { bySlug?: ReadonlyMap<string, ItemRecord> } = {},
+): {
   claimable: string[];
   alreadyClaimed: { file: string; item: ItemRecord }[];
   error: NodeJS.ErrnoException | null;
@@ -43,7 +51,9 @@ export function classifyInbox(db: FactoryDb, inboxDir: string): {
   const claimable: string[] = [];
   const alreadyClaimed: { file: string; item: ItemRecord }[] = [];
   for (const fileName of files) {
-    const existing = db.findBySlug(slugify(path.basename(fileName)));
+    const existing = opts.bySlug
+      ? opts.bySlug.get(slugify(path.basename(fileName)))
+      : db.findBySlug(slugify(path.basename(fileName)));
     if (claimBlocked(existing)) {
       alreadyClaimed.push({ file: fileName, item: existing });
     } else {
@@ -142,17 +152,17 @@ export function isParkedStatus(status: string): boolean {
     !(TERMINAL_STATUSES as readonly string[]).includes(status);
 }
 
-function toStatusItem(db: FactoryDb, item: ItemRecord): StatusItem {
+function toStatusItem(item: ItemRecord, artifactsByItem: ReadonlyMap<number, { name: string; stage: StageName | null; path: string; createdAt: string }[]>): StatusItem {
   const out: StatusItem = { ...item };
   if (item.status === "awaiting-approval") {
     // The parked stage's artifacts — "read the spec before approving".
     const stage = item.parkedDetail?.stage;
     if (typeof stage === "string") {
-      const artifacts = db.getArtifacts(item.id).filter((a) => a.stage === stage);
+      const artifacts = (artifactsByItem.get(item.id) ?? []).filter((a) => a.stage === stage);
       if (artifacts.length > 0) out.artifacts = artifacts;
     }
   } else if (item.status === "done") {
-    const artifacts = db.getArtifacts(item.id);
+    const artifacts = artifactsByItem.get(item.id) ?? [];
     if (artifacts.length > 0) out.artifacts = artifacts;
     const d = item.parkedDetail;
     if (d && typeof d.prUrl === "string") {
@@ -180,22 +190,45 @@ function serializeLock(root: string, clock: { now(): number }): StatusPayload["l
   };
 }
 
+/** The "did anything change" fingerprint derived from a built payload — the
+ *  SSE poller compares each client's copy against it to decide whether the
+ *  full `status` event must be re-sent (building the payload once per tick
+ *  and deriving the fingerprint from it is what keeps a tick single-read:
+ *  rework finding 2). */
+export function statusFingerprint(payload: StatusPayload): string {
+  const itemPart = payload.items
+    .map((i) => [i.id, i.status, i.stage, i.parkedReason, JSON.stringify(i.parkedDetail), i.feedback, i.updatedAt].join("|"))
+    .join(";");
+  return [itemPart, payload.inbox.claimable.join(","), payload.lock ? `${payload.lock.pid}@${payload.lock.ts}` : "-"].join("§");
+}
+
 /**
  * The one snapshot serializer behind `GET /api/status` and the SSE `status`
- * event. Read-only: `listItems`/`getArtifacts`/`getMaxHistoryId` +
- * `classifyInbox` + a lock read. No factory lock, no writes — the same
- * discipline as `wb status`.
+ * event. Read-only: one items read (or the caller's prefetched `snapshot`), one
+ * artifacts read (`listArtifactsByItem` — never per-item N+1), one known-repos
+ * read, one inbox directory scan + a lock read. No factory lock, no writes —
+ * the same discipline as `wb status`.
+ *
+ * `snapshot` lets a per-tick caller (the SSE poller) hand in the
+ * `getWatchSnapshot` it already read: the items and `maxHistoryId` are reused,
+ * and inbox slugs resolve against them in memory instead of one `findBySlug`
+ * per inbox filename — no second `SELECT * FROM items`, no second
+ * `MAX(id)`, no per-file queries.
  */
 export function buildStatusPayload(input: {
   root: string;
   paths: FactoryPaths;
   db: FactoryDb;
   clock?: { now(): number };
+  snapshot?: { items: ItemRecord[]; maxHistoryId: number | null };
 }): StatusPayload {
   const clock = input.clock ?? { now: () => Date.now() };
   const db = input.db;
-  const items = db.listItems();
-  const classified = classifyInbox(db, input.paths.inbox);
+  const items = input.snapshot?.items ?? db.listItems();
+  const maxHistoryId = input.snapshot ? input.snapshot.maxHistoryId : db.getMaxHistoryId();
+  const bySlug = new Map(items.map((i) => [i.slug, i] as const));
+  const classified = classifyInbox(db, input.paths.inbox, { bySlug });
+  const artifactsByItem = db.listArtifactsByItem();
   const decisions = items.filter((i) => isParkedStatus(i.status)).length;
   const running = items.filter((i) => i.status === "running");
   const queued = items.filter((i) => i.status === "queued").length;
@@ -212,7 +245,7 @@ export function buildStatusPayload(input: {
   return {
     root: input.root,
     generatedAt: new Date(clock.now()).toISOString(),
-    maxHistoryId: db.getMaxHistoryId(),
+    maxHistoryId,
     lock: serializeLock(input.root, clock),
     counts: {
       decisions,
@@ -233,6 +266,6 @@ export function buildStatusPayload(input: {
       error: classified.error ? (classified.error.message ?? String(classified.error)) : null,
     },
     // ALL items (incl. done), newest-last — the UI filters.
-    items: items.map((item) => toStatusItem(db, item)),
+    items: items.map((item) => toStatusItem(item, artifactsByItem)),
   };
 }

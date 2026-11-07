@@ -24,7 +24,7 @@ import {
   type TestHarness,
   type Script,
 } from "./helpers.js";
-import { createServeApp, SERVE_CSP, type ServeApp, type ServeAppDeps } from "../src/web/server.js";
+import { createServeApp, SERVE_CSP, MAX_SSE_REPLAY_ROWS, type ServeApp, type ServeAppDeps } from "../src/web/server.js";
 import { FactoryDb } from "../src/db.js";
 import { PAGE_HTML } from "../src/web/page.js";
 import { ITEM_TEMPLATE, parseItemMarkdown } from "../src/frontmatter.js";
@@ -1039,5 +1039,222 @@ describe("wb serve: CLI entry (spawn, external behavior)", () => {
       await new Promise<void>((resolve) => blocker.close(() => resolve()));
       h.cleanup();
     }
+  });
+});
+
+// ------------------------------------------------- per-tick query budget
+// Regression tests for the performance rework: the SSE poller's per-tick call
+// graph must stay single-read (one payload per tick, no N+1 artifacts, no
+// per-file slug queries) and must cost zero statements with no consumers
+// (KB 2026-11-06 17:02: prove it with a prepare/query-count assertion).
+
+describe("wb serve: per-tick query budget (counting proxy)", () => {
+  interface StmtCounts {
+    /** `prepare()` calls on the underlying connection (cache effectiveness). */
+    prepares: number;
+    /** Statement executions, keyed by SQL text. */
+    execs: Map<string, number>;
+    total: number;
+  }
+
+  /** Monkey-patch the readonly connection's `prepare` so every statement the
+   *  FactoryDb compiles (its own statement cache routes through here exactly
+   *  once per SQL text) and every execution is counted. Internal calls
+   *  (e.g. getWatchSnapshot's transaction) resolve the patched own-property
+   *  through `this`, so nothing escapes the count. */
+  function instrumentDb(db: FactoryDb): StmtCounts {
+    const counts: StmtCounts = { prepares: 0, execs: new Map(), total: 0 };
+    const raw = db.db as unknown as { prepare: (sql: string) => unknown };
+    const orig = db.db.prepare.bind(db.db);
+    raw.prepare = (sql: string) => {
+      counts.prepares += 1;
+      const stmt = orig(sql) as unknown as Record<string, (...args: unknown[]) => unknown>;
+      const wrapped: Record<string, (...args: unknown[]) => unknown> = {};
+      for (const m of ["get", "all", "run", "iterate"] as const) {
+        const fn = stmt[m];
+        if (typeof fn !== "function") continue;
+        wrapped[m] = (...args: unknown[]) => {
+          counts.total += 1;
+          counts.execs.set(sql, (counts.execs.get(sql) ?? 0) + 1);
+          return fn.apply(stmt, args);
+        };
+      }
+      return wrapped as unknown as ReturnType<FactoryDb["db"]["prepare"]>;
+    };
+    return counts;
+  }
+
+  function execsOf(counts: StmtCounts, needle: string): number {
+    let n = 0;
+    for (const [sql, c] of counts.execs) {
+      if (sql.includes(needle)) n += c;
+    }
+    return n;
+  }
+
+  function reset(counts: StmtCounts): void {
+    counts.prepares = 0;
+    counts.execs.clear();
+    counts.total = 0;
+  }
+
+  /** Server with an instrumented readonly observation DB (manual wiring —
+   *  the point is to count what the serve-side read path executes). */
+  async function makeInstrumentedServer(): Promise<{
+    s: ServerHarness;
+    counts: StmtCounts;
+  }> {
+    const h = createHarness();
+    const runner = new ScriptedRunner({});
+    const rodb = FactoryDb.openReadonly(h.root);
+    const counts = instrumentDb(rodb);
+    const app = createServeApp({
+      root: h.root,
+      paths: h.paths,
+      config: h.config,
+      db: rodb,
+      makeRunner: () => ({ runner, curator: null, publisher: new FakePublisher(), baseCheck: silentProceed }),
+      intervalMs: 0,
+      runMode: "await",
+    });
+    const server = http.createServer((req, res) => app.handler(req, res));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const s: ServerHarness = {
+      h,
+      app,
+      server,
+      url,
+      runner,
+      stop: async () => {
+        app.stop();
+        server.closeAllConnections?.();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        rodb.close();
+        h.cleanup();
+      },
+    };
+    servers.push(s);
+    return { s, counts };
+  }
+
+  /** Seed several parked/done items with artifacts directly (no stage runner). */
+  function seedItems(h: TestHarness, n: number): void {
+    for (let i = 0; i < n; i++) {
+      const parked = i % 3 === 0;
+      const done = !parked && i % 3 === 1;
+      const item = h.db.insertItem({
+        slug: `budget-item-${i}`,
+        title: `Budget item ${i}`,
+        repo: "/tmp/repo",
+        base: "main",
+        approvals: [],
+        stage: "spec",
+        status: parked ? "awaiting-approval" : done ? "done" : "queued",
+        ...(parked
+          ? { parkedReason: "awaiting-approval", parkedDetail: { stage: "spec", doneStage: "triage" } }
+          : done
+            ? { parkedDetail: { prUrl: "https://github.com/x/y/pull/1", prNumber: i, draft: false } }
+            : {}),
+      });
+      h.db.addArtifact(item.id, "spec", `spec-artifact-${i}`, `items/budget-item-${i}/artifacts/spec-${i}.md`);
+      if (done) h.db.addArtifact(item.id, "pr", `pr-artifact-${i}`, `items/budget-item-${i}/artifacts/pr-${i}.md`);
+    }
+  }
+
+  it("builds a payload with exactly one artifacts query and one items read (no N+1)", async () => {
+    const { s, counts } = await makeInstrumentedServer();
+    seedItems(s.h, 12); // 4 awaiting-approval + 4 done (both artifact-bearing) + 4 queued
+    const res = await fetch(s.url + "/api/status");
+    expect(res.status).toBe(200);
+    const payload = (await res.json()) as {
+      items: { status: string; artifacts?: unknown[]; prUrl?: string }[];
+    };
+    expect(payload.items.filter((i) => i.status === "awaiting-approval").every((i) => (i.artifacts ?? []).length === 1)).toBe(true);
+    expect(payload.items.filter((i) => i.status === "done").every((i) => (i.artifacts ?? []).length === 2 && typeof i.prUrl === "string")).toBe(true);
+    // One artifacts query per payload — never one per artifact-bearing item.
+    expect(execsOf(counts, "FROM artifacts")).toBe(1);
+    // One whole-store items read per payload — never per-item.
+    expect(execsOf(counts, "SELECT * FROM items")).toBe(1);
+    // Inbox classification resolves slugs in memory — no per-file slug query.
+    expect(execsOf(counts, "WHERE slug")).toBe(0);
+  });
+
+  it("runs a changed tick with at most one items SELECT, one artifacts query, and a warm statement cache", async () => {
+    const { s, counts } = await makeInstrumentedServer();
+    seedItems(s.h, 30);
+    const id = s.h.db.listItems()[0]!.id;
+    const stream = connectEvents(s);
+    await stream.waitUntil((n) => n >= 1);
+    s.app.flush(); // warm every read path once (cache miss → prepare)
+    reset(counts);
+    // activity: a history row + an item state change
+    s.h.db.appendHistory(id, "stage-start", "test", { attempt: 1 });
+    s.h.db.updateItem(id, { status: "awaiting-approval" });
+    const before = stream.events.length;
+    s.app.flush();
+    await stream.waitUntil((n) => n >= before + 2); // one history row + one status event
+    // The statement cache: zero new prepares on a warmed-up tick.
+    expect(counts.prepares).toBe(0);
+    // Exactly one whole-store items read per tick (the getWatchSnapshot one).
+    expect(execsOf(counts, "SELECT * FROM items")).toBe(1);
+    // One artifacts query per payload (built once per tick).
+    expect(execsOf(counts, "FROM artifacts")).toBe(1);
+    // One max-history-id + one history-since + one known-repos query — nothing else.
+    expect(execsOf(counts, "AS maxId")).toBe(1);
+    expect(execsOf(counts, "FROM history WHERE id >")).toBe(1);
+    expect(execsOf(counts, "AS latest_id")).toBe(1);
+    expect(counts.total).toBe(5);
+    stream.abort();
+  });
+
+  it("executes zero statements on a zero-client tick (idle server)", async () => {
+    const { s, counts } = await makeInstrumentedServer();
+    seedItems(s.h, 5);
+    const id = s.h.db.listItems()[0]!.id;
+    // No SSE clients connected. History rows pile up while idle.
+    s.h.db.appendHistory(id, "stage-start", "spec", {});
+    s.h.db.appendHistory(id, "stage-pass", "spec", { nextStage: "implement" });
+    reset(counts);
+    s.app.flush();
+    expect(counts.total).toBe(0);
+    expect(counts.prepares).toBe(0);
+    // A client connecting after the idle period gets the current snapshot and
+    // the poller continues from its position — no re-fetch of the idle rows.
+    const stream = connectEvents(s);
+    await stream.waitUntil((n) => n >= 1);
+    expect(stream.events[0]!.event).toBe("status");
+    const maxId = s.h.db.getMaxHistoryId();
+    reset(counts);
+    s.h.db.appendHistory(id, "stage-start", "implement", {});
+    s.app.flush();
+    await stream.waitUntil((n) => n >= 2);
+    const row = stream.events.find((e) => e.event === "history")!;
+    expect(row.id).toBe(maxId! + 1); // only the post-connect row is fetched
+    expect(execsOf(counts, "FROM history WHERE id >")).toBe(1);
+    stream.abort();
+  });
+
+  it("bounds reconnect replay to MAX_SSE_REPLAY_ROWS rows (snapshot beyond that)", async () => {
+    const { s } = await makeInstrumentedServer();
+    s.h.inboxFile("replay-cap", { title: "Replay cap", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    claim(s.h);
+    const id = s.h.db.listItems()[0]!.id;
+    for (let i = 0; i < MAX_SSE_REPLAY_ROWS + 100; i++) {
+      s.h.db.appendHistory(id, "stage-start", "spec", { n: i });
+    }
+    const maxId = s.h.db.getMaxHistoryId()!;
+    const stream = connectEvents(s, { query: "afterId=0" }); // far behind: everything is missed
+    await stream.waitUntil((n) => n >= MAX_SSE_REPLAY_ROWS + 1);
+    expect(stream.events).toHaveLength(MAX_SSE_REPLAY_ROWS + 1);
+    const history = stream.events.filter((e) => e.event === "history");
+    expect(history).toHaveLength(MAX_SSE_REPLAY_ROWS);
+    // The most recent MAX_SSE_REPLAY_ROWS rows, in id order, then the snapshot.
+    expect(history[0]!.id).toBe(maxId - MAX_SSE_REPLAY_ROWS + 1);
+    expect(history[history.length - 1]!.id).toBe(maxId);
+    const status = stream.events[stream.events.length - 1]!;
+    expect(status.event).toBe("status");
+    expect(status.id).toBeNull();
+    stream.abort();
   });
 });

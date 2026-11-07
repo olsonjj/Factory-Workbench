@@ -277,16 +277,22 @@ the `item`-field backstop).
 Headers: `text/event-stream`, `no-cache`, `keep-alive`, `X-Accel-Buffering:
 no`. On connect: one read snapshot; when `afterId` (query param, or the
 `Last-Event-ID` header EventSource sends) is present, the missed rows
-(`getHistorySince(afterId)`) are replayed first — then one `status` event
-carrying the full `StatusPayload` (no `id:` field; ids belong only to history
-rows). Per tick (one shared poll for all clients, `flush()`): one
-`getWatchSnapshot(cursor)` read; each client receives exactly the rows with
-`id > client.lastEventId` (in order, tagged `id:`), then a `status` event iff
-a fingerprint over (items' id/status/stage/parkedReason/parkedDetail/
-feedback/updatedAt + claimable inbox filenames + lock pid/ts) changed. Reconnect
-or a second tab gets a fresh snapshot; there is no client-side merge. DB read
-failures are swallowed with a consecutive-failure counter; from the 5th
-failure one stderr line per failing poll (watch parity).
+(`getHistorySince(afterId)`) are replayed first — bounded to the most
+recent 500 rows (`MAX_SSE_REPLAY_ROWS`; anything older is dropped in favor
+of the snapshot, which is authoritative for current state) — then one
+`status` event carrying the full `StatusPayload` (no `id:` field; ids
+belong only to history rows). Per tick (one shared poll for all clients,
+`flush()`): zero connected clients means zero work (no snapshot read, no
+payload build); otherwise one `getWatchSnapshot(cursor)` read, one payload
+built from that same snapshot (inbox slugs resolve against the snapshot's
+items in memory; one artifacts query via `listArtifactsByItem`), and the
+fingerprint derived from the built payload; each client receives exactly
+the rows with `id > client.lastEventId` (in order, tagged `id:`), then a
+`status` event iff a fingerprint over (items' id/status/stage/parkedReason/
+parkedDetail/feedback/updatedAt + claimable inbox filenames + lock pid/ts)
+changed. Reconnect or a second tab gets a fresh snapshot; there is no
+client-side merge. DB read failures are swallowed with a consecutive-failure
+counter; from the 5th failure one stderr line per failing poll (watch parity).
 
 ## Artifact containment
 
