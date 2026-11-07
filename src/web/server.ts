@@ -49,6 +49,15 @@ export const DEFAULT_SERVE_HOST = "127.0.0.1";
 export const MAX_BODY_BYTES = 2 * 1024 * 1024;
 /** From the 5th consecutive failing DB read, surface once per failing poll (watch parity). */
 const READ_FAILURE_NOTICE_THRESHOLD = 5;
+/** Strict CSP emitted on every response (page, API JSON, SSE, artifacts,
+ *  errors alike): nothing loads or connects anywhere but self, inline
+ *  style/script only. Defense-in-depth for a localhost control surface —
+ *  combined with the self-contained page (no remote code) it means a
+ *  compromised/remote resource can never run or exfiltrate (rework per KB
+ *  2026-11-06 16:40). */
+export const SERVE_CSP =
+  "default-src 'none'; frame-ancestors 'none'; style-src 'unsafe-inline'; " +
+  "script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:";
 
 // ---------------------------------------------------------------- seam types
 
@@ -736,6 +745,7 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
   }
 
   function handler(req: IncomingMessage, res: ServerResponse): void {
+    res.setHeader("Content-Security-Policy", SERVE_CSP);
     handle(req, res).catch((err: unknown) => {
       if (res.writableEnded || res.destroyed) return;
       if (err instanceof HttpError) {

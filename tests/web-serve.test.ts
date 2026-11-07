@@ -24,7 +24,7 @@ import {
   type TestHarness,
   type Script,
 } from "./helpers.js";
-import { createServeApp, type ServeApp, type ServeAppDeps } from "../src/web/server.js";
+import { createServeApp, SERVE_CSP, type ServeApp, type ServeAppDeps } from "../src/web/server.js";
 import { FactoryDb } from "../src/db.js";
 import { PAGE_HTML } from "../src/web/page.js";
 import { ITEM_TEMPLATE, parseItemMarkdown } from "../src/frontmatter.js";
@@ -204,6 +204,34 @@ describe("wb serve: page, template, snapshot (CLI status contract)", () => {
     expect(await tmpl.text()).toBe(ITEM_TEMPLATE);
     // Observation never takes the factory lock.
     expect(existsSync(path.join(s.h.root, "factory.lock"))).toBe(false);
+  });
+
+  it("ships a self-contained page (no remote code) with a strict CSP on every response", async () => {
+    // A remote script on a localhost control surface would run same-origin,
+    // invisible to the Host/Origin CSRF guards (KB 2026-11-06 16:40 + rework):
+    // the page must carry its own styles and reference nothing off-box.
+    expect(PAGE_HTML).not.toContain("cdn.tailwindcss.com");
+    expect(PAGE_HTML).not.toMatch(/<script[^>]*\ssrc=/i);
+    expect(PAGE_HTML).not.toContain("https://");
+    expect(PAGE_HTML).not.toContain("http://");
+    expect(PAGE_HTML).toContain("<style>");
+    const s = await makeServer();
+    for (const p of ["/", "/api/status", "/api/template", "/api/nope"]) {
+      const res = await fetch(s.url + p);
+      expect(res.headers.get("content-security-policy")).toBe(SERVE_CSP);
+      await res.body?.cancel();
+    }
+    const blocked = await fetch(s.url + "/api/artifact?path=../../etc/passwd");
+    expect(blocked.status).toBe(403);
+    expect(blocked.headers.get("content-security-policy")).toBe(SERVE_CSP);
+    // The SSE stream response carries it too.
+    const ac = new AbortController();
+    const sse = await fetch(s.url + "/api/events", {
+      headers: { accept: "text/event-stream" },
+      signal: ac.signal,
+    });
+    expect(sse.headers.get("content-security-policy")).toBe(SERVE_CSP);
+    ac.abort();
   });
 
   it("returns a snapshot whose items/inbox match the shared status layer exactly", async () => {

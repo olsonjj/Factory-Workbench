@@ -82,8 +82,8 @@ functional and the two never disagree about state.
 - **Authoring goes through `authorItem`.** The composer posts title, repo, base, approval stages, and description body; the server validates repo and draft with the same validation functions the CLI's authoring path uses, then writes the front-matter'd markdown into the inbox. Explicit-field mode only (no interactive prompts). File-drop posts write the uploaded markdown into the inbox as-is, matching claim/malformed semantics of the inbox scanner.
 - **Artifact serving with containment.** Parked artifacts are served from paths under the factory root only; the endpoint resolves and rejects anything escaping the root. This single guard is what makes "read the spec before approving" safe in-browser.
 - **Localhost-only default.** The server binds to loopback by default with an explicit override for the rare non-default case. No authentication layer in scope — the binding is the boundary.
-- **Frontend: one static asset, no build step.** UI is a single self-contained HTML page (vanilla JS + Tailwind, rendered server-side as static content — no bundler, no framework, no npm additions) served by the same server. EventSource for the feed, plain fetch for actions. The design implements the prototype's "Decision desk" layout: pulse tiles, flow bar, composer, decision cards with stage-progress dots.
-- **No new npm dependencies.** `node:http` covers serving and SSE; Tailwind enters via CDN/static asset only.
+- **Frontend: one static asset, no build step.** UI is a single self-contained HTML page (vanilla JS with a hand-written stylesheet, rendered server-side as static content — no bundler, no framework, no npm additions, no CDN or any other remote code) served by the same server. EventSource for the feed, plain fetch for actions. The design implements the prototype's "Decision desk" layout: pulse tiles, flow bar, composer, decision cards with stage-progress dots.
+- **No new npm dependencies.** `node:http` covers serving and SSE; the page's styles ship as a hand-written `<style>` block inside the page itself. No CDN script — a remote script loaded into a localhost control surface runs same-origin and is invisible to the Host/Origin guards (KB 2026-11-06 16:40); every response additionally carries a strict CSP (see Implementation Contract).
 
 ## Testing Decisions
 
@@ -116,8 +116,9 @@ observable behavior change must update it in the same commit (repo
 spec-lockstep convention). Modules: `src/status.ts` (shared status layer),
 `src/web/server.ts` (app factory, routes, SSE ticker, `runServe`),
 `src/web/page.ts` (`PAGE_HTML`), thin `serve` command in `src/cli/index.ts`.
-No npm dependency changes; the page is vanilla JS + Tailwind CDN, served as
-one static string.
+No npm dependency changes; the page is vanilla JS with a self-contained
+hand-written stylesheet, served as one static string. The page loads no
+remote code, and every response carries a strict CSP (`SERVE_CSP`).
 
 ## Hard constraints
 
@@ -136,6 +137,11 @@ one static string.
   No auth — the binding is the boundary.
 - `wb serve` on a root without `factory.db` prints the friendly status/watch
   message and exits 0.
+- The page loads no remote code (no CDN script, no remote CSS): styles are a
+  hand-written `<style>` block inside `PAGE_HTML` (a minimal preflight, the
+  component classes, and the utility classes the markup uses). A remote
+  script on a localhost control surface would run same-origin, invisible to
+  the Host/Origin guards (KB 2026-11-06 16:40).
 
 ## CLI wiring
 
@@ -201,6 +207,12 @@ method) is therefore guarded before routing:
 - Mutating endpoints additionally require `Content-Type: application/json`
   (a `; charset=` suffix is allowed); form-encoded / text/plain / missing →
   415 before the body is parsed.
+- Every response — the page, API JSON, SSE stream, artifacts, and error bodies
+  alike — carries a strict `Content-Security-Policy` (`SERVE_CSP`):
+  `default-src 'none'; frame-ancestors 'none'; style-src 'unsafe-inline';
+  script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:`.
+  Combined with the self-contained page (above) it guarantees no remote
+  resource can ever run on or exfiltrate from this control surface.
 - `GET /` serves the page itself without the API guard (static markup, no
   data in it).
 
@@ -309,7 +321,11 @@ append-only live feed colored by event. EventSource auto-reconnect with
 `Last-Event-ID` provides gapless resume. Every untrusted string is rendered
 through `esc()`/`textContent` (no raw `innerHTML` interpolation of data); all
 actions are same-origin `POST` with `Content-Type: application/json`; no CORS
-headers are emitted. Width: `max-w-3xl`, laptop-first.
+headers are emitted. Styles are a hand-written `<style>` block inside the
+page (minimal preflight + the utility classes the markup uses + the
+lbl/finput/ferr/btn component classes) — no CDN script, no remote CSS, and a
+strict CSP rides on every response (Request hardening above). Width:
+`max-w-3xl`, laptop-first.
 
 ## Tests
 
@@ -333,6 +349,8 @@ duplicates, fan-out of one poll to two clients; artifact containment
 symlinked intermediate directory escaping the root → 403); request
 hardening: non-JSON content types → 415 (charset suffix allowed), foreign /
 wrong-port / absent Host and mismatched Origin on `/api/*` → 403 while the
-static page is served regardless; CLI entry (spawned): fresh-root refusal
+static page is served regardless; the strict CSP on every response (page,
+JSON, artifact, error, SSE) and the page's self-containment (no CDN script,
+no remote URLs); CLI entry (spawned): fresh-root refusal
 (exit 0), invalid `--port` (friendly message, exit 1), EADDRINUSE (friendly
 message, exit 1).

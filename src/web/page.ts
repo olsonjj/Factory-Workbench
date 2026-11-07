@@ -7,8 +7,12 @@
  * string travels with the bundle under both tsx and tsc with zero build
  * changes (wb-serve implementation spec §6.5 — hard constraint).
  *
- * Content: vanilla JS + Tailwind via CDN, exactly as the throwaway prototype
- * (branch prototype/wb-serve-design, variant C "Decision desk") did. The
+ * Content: vanilla JS with a hand-written self-contained stylesheet — the
+ * prototype's (branch prototype/wb-serve-design, variant C "Decision desk")
+ * Tailwind vocabulary and paper/ink palette, inlined. The page loads no
+ * remote code: a CDN script on a localhost control surface runs same-origin
+ * and is invisible to the Host/Origin guards (rework per KB 2026-11-06
+ * 16:40); server.ts additionally emits a strict CSP on every response. The
  * inner script deliberately uses string concatenation, never template
  * literals, so nothing inside needs escaping from the surrounding TS literal.
  *
@@ -26,21 +30,26 @@ export const PAGE_HTML = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>wb — factory workbench</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script>
-  tailwind.config = {
-    theme: {
-      extend: {
-        fontFamily: { mono: ['ui-monospace', 'SFMono-Regular', 'SF Mono', 'Menlo', 'Consolas', 'monospace'] },
-        colors: {
-          paper: '#fafaf9',
-          ink: { 950: '#1c1917', 900: '#292524', 800: '#44403c', 700: '#57534e', 500: '#78716c', 400: '#a8a29e', 300: '#d6d3d1', 200: '#e7e5e4', 100: '#f5f5f4' },
-        },
-      },
-    },
-  };
-</script>
 <style>
+/* Self-contained stylesheet — no CDN script, no remote CSS (KB 2026-11-06
+ * 16:40: a remote script on a localhost control surface runs same-origin and
+ * is invisible to the Host/Origin CSRF guards). It carries a minimal
+ * preflight, the component classes (lbl/finput/ferr/btn), and the utility
+ * classes the markup and render functions use — the prototype's Tailwind
+ * vocabulary hand-written in its paper/ink palette. Utilities come after the
+ * component classes so combinations like btn-dark + bg-indigo-600 and
+ * btn-ok + !bg-red-600 compose exactly as the prototype intended. */
+
+/* ---- minimal preflight ---- */
+*, *::before, *::after { box-sizing: border-box; border: 0 solid #e5e7eb; margin: 0; }
+body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif; line-height: 1.5; }
+h1, h2, h3, h4, h5, h6, p { font-size: inherit; font-weight: inherit; }
+button, input, textarea, select { font: inherit; color: inherit; }
+button { background-color: transparent; }
+a { color: inherit; text-decoration: inherit; }
+input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
+
+/* ---- component classes ---- */
   .lbl { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: #57534e; margin-bottom: 4px; }
   .finput { width: 100%; border: 1px solid #d6d3d1; border-radius: 6px; padding: 8px 10px; font-size: 13px; background: #fff; }
   .finput:focus { outline: none; border-color: #6366f1; box-shadow: 0 0 0 2px rgba(99,102,241,.35); }
@@ -52,6 +61,249 @@ export const PAGE_HTML = `<!DOCTYPE html>
   .btn-out:hover { background: #f5f5f4; }
   .btn-ok { background: #059669; color: #fff; }
   .btn-ok:hover { background: #047857; }
+
+/* ---- utilities: display / flex / grid / gaps ---- */
+  .hidden { display: none; }
+  .block { display: block; }
+  .flex { display: flex; }
+  .inline-flex { display: inline-flex; }
+  .grid { display: grid; }
+  .flex-col { flex-direction: column; }
+  .flex-wrap { flex-wrap: wrap; }
+  .flex-1 { flex: 1 1 0%; }
+  .shrink-0 { flex-shrink: 0; }
+  .items-baseline { align-items: baseline; }
+  .items-center { align-items: center; }
+  .items-start { align-items: flex-start; }
+  .justify-between { justify-content: space-between; }
+  .justify-center { justify-content: center; }
+  .grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .col-span-2 { grid-column: span 2 / span 2; }
+  .gap-0 { gap: 0; }
+  .gap-1 { gap: 0.25rem; }
+  .gap-1\.5 { gap: 0.375rem; }
+  .gap-2 { gap: 0.5rem; }
+  .gap-3 { gap: 0.75rem; }
+  .gap-x-3 { column-gap: 0.75rem; }
+  .gap-y-0\.5 { row-gap: 0.125rem; }
+  .space-y-0\.5 > * + * { margin-top: 0.125rem; }
+  .space-y-3 > * + * { margin-top: 0.75rem; }
+  .space-y-4 > * + * { margin-top: 1rem; }
+
+/* ---- position ---- */
+  .relative { position: relative; }
+  .absolute { position: absolute; }
+  .fixed { position: fixed; }
+  .sticky { position: sticky; }
+  .top-0 { top: 0; }
+  .top-4 { top: 1rem; }
+  .left-0 { left: 0; }
+  .left-1\/2 { left: 50%; }
+  .bottom-0 { bottom: 0; }
+  .z-20 { z-index: 20; }
+  .z-50 { z-index: 50; }
+  .-translate-x-1\/2 { transform: translateX(-50%); }
+
+/* ---- size ---- */
+  .h-1 { height: 0.25rem; }
+  .h-1\.5 { height: 0.375rem; }
+  .h-2 { height: 0.5rem; }
+  .h-2\.5 { height: 0.625rem; }
+  .h-6 { height: 1.5rem; }
+  .h-px { height: 1px; }
+  .w-1 { width: 0.25rem; }
+  .w-1\.5 { width: 0.375rem; }
+  .w-2 { width: 0.5rem; }
+  .w-2\.5 { width: 0.625rem; }
+  .w-6 { width: 1.5rem; }
+  .w-36 { width: 9rem; }
+  .w-full { width: 100%; }
+  .\!w-52 { width: 13rem !important; }
+  .max-w-3xl { max-width: 48rem; }
+  .max-h-72 { max-height: 18rem; }
+  .min-h-\[3rem\] { min-height: 3rem; }
+
+/* ---- spacing ---- */
+  .mx-auto { margin-left: auto; margin-right: auto; }
+  .ml-auto { margin-left: auto; }
+  .mr-1 { margin-right: 0.25rem; }
+  .mt-0\.5 { margin-top: 0.125rem; }
+  .mt-1 { margin-top: 0.25rem; }
+  .mt-1\.5 { margin-top: 0.375rem; }
+  .mt-2 { margin-top: 0.5rem; }
+  .mt-3 { margin-top: 0.75rem; }
+  .mt-4 { margin-top: 1rem; }
+  .mt-5 { margin-top: 1.25rem; }
+  .mt-8 { margin-top: 2rem; }
+  .mt-10 { margin-top: 2.5rem; }
+  .mb-1 { margin-bottom: 0.25rem; }
+  .mb-1\.5 { margin-bottom: 0.375rem; }
+  .mb-3 { margin-bottom: 0.75rem; }
+  .mb-4 { margin-bottom: 1rem; }
+  .p-2 { padding: 0.5rem; }
+  .p-2\.5 { padding: 0.625rem; }
+  .p-3 { padding: 0.75rem; }
+  .p-4 { padding: 1rem; }
+  .p-5 { padding: 1.25rem; }
+  .px-1 { padding-left: 0.25rem; padding-right: 0.25rem; }
+  .px-2 { padding-left: 0.5rem; padding-right: 0.5rem; }
+  .px-2\.5 { padding-left: 0.625rem; padding-right: 0.625rem; }
+  .px-3 { padding-left: 0.75rem; padding-right: 0.75rem; }
+  .px-4 { padding-left: 1rem; padding-right: 1rem; }
+  .px-5 { padding-left: 1.25rem; padding-right: 1.25rem; }
+  .py-0\.5 { padding-top: 0.125rem; padding-bottom: 0.125rem; }
+  .py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; }
+  .py-1\.5 { padding-top: 0.375rem; padding-bottom: 0.375rem; }
+  .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
+  .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
+  .pb-24 { padding-bottom: 6rem; }
+  .pl-5 { padding-left: 1.25rem; }
+  .pt-4 { padding-top: 1rem; }
+  .pt-6 { padding-top: 1.5rem; }
+
+/* ---- typography ---- */
+  .font-mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+  .font-bold { font-weight: 700; }
+  .font-semibold { font-weight: 600; }
+  .font-medium { font-weight: 500; }
+  .font-normal { font-weight: 400; }
+  .text-\[9px\] { font-size: 9px; }
+  .text-\[10px\] { font-size: 10px; }
+  .text-\[11px\] { font-size: 11px; }
+  .text-xs { font-size: 12px; line-height: 16px; }
+  .text-sm { font-size: 14px; line-height: 20px; }
+  .text-lg { font-size: 18px; line-height: 28px; }
+  .text-3xl { font-size: 30px; line-height: 36px; }
+  .leading-none { line-height: 1; }
+  .leading-tight { line-height: 1.25; }
+  .leading-relaxed { line-height: 1.625; }
+  .tracking-tight { letter-spacing: -0.025em; }
+  .tracking-wide { letter-spacing: 0.025em; }
+  .tracking-widest { letter-spacing: 0.1em; }
+  .uppercase { text-transform: uppercase; }
+  .normal-case { text-transform: none; }
+  .whitespace-nowrap { white-space: nowrap; }
+  .whitespace-pre-wrap { white-space: pre-wrap; }
+  .underline { text-decoration: underline; }
+  .underline-offset-2 { text-underline-offset: 2px; }
+  .text-center { text-align: center; }
+  .tabular-nums { font-variant-numeric: tabular-nums; }
+
+/* ---- colors: text (the prototype's ink palette + status hues) ---- */
+  .text-white { color: #fff; }
+  .text-ink-400 { color: #a8a29e; }
+  .text-ink-500 { color: #78716c; }
+  /* ink-600 was absent from the prototype config; midpoint of 500/700 */
+  .text-ink-600 { color: #68655d; }
+  .text-ink-700 { color: #57534e; }
+  .text-ink-800 { color: #44403c; }
+  .text-ink-900 { color: #292524; }
+  .text-ink-950 { color: #1c1917; }
+  .text-amber-400 { color: #fbbf24; }
+  .text-amber-600 { color: #d97706; }
+  .text-amber-700 { color: #b45309; }
+  .text-amber-800 { color: #92400e; }
+  .text-amber-950 { color: #451a03; }
+  .text-blue-500 { color: #3b82f6; }
+  .text-blue-700 { color: #1d4ed8; }
+  .text-emerald-500 { color: #10b981; }
+  .text-emerald-600 { color: #059669; }
+  .text-emerald-700 { color: #047857; }
+  .text-fuchsia-700 { color: #a21caf; }
+  .text-fuchsia-800 { color: #86198f; }
+  .text-orange-700 { color: #c2410c; }
+  .text-orange-800 { color: #9a3412; }
+  .text-red-500 { color: #ef4444; }
+  .text-red-600 { color: #dc2626; }
+  .text-red-700 { color: #b91c1c; }
+  .text-red-800 { color: #991b1b; }
+  .text-violet-600 { color: #7c3aed; }
+  .text-violet-700 { color: #6d28d9; }
+  .text-violet-800 { color: #5b21b6; }
+
+/* ---- colors: backgrounds (paper/ink theme + status hues) ---- */
+  .bg-paper { background-color: #fafaf9; }
+  .bg-white { background-color: #fff; }
+  .bg-white\/50 { background-color: rgba(255, 255, 255, 0.5); }
+  .bg-white\/70 { background-color: rgba(255, 255, 255, 0.7); }
+  .bg-white\/80 { background-color: rgba(255, 255, 255, 0.8); }
+  .bg-ink-100 { background-color: #f5f5f4; }
+  .bg-ink-100\/70 { background-color: rgba(245, 245, 244, 0.7); }
+  .bg-ink-300 { background-color: #d6d3d1; }
+  .bg-ink-400 { background-color: #a8a29e; }
+  .bg-ink-500 { background-color: #78716c; }
+  .bg-ink-950 { background-color: #1c1917; }
+  .bg-amber-100 { background-color: #fef3c7; }
+  .bg-amber-400 { background-color: #fbbf24; }
+  .bg-blue-50 { background-color: #eff6ff; }
+  .bg-blue-500 { background-color: #3b82f6; }
+  .bg-emerald-50 { background-color: #ecfdf5; }
+  .bg-emerald-500 { background-color: #10b981; }
+  .bg-fuchsia-50 { background-color: #fdf4ff; }
+  .bg-fuchsia-100 { background-color: #fae8ff; }
+  .bg-fuchsia-500 { background-color: #d946ef; }
+  .bg-indigo-50 { background-color: #eef2ff; }
+  .bg-indigo-600 { background-color: #4f46e5; }
+  .bg-orange-50 { background-color: #fff7ed; }
+  .bg-orange-100 { background-color: #ffedd5; }
+  .bg-orange-500 { background-color: #f97316; }
+  .bg-red-50 { background-color: #fef2f2; }
+  .bg-red-100 { background-color: #fee2e2; }
+  .bg-red-500 { background-color: #ef4444; }
+  .bg-stone-400 { background-color: #a8a29e; }
+  .bg-violet-100 { background-color: #ede9fe; }
+  .bg-violet-500 { background-color: #8b5cf6; }
+
+/* ---- borders / rings ---- */
+  .border { border-width: 1px; }
+  .border-2 { border-width: 2px; }
+  .border-b { border-bottom-width: 1px; }
+  .border-t { border-top-width: 1px; }
+  .border-dashed { border-style: dashed; }
+  .border-amber-200 { border-color: #fde68a; }
+  .border-fuchsia-200 { border-color: #f5d0fe; }
+  .border-indigo-100 { border-color: #e0e7ff; }
+  .border-indigo-300 { border-color: #a5b4fc; }
+  .border-ink-200 { border-color: #e7e5e4; }
+  .border-ink-300 { border-color: #d6d3d1; }
+  .border-orange-200 { border-color: #fed7aa; }
+  .border-red-200 { border-color: #fecaca; }
+  .border-violet-200 { border-color: #ddd6fe; }
+  .ring-1 { box-shadow: 0 0 0 1px var(--ring, rgba(0, 0, 0, 0.05)); }
+  .ring-amber-300 { --ring: #fcd34d; }
+  .ring-blue-200 { --ring: #bfdbfe; }
+  .ring-emerald-200 { --ring: #a7f3d0; }
+  .ring-fuchsia-300 { --ring: #f0abfc; }
+  .ring-ink-200 { --ring: #e7e5e4; }
+  .ring-ink-300 { --ring: #d6d3d1; }
+  .ring-orange-300 { --ring: #fdba74; }
+  .ring-red-300 { --ring: #fca5a5; }
+  .ring-violet-300 { --ring: #c4b5fd; }
+
+/* ---- radii / shadows / effects ---- */
+  .rounded-md { border-radius: 6px; }
+  .rounded-lg { border-radius: 8px; }
+  .rounded-xl { border-radius: 12px; }
+  .rounded-2xl { border-radius: 16px; }
+  .rounded-full { border-radius: 9999px; }
+  /* after .ring-1: on elements combining ring + shadow the ring rides along */
+  .shadow-sm { box-shadow: 0 0 0 1px var(--ring, transparent), 0 1px 2px 0 rgba(0, 0, 0, 0.05); }
+  .shadow-lg { box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1); }
+  .backdrop-blur { backdrop-filter: blur(8px); }
+  .overflow-hidden { overflow: hidden; }
+  .overflow-y-auto { overflow-y: auto; }
+  .transition-colors { transition-property: color, background-color, border-color, text-decoration-color, fill, stroke; transition-duration: 150ms; transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1); }
+  .animate-pulse { animation: wb-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+  @keyframes wb-pulse { 50% { opacity: 0.5; } }
+  .cursor-pointer { cursor: pointer; }
+  .accent-indigo-600 { accent-color: #4f46e5; }
+
+/* ---- important / hover variants ---- */
+  .\!bg-red-600 { background-color: #dc2626 !important; }
+  .hover\:\!bg-red-700:hover { background-color: #b91c1c !important; }
+  .hover\:bg-indigo-700:hover { background-color: #4338ca; }
+  .hover\:bg-indigo-50\/50:hover { background-color: rgba(238, 242, 255, 0.5); }
 </style>
 </head>
 <body class="bg-paper text-ink-900">
