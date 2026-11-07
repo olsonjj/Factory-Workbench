@@ -23,7 +23,8 @@ describe("wb --version (CLI external behavior)", () => {
     const { stdout, stderr, status } = runWb(["--version"]);
     expect(status).toBe(0);
     expect(stderr).toBe("");
-    expect(stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/); // semver-looking
+    // Exact equality against package.json is the real assertion; no shape
+    // check so prerelease versions (e.g. 1.1.0-beta.1) don't fail CI.
     expect(stdout.trim()).toBe(expectedVersion); // matches package.json at test run time
   });
 
