@@ -226,6 +226,12 @@ describe("wb serve: page, template, snapshot (CLI status contract)", () => {
     expect(PAGE_HTML).not.toContain("https://");
     expect(PAGE_HTML).not.toContain("http://");
     expect(PAGE_HTML).toContain("<style>");
+    // The header run-state pill: the SSE render path writes into #run-state,
+    // and the per-second client-side clock tick and the glance-chip flash
+    // class are the pieces a refactor could silently drop.
+    expect(PAGE_HTML).toContain('id="run-state"');
+    expect(PAGE_HTML).toMatch(/setInterval\([\s\S]*?1000\)/);
+    expect(PAGE_HTML).toContain("wb-flash");
     const s = await makeServer();
     for (const p of ["/", "/api/status", "/api/template", "/api/nope"]) {
       const res = await fetch(s.url + p);
