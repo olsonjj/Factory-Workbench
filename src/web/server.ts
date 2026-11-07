@@ -127,11 +127,16 @@ interface SseClient {
   /** Last status fingerprint delivered to this client. */
   fingerprint: string;
   /** Chunks queued but not yet handed to the socket (delivery paused after
-   *  backpressure — see clientWrite). Always bounded by the backlog cap.
-   *  A healthy draining reader never grows this: `drain` resumes delivery,
-   *  so large snapshots flow to it in slices no matter how big they are. */
-  queue: string[];
+   *  backpressure — see clientWrite), as UTF-8 Buffers so slicing never splits
+   *  a multi-byte character. Always bounded by the backlog cap. A healthy
+   *  draining reader never grows this: `drain` resumes delivery, so large
+   *  snapshots flow to it in slices no matter how big they are. */
+  queue: Buffer[];
   queuedBytes: number;
+  /** Bytes handed to Node's write buffer that Node has not yet drained to
+   *  the socket (slices written while write() → false). Zeroed on `drain` —
+   *  every byte Node held has reached the socket — so the backlog cap counts
+   *  only bytes still in flight, never bytes the client already received. */
   pendingBytes: number;
   /** Set when the client is cut (or gone); further writes are no-ops. */
   closed?: boolean;
@@ -194,49 +199,47 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
   }
 
   /** Deliver `chunk` to a connected SSE client through the per-client backlog
-   *  gate. Chunking + drain-resume: writes go out in slices, backpressure
-   *  (write() → false — which a large slice triggers even on a healthy,
-   *  actively-draining reader) pauses delivery into a bounded per-client queue
-   *  that resumes on `drain`; a reader that never drains accumulates queued
-   *  bytes past the cap across ticks and is then cut — its reconnect (bounded
-   *  replay) is the recovery path. Either way server memory stays bounded;
-   *  no reader is ever cut merely for receiving a large snapshot. */
+   *  gate. The event is encoded to UTF-8 ONCE (byte-slicing Buffer slices
+   *  later can never split a multi-byte character); chunks go out in slices;
+   *  backpressure (write() → false — which a large slice triggers even on a
+   *  healthy, actively-draining reader) stops further writes and resumes on
+   *  `drain` (which zeroes pendingBytes). The in-flight slice is NOT retried
+   *  — Node buffered it and will deliver it exactly once — only the remaining
+   *  queue waits. A reader that never drains accumulates pending+queued bytes
+   *  past the cap across ticks and is then cut; its reconnect (bounded replay)
+   *  is the recovery path. Either way server memory stays bounded and no
+   *  healthy, draining reader is ever cut. */
   function clientWrite(client: SseClient, chunk: string): void {
     if (client.closed) return;
-    client.queue.push(chunk);
-    client.queuedBytes += chunk.length;
-    if (client.queuedBytes > maxClientBufferedBytes) {
-      cutClient(client, "write backlog exceeded cap");
-      return;
-    }
+    const buf = Buffer.from(chunk, "utf8");
+    client.queue.push(buf);
+    client.queuedBytes += buf.length;
     drainQueue(client);
   }
 
   /** Hand queued slices to the socket until it reports backpressure; `drain`
-   *  resumes. Crucially, the slice that returns false is CONSUMED — Node
-   *  buffered it and will deliver it exactly once — only FURTHER writes wait
-   *  for `drain`: retrying an already-buffered slice would deliver it twice,
+   *  resumes (and zeroes pendingBytes). Both outcomes consume the slice: `ok`
+   *  means the socket took it; `false` means Node buffered it for assured
+   *  delivery — retrying an already-buffered slice would deliver it twice,
    *  once per retry. */
   function drainQueue(client: SseClient): void {
     while (!client.closed && client.queue.length > 0) {
       const head = client.queue[0]!;
-      const slice = head.length <= MAX_SSE_WRITE_SLICE_BYTES ? head : head.slice(0, MAX_SSE_WRITE_SLICE_BYTES)!;
+      const slice = head.length <= MAX_SSE_WRITE_SLICE_BYTES ? head : head.subarray(0, MAX_SSE_WRITE_SLICE_BYTES);
       let ok: boolean;
       try {
         ok = client.res.write(slice);
       } catch {
         return; // already-gone socket — the `close` handler removes the client
       }
-      // Both paths consume the slice: ok means the socket took it; false means
-      // Node buffered it for assured delivery. Only FURTHER queued work waits.
       client.queuedBytes -= slice.length;
       if (ok) {
         if (slice.length === head.length) client.queue.shift();
-        else client.queue[0] = head.slice(slice.length);
+        else client.queue[0] = head.subarray(slice.length);
       } else {
         client.pendingBytes += slice.length;
         if (slice.length === head.length) client.queue.shift();
-        else client.queue[0] = head.slice(slice.length);
+        else client.queue[0] = head.subarray(slice.length);
         if (client.pendingBytes + client.queuedBytes > maxClientBufferedBytes) {
           cutClient(client, "write backlog exceeded cap");
         }
@@ -288,7 +291,14 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     };
     // Backpressure resumes queued delivery; `close` removes the client from
     // the fan-out on every other path.
-    res.on("drain", () => drainQueue(client));
+    // Backpressure resume AND ledger reset: 'drain' means every byte Node
+    // held reached the socket, so pendingBytes returns to zero before queued
+    // work resumes — without this, the cap would count bytes the client
+    // already received and healthy tabs would eventually be cut.
+    res.on("drain", () => {
+      client.pendingBytes = 0;
+      drainQueue(client);
+    });
     res.on("close", () => {
       clients.delete(client);
       client.closed = true;

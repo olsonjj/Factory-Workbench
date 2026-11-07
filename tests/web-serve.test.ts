@@ -171,11 +171,15 @@ function connectEvents(
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/event-stream");
     const reader = res.body!.getReader();
+    // Stateful UTF-8 decode: a multi-byte character split across two network
+    // chunks must be reassembled (stream: true), or the harness itself would
+    // mangle exactly the byte-boundary property the server is being tested for.
+    const decoder = new TextDecoder("utf-8");
     let buf = "";
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) break;
-      buf += new TextDecoder().decode(value);
+      if (done) { buf += decoder.decode(new Uint8Array(0), { stream: false }); break; }
+      buf += decoder.decode(value, { stream: true });
       let idx: number;
       while ((idx = buf.indexOf("\n\n")) !== -1) {
         const ev = parseBlock(buf.slice(0, idx));
@@ -1439,6 +1443,61 @@ describe("wb serve: large snapshots reach healthy readers (no cut-on-connect liv
     s.app.flush();
     await stream.waitUntil((n) => n >= 2, 10000);
     expect(stream.events.some((e) => e.event === "history")).toBe(true);
+    stream.abort();
+  });
+});
+
+// ------------------------------------------------- Greptile rework round 3
+const EMOJI_FILLER = "🔧x".repeat(30_000); // 🔧 is a surrogate pair; every 5-byte UTF-8 group straddles a 64 KiB slice boundary
+
+describe("wb serve: SSE ledger reset + unicode-safe slicing", () => {
+  it("keeps a healthy tab that receives repeated large updates connected (pendingBytes resets on drain)", async () => {
+    const s = await makeServer(); // production default cap
+    s.h.inboxFile("big-updates", { title: "Big updates", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    claim(s.h);
+    const id = s.h.db.listItems()[0]!.id;
+    const stream = connectEvents(s);
+    await stream.waitUntil((n) => n >= 1);
+    // 40 ticks, each changing the status payload (fingerprint → full ~100 KiB
+    // resend). Every slice that returns false leaves 64 KiB in Node's buffer;
+    // without the drain-resets-pendingBytes ledger, untouched `pendingBytes`
+    // accumulates past the 2 MiB cap after ~30 ticks and a keeping-up tab is
+    // cut despite never stalling.
+    const filler = "y".repeat(100 * 1024);
+    for (let t = 0; t < 40; t++) {
+      s.h.db.updateItem(id, {
+        status: "infrastructure-failure", stage: "test", parkedReason: "infra-budget",
+        parkedDetail: { error: `${filler}|tick:${t}` },
+      });
+      s.app.flush();
+      await stream.waitUntil((n) => n >= t + 2, 10000);
+    }
+    // The finale proves the connection was never cut.
+    s.h.db.appendHistory(id, "gc", null, { final: "alive" });
+    s.app.flush();
+    await stream.waitUntil((n) => n >= 42, 10000);
+    const finale = stream.events[stream.events.length - 1]!;
+    expect(finale.event === "history" || finale.event === "status").toBe(true);
+    stream.abort();
+  });
+
+  it("never splits a multi-byte character across write slices (byte-boundary, not char-boundary)", async () => {
+    const s = await makeServer(); // slices at 64 KiB; EMOJI_FILLER straddles them
+    s.h.inboxFile("emoji-detail", { title: "Emoji detail", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    claim(s.h);
+    const id = s.h.db.listItems()[0]!.id;
+    s.h.db.updateItem(id, {
+      status: "infrastructure-failure", stage: "test", parkedReason: "infra-budget",
+      parkedDetail: { error: EMOJI_FILLER },
+    });
+    const stream = connectEvents(s);
+    await stream.waitUntil((n) => n >= 1, 10000);
+    const snapshot = JSON.parse(stream.events[0]!.data) as { items: { id: number; parkedDetail?: { error?: string } }[] };
+    const delivered = snapshot.items.find((i) => i.id === id)?.parkedDetail?.error;
+    // Slicing at UTF-16 code-unit boundaries would split a surrogate pair and
+    // the re-encoded halves arrive as U+FFFD replacement characters; slicing
+    // the UTF-8 buffer delivers the payload byte-exactly.
+    expect(delivered).toBe(EMOJI_FILLER);
     stream.abort();
   });
 });
