@@ -138,6 +138,7 @@ read `FACTORY_ROOT` or an existing config's `root` value.
 | `wb resume` | Recover interrupted/rejected items and continue until they park or finish. |
 | `wb status [--all]` | Show items other than completed ones and their parked reasons; `--all` includes done items. |
 | `wb watch [--interval <seconds>]` | Poll read-only for new events, show a compact status card, and notify when items park (default: 5 seconds; Ctrl+C to stop). |
+| `wb serve [--port <n>] [--host <addr>] [--interval <seconds>]` | Host a local browser UI over the factory (default: http://127.0.0.1:7466, poll every 2 seconds): live status snapshot, parked-item decision cards (approve/reject/answer/retry), work intake (compose an item or drop `.md` files into the inbox), and backgrounded Run/Resume. Binds to localhost only by default; `--host` is the escape hatch. |
 | `wb approve <id-or-slug> [-n <note>]` | Release a parked approval gate. |
 | `wb reject <id-or-slug> -r <reason>` | Reject stage output; the reason becomes rework feedback. |
 | `wb answer <id-or-slug> -a <answers...>` | Answer parked triage questions in order; triage re-runs. |
@@ -155,7 +156,16 @@ factory lock, claim nothing, and do not create or write `factory.db`, so they
 work while another wb command is active. `status` also reports the lock holder
 and inbox files awaiting claim. `watch` only observes the factory—it does not
 advance items—and offers best-effort parked-item notifications on macOS and
-Linux.
+Linux. `serve` observes the same way: the server takes no factory lock while
+watching, and each of its actions (approve/reject/answer/retry, item authoring,
+Run/Resume) takes the lock only for the duration of that action, so the UI
+and the CLI can never interleave destructively. Run/Resume execute in the
+background and their progress arrives on the page over a server-sent event
+stream. As a CSRF/DNS-rebinding guard, the API accepts only JSON requests
+whose Host/Origin match the bound localhost address, and artifact links are
+served only from real files under `items/` inside the factory root (no
+symlinks). `--port` must be an integer between 1 and 65535; a taken or
+invalid port exits with a friendly error.
 
 Before an item's first stage run of a round, `wb run`/`wb resume` check the
 item's base branch (`base:` front-matter, typically `main`) against its
