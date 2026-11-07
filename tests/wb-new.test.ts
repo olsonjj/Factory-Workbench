@@ -9,7 +9,7 @@ import {
   slugForTitle,
   validateItemDraft,
 } from "../src/frontmatter.js";
-import { authorItem, buildEditorTemplate, stripEditorComments, type AuthoringIO } from "../src/new.js";
+import { authorItem, buildEditorTemplate, expandRepoInput, stripEditorComments, type AuthoringIO } from "../src/new.js";
 import { splitCommand } from "../src/prompt.js";
 
 class ScriptedIO implements AuthoringIO {
@@ -288,10 +288,13 @@ describe("wb new", () => {
     expect(result.ok).toBe(true);
   });
 
-  it("a relative repo path is stored as an absolute path", async () => {
+  it("a repo path relative to the factory root is stored as an absolute path", async () => {
     const harness = newHarness();
     const repo = makeRepo();
-    const relative = path.relative(process.cwd(), repo);
+    // Relative to the factory root (the authoring seam's baseDir), NOT the
+    // process CWD — expansion must be deterministic regardless of where the
+    // CLI was invoked from.
+    const relative = path.relative(harness.paths.root, repo);
 
     const result = await authorItem(
       { title: "T", repo: relative, description: "Body." },
@@ -301,6 +304,55 @@ describe("wb new", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.markdown).toContain(`repo: ${repo}\n`);
+  });
+
+  it("a bare repo name matching a known repo authorizes identically to the absolute path", async () => {
+    const repo = makeRepo();
+    // Seed a known repo (newest-first source) in the first harness...
+    const ha = newHarness();
+    ha.db.insertItem({
+      slug: "seed", title: "Seed", repo, base: "main",
+      approvals: [], stage: "triage", status: "queued",
+    });
+    const byName = await authorItem(
+      { title: "T", repo: path.basename(repo), description: "Body." },
+      ha.db, ha.paths, new ScriptedIO({ isInteractive: false }),
+    );
+    // ...and compare against the absolute-path authoring in a fresh harness.
+    const hb = newHarness();
+    const byPath = await authorItem(
+      { title: "T", repo, description: "Body." },
+      hb.db, hb.paths, new ScriptedIO({ isInteractive: false }),
+    );
+
+    expect(byName.ok).toBe(true);
+    expect(byPath.ok).toBe(true);
+    if (!byName.ok || !byPath.ok) return;
+    expect(byName.markdown).toBe(byPath.markdown);
+    expect(byName.markdown).toContain(`repo: ${repo}\n`);
+  });
+
+  it("a ~/-prefixed repo expands against the operator's home directory", async () => {
+    const harness = newHarness();
+    const fakeHome = mkdtempSync(path.join(os.tmpdir(), "wb-new-home-"));
+    tempDirs.push(fakeHome);
+    mkdirSync(path.join(fakeHome, "dev", "x", ".git"), { recursive: true });
+    const prevHome = process.env.HOME;
+    const prevProfile = process.env.USERPROFILE;
+    try {
+      process.env.HOME = fakeHome;
+      process.env.USERPROFILE = fakeHome;
+      const result = await authorItem(
+        { title: "T", repo: "~/dev/x", description: "Body." },
+        harness.db, harness.paths, new ScriptedIO({ isInteractive: false }),
+      );
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.markdown).toContain(`repo: ${path.join(fakeHome, "dev", "x")}\n`);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+      if (prevProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevProfile;
+    }
   });
 
   it("concurrent same-title creation is exclusive: existing inbox file aborts, never clobbers", async () => {
@@ -358,5 +410,53 @@ describe("wb new", () => {
     expect(splitCommand("code -w")).toEqual(["code", "-w"]);
     expect(splitCommand("vi")).toEqual(["vi"]);
     expect(splitCommand("emacs -nw -f 'my fun func'")).toEqual(["emacs", "-nw", "-f", "my fun func"]);
+  });
+});
+
+describe("expandRepoInput", () => {
+  it("expands ~ and ~/sub against the operator's home directory (lazily, per call)", () => {
+    const fakeHome = mkdtempSync(path.join(os.tmpdir(), "wb-new-home-"));
+    tempDirs.push(fakeHome);
+    const prevHome = process.env.HOME;
+    const prevProfile = process.env.USERPROFILE;
+    try {
+      process.env.HOME = fakeHome;
+      process.env.USERPROFILE = fakeHome;
+      expect(expandRepoInput("~", { baseDir: "/factory" })).toBe(path.resolve(fakeHome));
+      expect(expandRepoInput("~/dev/x", { baseDir: "/factory" })).toBe(path.join(path.resolve(fakeHome), "dev", "x"));
+      // Leading/trailing whitespace is trimmed first.
+      expect(expandRepoInput("  ~/dev/x  ", { baseDir: "/factory" })).toBe(path.join(path.resolve(fakeHome), "dev", "x"));
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+      if (prevProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevProfile;
+    }
+    // And against the live home when the env is untouched:
+    expect(expandRepoInput("~/dev/x", { baseDir: "/factory" })).toBe(path.join(os.homedir(), "dev", "x"));
+  });
+
+  it("passes an absolute path through unchanged", () => {
+    const abs = path.resolve("/abs/repo");
+    expect(expandRepoInput(abs, { baseDir: "/factory" })).toBe(abs);
+    expect(expandRepoInput(`  ${abs}  `, { baseDir: "/factory" })).toBe(abs);
+  });
+
+  it("resolves a bare name matching a known repo to that repo (newest-first tie-break)", () => {
+    const known = [
+      { repo: "/a/r1", count: 1 },
+      { repo: "/b/r1", count: 1 },
+    ];
+    // Entries arrive newest-first; the first basename match wins.
+    expect(expandRepoInput("r1", { baseDir: "/factory", knownRepos: known })).toBe("/a/r1");
+    // A full known path also passes through as an exact basename of itself.
+    expect(expandRepoInput("/a/r1", { baseDir: "/factory", knownRepos: known })).toBe("/a/r1");
+    // A name matching nothing falls through to baseDir resolution.
+    expect(expandRepoInput("zzz", { baseDir: "/factory", knownRepos: known })).toBe(path.resolve("/factory", "zzz"));
+  });
+
+  it("resolves relative paths against the factory root, never the process CWD", () => {
+    expect(expandRepoInput("Code/factory-1", { baseDir: "/factory" })).toBe(path.join(path.resolve("/factory"), "Code", "factory-1"));
+    // ~otheruser/x is NOT tilde-expanded: it falls through to baseDir resolution
+    // (and would fail repo validation with a clear reason upstream).
+    expect(expandRepoInput("~otheruser/x", { baseDir: "/factory" })).toBe(path.join(path.resolve("/factory"), "~otheruser", "x"));
   });
 });
