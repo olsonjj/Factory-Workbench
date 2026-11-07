@@ -40,7 +40,8 @@ export interface KnownRepo { repo: string; count: number }
  *  2. `~` / `~/sub` expand against the operator's home directory
  *     (`os.homedir()` read lazily on every call, so env overrides work);
  *  3. a bare name equal to a known repo's basename resolves to that repo's
- *     stored path — the FIRST match wins, and `knownRepos` arrive in
+ *     stored path, resolved to ABSOLUTE (hand-written items can persist a
+ *     relative `repo:`) — the FIRST match wins, and `knownRepos` arrive in
  *     `knownReposNewestFirst` order, so an ambiguous basename deterministically
  *     resolves to the newest repo;
  *  4. anything else resolves against `baseDir` (the factory root, never the
@@ -60,7 +61,12 @@ export function expandRepoInput(
   const known = opts.knownRepos;
   if (known) {
     for (const k of known) {
-      if (path.basename(k.repo) === trimmed) return k.repo;
+      if (path.basename(k.repo) === trimmed) {
+        // Hand-written items persist `repo:` verbatim, so a stored entry can be
+        // relative — resolve it (absolute entries are untouched) so expansion
+        // never returns a CWD-dependent path.
+        return path.resolve(k.repo);
+      }
     }
   }
   return path.resolve(opts.baseDir, trimmed);

@@ -449,6 +449,10 @@ describe("expandRepoInput", () => {
     expect(expandRepoInput("r1", { baseDir: "/factory", knownRepos: known })).toBe("/a/r1");
     // A full known path also passes through as an exact basename of itself.
     expect(expandRepoInput("/a/r1", { baseDir: "/factory", knownRepos: known })).toBe("/a/r1");
+    // A RELATIVE stored entry (hand-written items persist `repo:` verbatim)
+    // still expands to an absolute path — never a CWD-dependent return.
+    const relative = [{ repo: "dev/x", count: 1 }];
+    expect(expandRepoInput("x", { baseDir: "/factory", knownRepos: relative })).toBe(path.resolve("dev/x"));
     // A name matching nothing falls through to baseDir resolution.
     expect(expandRepoInput("zzz", { baseDir: "/factory", knownRepos: known })).toBe(path.resolve("/factory", "zzz"));
   });
