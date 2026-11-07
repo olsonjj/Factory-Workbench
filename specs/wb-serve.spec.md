@@ -106,3 +106,193 @@ functional and the two never disagree about state.
 - **Prototype provenance.** Design originates from a throwaway prototype at `prototype/web-dashboard.html` (three switchable variants: A "Pipeline board", B "Control room", C "Decision queue"). Verdict from the operator: C wins; A's spatial stage distribution folded into C as the proportional flow bar because a kanban requires an uncomfortably wide screen. The prototype must be committed to a throwaway branch as the primary source for the design when implementation lands, and removed from the working tree.
 - **Why this stays small.** Everything a UI needs already exists below the seam: readonly snapshot/history feeds for observation, orchestrator actions for control, authoring for intake, and a lock discipline that makes backgrounded run/resume safe. The feature is one new module (server + routing + SSE ticker), one extraction (shared status layer), one static asset (the page), and thin CLI wiring.
 - **Update-transport decision record.** WebSockets were rejected (return channel unused, new dependency); browser polling was rejected (latency and client-side merge complexity); SSE+ snapshot-then-delta chosen because the existing watch snapshot feed makes it a thin wrapper: same poller, same event ids, same resumability model as the pipeline itself.
+
+---
+
+# Implementation Contract (v1, kept in lockstep with the code)
+
+This section is the implementation contract for the shipped `wb serve`; any
+observable behavior change must update it in the same commit (repo
+spec-lockstep convention). Modules: `src/status.ts` (shared status layer),
+`src/web/server.ts` (app factory, routes, SSE ticker, `runServe`),
+`src/web/page.ts` (`PAGE_HTML`), thin `serve` command in `src/cli/index.ts`.
+No npm dependency changes; the page is vanilla JS + Tailwind CDN, served as
+one static string.
+
+## Hard constraints
+
+- The server process never holds the factory lock: observation goes through
+  `FactoryDb.openReadonly(root)` (the `wb status` discipline), and every
+  mutating request acquires `acquireFactoryLock` for the duration of that
+  action only (construct → use → dispose → close → release — the CLI
+  `withFactory` lifecycle without the inbox claim).
+- `wb serve` never claims inbox files (no `scanInbox` at startup or in
+  per-item actions); claiming belongs to the `run` action (`POST /api/run`
+  and `runNow`).
+- `wb status` output stays byte-identical: `classifyInbox`, `formatAge`, and
+  `printStatusItems` were moved verbatim into `src/status.ts` and re-imported
+  by the CLI.
+- Localhost-only by default: binds `127.0.0.1`; `--host` is the only escape.
+  No auth — the binding is the boundary.
+- `wb serve` on a root without `factory.db` prints the friendly status/watch
+  message and exits 0.
+
+## CLI wiring
+
+`wb serve [--root <dir>] [--port <n>] [--host <addr>] [--interval <seconds>]`
+(defaults 7466 / 127.0.0.1 / 2). Mirrors `wb watch`: resolve config/root,
+refuse a fresh root, open the DB read-only, listen, print
+`wb serve — http://<host>:<port> · Ctrl+C to stop`, keep alive until SIGINT
+(clean exit 0; readonly DB closed). Production runners (`SandcastleStageRunner`,
+`SandcastleCurator`, `GhPrPublisher`) are constructed per mutating action,
+never at startup.
+
+## Shared status layer (`src/status.ts`)
+
+- `classifyInbox(db, inboxDir)`, `formatAge(ms)`, `printStatusItems(db, {all})`
+  — verbatim CLI presentation helpers (see above).
+- `buildStatusPayload({root, paths, db, clock?})` → `StatusPayload`:
+  `{ root, generatedAt, maxHistoryId, lock, counts, flow, stages, knownRepos,
+  inbox, items }`. Read-only calls only (no lock, no writes).
+  - `lock`: `readLockInfo` + `lockHolderAlive` + age (`stale` when older than
+    the 10-minute threshold), or `null`.
+  - `counts`: `decisions` = every status that is neither actionable
+    (queued/running) nor terminal (done/rejected) — the same parked set
+    `wb watch`'s card uses; `running`, `queued`, `inbox` (claimable), `done`.
+  - `flow`: segments in factory order, zero-count omitted — inbox, queue, one
+    per stage for running items at that stage, parked, done (the proportional
+    bar; prototype variant A folded into C).
+  - `items`: ALL items (incl. done), newest-last, each an `ItemRecord` plus at
+    most three derived fields: `artifacts` (the parked stage's artifacts for
+    `awaiting-approval`; all artifacts for `done`), `prUrl`/`prDraft` (from
+    `parkedDetail` when done), `questions` (from `parkedDetail` when
+    `needs-human`). `artifact.path` is root-relative as stored.
+
+## HTTP surface (`createServeApp(deps)` → `{handler, flush, stop}`)
+
+`deps`: `{ root, paths, config, db (readonly), makeRunner, intervalMs? (0 = no
+timer, tests drive `flush()`), clock?, runMode? ("background" | "await") }`.
+`makeRunner()` returns `{ runner, curator, publisher, baseCheck? }`; production
+omits `baseCheck` (the real `GitBaseFreshnessChecker` is used), tests pass a
+silently-proceeding checker (`tests/helpers.ts` rationale). Errors are JSON
+`{ error }` (+ field arrays / lock objects). Bodies over 2 MiB and non-JSON
+bodies are 400.
+
+| Method/Path | Result |
+|---|---|
+| `GET /` | 200 `text/html` — `PAGE_HTML` |
+| `GET /api/status` | 200 `StatusPayload` |
+| `GET /api/events?afterId=<n>` | 200 `text/event-stream` (below) |
+| `GET /api/template` | 200 `text/markdown` — `ITEM_TEMPLATE` |
+| `GET /api/artifact?path=<rel>` | 200 file / 400 missing path / 403 escape or non-`items/` / 404 missing |
+| `POST /api/items` `{title, repo, base?, approvals?, description, runNow?}` | 201 `{ok, file, slug, runStarted, runBusy?}` / 422 `{errors: [{field, reason}]}` / 409 busy |
+| `POST /api/items/drop` `{filename, content}` | 201 `{ok, file}` / 400 bad name / 409 collision / 409 busy |
+| `POST /api/items/:id/approve` `{note?}` | 200 `{item}` / 404 / 409 |
+| `POST /api/items/:id/reject` `{reason}` | 200 `{item}` / 400 missing reason / 404 / 409 |
+| `POST /api/items/:id/answer` `{answers: [{question, answer}]} | {feedback}` | 200 `{item}` / 400 / 404 / 409 |
+| `POST /api/items/:id/retry` | 200 `{item}` / 404 / 409 / 422 `still malformed: …` |
+| `POST /api/run`, `POST /api/resume` | 202 `{started: true, capped?}` / 409 `{busy: true, error, lock}` |
+
+Fixed error mapping: unknown item id → 404 (numeric ids only; id-or-slug
+prefix matching stays CLI-only). `requireStatus`/`retry`-guard and other
+orchestrator errors → 409 with the message. `FactoryBusyError` → 409 with
+`{pid, ts, ageMs, alive, stale}` lock info. Composer validation failures →
+422 field-shaped errors (order: title → repo → base → approvals →
+description; `authorItem`'s composite reason — duplicate slug, EEXIST — is
+the `item`-field backstop).
+
+## Actions
+
+- Each action runs the CLI `withFactory` lifecycle minus the claim, with the
+  per-request lock. `approve`'s note maps to `-n`; `reject` requires a reason
+  (400 on empty, mirroring commander's `requiredOption`).
+- `answer` deliberately diverges from the CLI's `matchAnswers`: the server
+  validates each submitted `{question, answer}` pair against
+  `parkedDetail.questions` by exact string equality (at least one pair,
+  non-empty answers; unknown questions → 400) and calls `orch.answer(id,
+  pairs)` directly — subsets are legal (story 11); unanswered questions come
+  back as a fresh `needs-human` park if triage still needs them. Questionless
+  parks take `{feedback}` and store the CLI's `"(free-form)"` pair. The CLI's
+  full-count `matchAnswers` path is untouched.
+- `retry` maps to `orch.retry`; an unfixed malformed file surfaces the parse
+  reason as 422 `still malformed: …`.
+- `run`/`resume`: the lock is acquired synchronously (busy → 409 + lock info);
+  on success the response is 202 immediately (awaited in test mode) and the
+  task does the claim pass (`scanInbox`) then `tickAll()`/`resume()` (`capped`
+  reported; a capped resume logs the CLI's safety-cap line server-side).
+  Progress reaches clients only via SSE. Single-flight is enforced by the
+  lock itself (a second POST during a run → 409).
+- Composer writes go through `authorItem` (explicit-field mode,
+  non-interactive `AuthoringIO`); `runNow: true` performs the identical
+  background-run procedure after the write and reports `runStarted` /
+  `runBusy`.
+- File drop: `filename` must be a plain `path.basename` (path-shaped input →
+  400 — KB 2026-11-02 22:31 path-injection guard) matching
+  `^[A-Za-z0-9][A-Za-z0-9._-]*\.md$`; content is written byte-exact,
+  unparsed, with exclusive create (collision → 409).
+
+## SSE protocol (`GET /api/events`)
+
+Headers: `text/event-stream`, `no-cache`, `keep-alive`, `X-Accel-Buffering:
+no`. On connect: one read snapshot; when `afterId` (query param, or the
+`Last-Event-ID` header EventSource sends) is present, the missed rows
+(`getHistorySince(afterId)`) are replayed first — then one `status` event
+carrying the full `StatusPayload` (no `id:` field; ids belong only to history
+rows). Per tick (one shared poll for all clients, `flush()`): one
+`getWatchSnapshot(cursor)` read; each client receives exactly the rows with
+`id > client.lastEventId` (in order, tagged `id:`), then a `status` event iff
+a fingerprint over (items' id/status/stage/parkedReason/parkedDetail/
+feedback/updatedAt + claimable inbox filenames + lock pid/ts) changed. Reconnect
+or a second tab gets a fresh snapshot; there is no client-side merge. DB read
+failures are swallowed with a consecutive-failure counter; from the 5th
+failure one stderr line per failing poll (watch parity).
+
+## Artifact containment
+
+`GET /api/artifact?path=<root-relative>`: missing path → 400; absolute or
+`..` segments → 403 (before resolving); `path.resolve(root, requested)` +
+`path.relative` prefix check → 403 on escape; the served prefix is
+allowlisted to `items/` → 403 otherwise; `statSync` file check → 404; served
+as `text/markdown; charset=utf-8` with `Cache-Control: no-store`.
+
+## Page (`PAGE_HTML`)
+
+Decision-desk layout (prototype variant C): pulse tiles (decisions amber /
+in flight / inbox / landed) + proportional flow bar (sub-9% segments demoted
+to a legend); the collapsible composer (title, repo input + known-repos
+datalist, base default "main", five approval-gate checkboxes, markdown
+description, "Start from template" prefill from `/api/template`, "run now",
+and a file drop zone); the parking lot — one card per parked item (decision
+order: awaiting-approval, needs-human, exhausted-rework,
+infrastructure-failure, malformed, human-rejected, then id) with the color
+map (amber/red/orange/violet/fuchsia), stage-progress dots (stages before
+`item.stage` emerald, current dot in the status color, future stone),
+artifact links, note/reason inputs, per-question answer inputs, verbatim gate
+feedback, retry with inline 409/422 reasons, stale-base hint on the glance
+chips, PR links on done chips, human-rejected hint (Resume; no per-item
+button); Run/Resume buttons and the lock banner (pid + age) in the header; an
+append-only live feed colored by event. EventSource auto-reconnect with
+`Last-Event-ID` provides gapless resume. Every untrusted string is rendered
+through `esc()`/`textContent` (no raw `innerHTML` interpolation of data); all
+actions are same-origin `POST` with `Content-Type: application/json`; no CORS
+headers are emitted. Width: `max-w-3xl`, laptop-first.
+
+## Tests
+
+`tests/web-serve.test.ts` — HTTP-seam only: `createServeApp` wired to a temp
+factory root via `createHarness()` (readonly DB handle, `ScriptedRunner`/
+`FakePublisher` + silent-proceed `baseCheck`, `runMode: "await"`,
+`intervalMs: 0`), served on `127.0.0.1` with a real `http.Server`, exercised
+with `fetch`. Covers: page/template endpoints and the no-lock invariant;
+`/api/status` item/inbox equality with the shared status layer (decisions
+counts, questions, artifacts, prUrl, lock holder); approve (±note) /
+reject (400 vs 200) / retry (infra budget untouched, malformed 422→fixed 200,
+wrong status 409) / answer (subset, full set with merge, unknown question,
+free-form) driving real transitions; composer front-matter round-trip,
+field-shaped 422s, duplicate slug, `runNow`; drop byte-exactness, bad names,
+oversize, collision, malformed JSON; lock single-flight across every mutating
+endpoint plus a concurrent run during a slow-stage execution; resume to
+completion with `capped: false`; SSE snapshot-then-delta with ids,
+no-change quiet, `afterId`/`Last-Event-ID` resumption without gaps or
+duplicates, fan-out of one poll to two clients; artifact containment
+(200/400/403/404 matrix).

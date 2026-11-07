@@ -8,19 +8,22 @@ import { loadConfig, ensureConfigFile } from "../config.js";
 import { makePaths, ensureLayout } from "../paths.js";
 import { FactoryDb } from "../db.js";
 import { acquireFactoryLock, lockHolderAlive, readLockInfo, STALE_LOCK_MS } from "../lock.js";
-import { scanInbox, claimBlocked, listInboxFiles } from "../inbox.js";
-import { ITEM_TEMPLATE, slugify } from "../frontmatter.js";
-import type { ItemRecord } from "../types.js";
+import { scanInbox } from "../inbox.js";
+import { ITEM_TEMPLATE } from "../frontmatter.js";
 import { authorItem, type NewOptions } from "../new.js";
 import { makeRealIO } from "../prompt.js";
 import { Orchestrator, matchAnswers } from "../pipeline.js";
 import { GitBaseFreshnessChecker } from "../baseFreshness.js";
 import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, agentEnvFor } from "../adapters/sandcastle.js";
 import { parseIntervalSeconds, startWatch, type WatchState } from "../watch.js";
+import { classifyInbox, formatAge, printStatusItems } from "../status.js";
+import { runServe } from "../web/server.js";
 import { runGc, GitGcScanner, GitGcReaper, renderGcHuman, renderGcJson, type GcFlags } from "../gc.js";
 import { sleep } from "../util.js";
 
 const program = new Command("wb");
+
+interface StatusFlags { all?: boolean }
 
 function openFactory(rootOverride?: string): {
   root: string;
@@ -124,87 +127,6 @@ function logClaimReport(report: ReturnType<typeof scanInbox>): void {
   }
   if (report.skipped.length) {
     for (const s of report.skipped) console.log(`skipped (already claimed): ${s.slug}`);
-  }
-}
-
-interface StatusFlags { all?: boolean }
-
-/** Classify unclaimed inbox files without mutating anything (read-only peer of `scanInbox`).
- *  Matches scanInbox's skip rule via the shared `claimBlocked` predicate and
- *  shares `listInboxFiles`, so "awaiting claim" means `wb run` will actually claim it. */
-function classifyInbox(db: FactoryDb, inboxDir: string): {
-  claimable: string[];
-  alreadyClaimed: { file: string; item: ItemRecord }[];
-  error: NodeJS.ErrnoException | null;
-} {
-  let files: string[];
-  try {
-    // listInboxFiles throws ENOENT when the inbox doesn't exist yet — a normal
-    // settled state. Any other read error must surface, otherwise status makes
-    // an unreadable inbox look empty.
-    files = listInboxFiles(inboxDir);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      return { claimable: [], alreadyClaimed: [], error: null };
-    }
-    return { claimable: [], alreadyClaimed: [], error: err as NodeJS.ErrnoException };
-  }
-  const claimable: string[] = [];
-  const alreadyClaimed: { file: string; item: ItemRecord }[] = [];
-  for (const fileName of files) {
-    const existing = db.findBySlug(slugify(path.basename(fileName)));
-    if (claimBlocked(existing)) {
-      alreadyClaimed.push({ file: fileName, item: existing });
-    } else {
-      claimable.push(fileName);
-    }
-  }
-  return { claimable, alreadyClaimed, error: null };
-}
-
-/** Human age for a lock timestamp. */
-function formatAge(ms: number): string {
-  if (ms < 60_000) return "just started";
-  return `${Math.round(ms / 60_000)} min ago`;
-}
-
-/** Shared item listing used by `wb status` (read-only, no lock needed). */
-function printStatusItems(db: FactoryDb, opts: StatusFlags): void {
-  const items = db.listItems().filter((i) => opts.all || i.status !== "done");
-  if (items.length === 0) {
-    console.log("No items. Drop a markdown file in the inbox: `wb template`");
-  }
-  for (const item of items) {
-    console.log(`#${item.id} ${item.slug} [${item.status}] stage=${item.stage} repo=${item.repo}`);
-    console.log(`    title: ${item.title}`);
-    if (item.sourceFile) console.log(`    source: ${item.sourceFile}`);
-    if (item.parkedReason) console.log(`    parked: ${item.parkedReason}`);
-    if (item.parkedDetail) {
-      const d = item.parkedDetail;
-      if (item.parkedReason === "stale-base" && typeof d.base === "string" && typeof d.repo === "string") {
-        console.log(
-          `    stale base: ${d.base} (${d.localTip ?? "?"}) behind origin/${d.base} (${d.upstreamTip ?? "?"}) — git pull in ${d.repo}`,
-        );
-      }
-      if (Array.isArray(d.questions) && d.questions.length > 0) {
-        console.log("    questions:");
-        for (const q of d.questions as string[]) console.log(`      - ${q}`);
-      }
-      if (typeof d.stage === "string" && d.stage !== item.stage) {
-        console.log(`    completed stage: ${d.stage}`);
-      }
-      if (item.parkedReason === "awaiting-approval") {
-        const artifacts = db.getArtifacts(item.id).filter((a) => a.stage === d.stage);
-        if (artifacts.length > 0) {
-          console.log(`    artifact from ${d.stage}: ` + artifacts.map((a) => a.path).join(", "));
-        }
-      }
-    }
-    const attempts = Object.entries(item.gateAttempts);
-    if (attempts.length > 0) {
-      console.log(`    gate attempts: ${attempts.map(([s, n]) => `${s}=${n}`).join(", ")}`);
-    }
-    if (item.infraAttempts > 0) console.log(`    infra retries so far: ${item.infraAttempts}`);
   }
 }
 
@@ -359,6 +281,17 @@ program
     } finally {
       db.close();
     }
+  });
+
+program
+  .command("serve")
+  .description("Host a local browser UI over the factory (read-only observation; actions take the factory lock per request)")
+  .option("--root <dir>", "factory root directory")
+  .option("--port <n>", "port to listen on", "7466")
+  .option("--host <addr>", "address to bind (default 127.0.0.1; bind only if you know why)", "127.0.0.1")
+  .option("--interval <seconds>", "SSE poll interval in seconds", "2")
+  .action(async (opts: { root?: string; port?: string; host?: string; interval?: string }) => {
+    await runServe(opts);
   });
 
 program
