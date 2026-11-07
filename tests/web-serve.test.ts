@@ -59,13 +59,18 @@ interface ServerHarness {
   server: http.Server;
   url: string;
   runner: StageRunner;
+  /** The readonly observation handle the app polls (deps.db). */
+  rodb: FactoryDb;
   stop: () => Promise<void>;
 }
 
 const servers: ServerHarness[] = [];
 const extraDirs: string[] = [];
 
-async function makeServer(script: Script = {}): Promise<ServerHarness> {
+async function makeServer(
+  script: Script = {},
+  extraDeps: Partial<ServeAppDeps> = {},
+): Promise<ServerHarness> {
   const h = createHarness();
   const runner = new ScriptedRunner(script);
   const rodb = FactoryDb.openReadonly(h.root);
@@ -77,6 +82,7 @@ async function makeServer(script: Script = {}): Promise<ServerHarness> {
     makeRunner: () => ({ runner, curator: null, publisher: new FakePublisher(), baseCheck: silentProceed }),
     intervalMs: 0, // no real timers: tests drive app.flush()
     runMode: "await",
+    ...extraDeps,
   });
   const server = http.createServer((req, res) => app.handler(req, res));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -87,6 +93,7 @@ async function makeServer(script: Script = {}): Promise<ServerHarness> {
     server,
     url,
     runner,
+    rodb,
     stop: async () => {
       app.stop();
       server.closeAllConnections?.();
@@ -1308,5 +1315,100 @@ describe("wb serve: per-tick query budget (counting proxy)", () => {
     expect(execsOf(counts, "ORDER BY id DESC LIMIT")).toBe(1);
     expect(rowsOf(counts, "ORDER BY id DESC LIMIT")).toBe(3);
     stream.abort();
+  });
+});
+
+// ------------------------------------------------- Greptile review rework
+// Regression tests for review findings on the shipped PR: CSS selector
+// escapes must survive the template literal, the whole SSE read step must be
+// failure-proof, and a stalled reader must not buffer server memory without
+// bound.
+
+describe("wb serve: page CSS selectors survive the template literal", () => {
+  it("emits escaped CSS selectors (every backslash is doubled) and never a bare bracketed selector", async () => {
+    const s = await makeServer();
+    const page = await (await fetch(s.url + "/")).text();
+    // Escaped forms — what a browser needs to drop the rule's braces safely.
+    for (const needle of [
+      ".text-\\[11px\\]",
+      ".left-1\\/2",
+      ".h-1\\.5",
+      ".bg-white\\/50",
+      ".min-h-\\[3rem\\]",
+      ".hover\\:\\!bg-red-700:hover",
+    ]) {
+      expect(page).toContain(needle + " ");
+    }
+    // The unescaped forms as a template literal would mangle them: `\[` in a
+    // template literal evaluates to `[`, leaving `.text-[11px]` — an invalid
+    // selector whose rule the browser silently drops.
+    for (const broken of [".text-[11px] {", ".left-1/2 {", ".h-1.5 {", ".bg-white/50 {"]) {
+      expect(page).not.toContain(broken);
+    }
+    await s.stop();
+  });
+});
+
+describe("wb serve: SSE read resilience + backpressure", () => {
+  it("swallows a mid-payload read failure and advances the cursor only on success", async () => {
+    const s = await makeServer();
+    s.h.inboxFile("artifact-flake", { title: "Artifact flake", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    claim(s.h);
+    const id = s.h.db.listItems()[0]!.id;
+    const stream = connectEvents(s);
+    await stream.waitUntil((n) => n >= 1); // snapshot received
+
+    // The tick reads artifacts + known repos while building the payload; a
+    // failure anywhere in the whole read step must be swallowed — not escape
+    // the interval callback and kill the server — and must not advance the
+    // cursor, so the row is delivered once the flake clears.
+    s.h.db.appendHistory(id, "stage-start", "test", { attempt: 1 });
+    (s.rodb as unknown as { listArtifactsByItem: () => never }).listArtifactsByItem = () => {
+      throw new Error("simulated artifacts read failure");
+    };
+    expect(() => s.app.flush()).not.toThrow();
+
+    // Flake clears → the same window is re-fetched and delivered.
+    delete (s.rodb as unknown as { listArtifactsByItem?: () => never }).listArtifactsByItem;
+    const before = stream.events.length;
+    s.app.flush();
+    await stream.waitUntil((n) => n > before);
+    expect(stream.events[before]!.id).not.toBeNull(); // the missed history row, not lost
+    stream.abort();
+  });
+
+  it("cuts a client whose SSE write exceeds the backlog cap (slow-reader protection)", async () => {
+    // Small cap + one item whose status payload alone dwarfs it: the snapshot
+    // write returns false with a backlog over the cap, so the client is cut
+    // synchronously — no server-side memory growth for a stalled reader, and
+    // its reconnect replay (bounded) is the recovery path. Same clientWrite
+    // path that guards every per-tick fan-out write.
+    const s = await makeServer({}, { maxClientBufferedBytes: 64 * 1024 });
+    s.h.inboxFile("huge-detail", { title: "Huge detail", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    claim(s.h);
+    const id = s.h.db.listItems()[0]!.id;
+    s.h.db.updateItem(id, {
+      status: "infrastructure-failure",
+      stage: "test",
+      parkedReason: "infra-budget",
+      parkedDetail: { error: "z".repeat(512 * 1024) },
+    });
+    const closed = new Promise<string>((resolve) => {
+      const socket = net.connect((s.server.address() as { port: number }).port, "127.0.0.1", () => {
+        socket.setNoDelay(true);
+        socket.write(`GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:${(s.server.address() as { port: number }).port}\r\nAccept: text/event-stream\r\n\r\n`);
+      });
+      socket.on("data", () => { /* keep draining */ });
+      socket.on("close", () => resolve("closed"));
+      socket.on("error", () => resolve("error"));
+    });
+    const outcome = await Promise.race([closed, new Promise<string>((r) => setTimeout(() => r("not-cut"), 5000))]);
+    // The server cut the connection (destroy or reset) once the backlog cap
+    // was exceeded; it must NOT have buffered the whole oversized snapshot.
+    expect(outcome === "closed" || outcome === "error").toBe(true);
+    // The server itself stays healthy (the cap cut the client, not the server).
+    const status = await fetch(s.url + "/api/status");
+    expect(status.status).toBe(200);
+    await s.stop();
   });
 });

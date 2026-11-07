@@ -82,12 +82,12 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .col-span-2 { grid-column: span 2 / span 2; }
   .gap-0 { gap: 0; }
   .gap-1 { gap: 0.25rem; }
-  .gap-1\.5 { gap: 0.375rem; }
+  .gap-1\\.5 { gap: 0.375rem; }
   .gap-2 { gap: 0.5rem; }
   .gap-3 { gap: 0.75rem; }
   .gap-x-3 { column-gap: 0.75rem; }
-  .gap-y-0\.5 { row-gap: 0.125rem; }
-  .space-y-0\.5 > * + * { margin-top: 0.125rem; }
+  .gap-y-0\\.5 { row-gap: 0.125rem; }
+  .space-y-0\\.5 > * + * { margin-top: 0.125rem; }
   .space-y-3 > * + * { margin-top: 0.75rem; }
   .space-y-4 > * + * { margin-top: 1rem; }
 
@@ -99,38 +99,38 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .top-0 { top: 0; }
   .top-4 { top: 1rem; }
   .left-0 { left: 0; }
-  .left-1\/2 { left: 50%; }
+  .left-1\\/2 { left: 50%; }
   .bottom-0 { bottom: 0; }
   .z-20 { z-index: 20; }
   .z-50 { z-index: 50; }
-  .-translate-x-1\/2 { transform: translateX(-50%); }
+  .-translate-x-1\\/2 { transform: translateX(-50%); }
 
 /* ---- size ---- */
   .h-1 { height: 0.25rem; }
-  .h-1\.5 { height: 0.375rem; }
+  .h-1\\.5 { height: 0.375rem; }
   .h-2 { height: 0.5rem; }
-  .h-2\.5 { height: 0.625rem; }
+  .h-2\\.5 { height: 0.625rem; }
   .h-6 { height: 1.5rem; }
   .h-px { height: 1px; }
   .w-1 { width: 0.25rem; }
-  .w-1\.5 { width: 0.375rem; }
+  .w-1\\.5 { width: 0.375rem; }
   .w-2 { width: 0.5rem; }
-  .w-2\.5 { width: 0.625rem; }
+  .w-2\\.5 { width: 0.625rem; }
   .w-6 { width: 1.5rem; }
   .w-36 { width: 9rem; }
   .w-full { width: 100%; }
-  .\!w-52 { width: 13rem !important; }
+  .\\!w-52 { width: 13rem !important; }
   .max-w-3xl { max-width: 48rem; }
   .max-h-72 { max-height: 18rem; }
-  .min-h-\[3rem\] { min-height: 3rem; }
+  .min-h-\\[3rem\\] { min-height: 3rem; }
 
 /* ---- spacing ---- */
   .mx-auto { margin-left: auto; margin-right: auto; }
   .ml-auto { margin-left: auto; }
   .mr-1 { margin-right: 0.25rem; }
-  .mt-0\.5 { margin-top: 0.125rem; }
+  .mt-0\\.5 { margin-top: 0.125rem; }
   .mt-1 { margin-top: 0.25rem; }
-  .mt-1\.5 { margin-top: 0.375rem; }
+  .mt-1\\.5 { margin-top: 0.375rem; }
   .mt-2 { margin-top: 0.5rem; }
   .mt-3 { margin-top: 0.75rem; }
   .mt-4 { margin-top: 1rem; }
@@ -138,23 +138,23 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .mt-8 { margin-top: 2rem; }
   .mt-10 { margin-top: 2.5rem; }
   .mb-1 { margin-bottom: 0.25rem; }
-  .mb-1\.5 { margin-bottom: 0.375rem; }
+  .mb-1\\.5 { margin-bottom: 0.375rem; }
   .mb-3 { margin-bottom: 0.75rem; }
   .mb-4 { margin-bottom: 1rem; }
   .p-2 { padding: 0.5rem; }
-  .p-2\.5 { padding: 0.625rem; }
+  .p-2\\.5 { padding: 0.625rem; }
   .p-3 { padding: 0.75rem; }
   .p-4 { padding: 1rem; }
   .p-5 { padding: 1.25rem; }
   .px-1 { padding-left: 0.25rem; padding-right: 0.25rem; }
   .px-2 { padding-left: 0.5rem; padding-right: 0.5rem; }
-  .px-2\.5 { padding-left: 0.625rem; padding-right: 0.625rem; }
+  .px-2\\.5 { padding-left: 0.625rem; padding-right: 0.625rem; }
   .px-3 { padding-left: 0.75rem; padding-right: 0.75rem; }
   .px-4 { padding-left: 1rem; padding-right: 1rem; }
   .px-5 { padding-left: 1.25rem; padding-right: 1.25rem; }
-  .py-0\.5 { padding-top: 0.125rem; padding-bottom: 0.125rem; }
+  .py-0\\.5 { padding-top: 0.125rem; padding-bottom: 0.125rem; }
   .py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; }
-  .py-1\.5 { padding-top: 0.375rem; padding-bottom: 0.375rem; }
+  .py-1\\.5 { padding-top: 0.375rem; padding-bottom: 0.375rem; }
   .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
   .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
   .pb-24 { padding-bottom: 6rem; }
@@ -168,9 +168,9 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .font-semibold { font-weight: 600; }
   .font-medium { font-weight: 500; }
   .font-normal { font-weight: 400; }
-  .text-\[9px\] { font-size: 9px; }
-  .text-\[10px\] { font-size: 10px; }
-  .text-\[11px\] { font-size: 11px; }
+  .text-\\[9px\\] { font-size: 9px; }
+  .text-\\[10px\\] { font-size: 10px; }
+  .text-\\[11px\\] { font-size: 11px; }
   .text-xs { font-size: 12px; line-height: 16px; }
   .text-sm { font-size: 14px; line-height: 20px; }
   .text-lg { font-size: 18px; line-height: 28px; }
@@ -225,11 +225,11 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
 /* ---- colors: backgrounds (paper/ink theme + status hues) ---- */
   .bg-paper { background-color: #fafaf9; }
   .bg-white { background-color: #fff; }
-  .bg-white\/50 { background-color: rgba(255, 255, 255, 0.5); }
-  .bg-white\/70 { background-color: rgba(255, 255, 255, 0.7); }
-  .bg-white\/80 { background-color: rgba(255, 255, 255, 0.8); }
+  .bg-white\\/50 { background-color: rgba(255, 255, 255, 0.5); }
+  .bg-white\\/70 { background-color: rgba(255, 255, 255, 0.7); }
+  .bg-white\\/80 { background-color: rgba(255, 255, 255, 0.8); }
   .bg-ink-100 { background-color: #f5f5f4; }
-  .bg-ink-100\/70 { background-color: rgba(245, 245, 244, 0.7); }
+  .bg-ink-100\\/70 { background-color: rgba(245, 245, 244, 0.7); }
   .bg-ink-300 { background-color: #d6d3d1; }
   .bg-ink-400 { background-color: #a8a29e; }
   .bg-ink-500 { background-color: #78716c; }
@@ -300,10 +300,10 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .accent-indigo-600 { accent-color: #4f46e5; }
 
 /* ---- important / hover variants ---- */
-  .\!bg-red-600 { background-color: #dc2626 !important; }
-  .hover\:\!bg-red-700:hover { background-color: #b91c1c !important; }
-  .hover\:bg-indigo-700:hover { background-color: #4338ca; }
-  .hover\:bg-indigo-50\/50:hover { background-color: rgba(238, 242, 255, 0.5); }
+  .\\!bg-red-600 { background-color: #dc2626 !important; }
+  .hover\\:\\!bg-red-700:hover { background-color: #b91c1c !important; }
+  .hover\\:bg-indigo-700:hover { background-color: #4338ca; }
+  .hover\\:bg-indigo-50\\/50:hover { background-color: rgba(238, 242, 255, 0.5); }
 </style>
 </head>
 <body class="bg-paper text-ink-900">
@@ -694,6 +694,84 @@ function cardHtml(it) {
   return html;
 }
 
+/* Unfinished user input lives inside re-rendered cards (answer inputs, the
+ * approval note, the rejection textarea, an open reject box). Live status
+ * events must not silently wipe it: before replacing the parking-lot DOM we
+ * capture every non-empty draft plus the focused field, and after the
+ * replacement we restore them. Keyed by item id (+ question text), which is
+ * stable across renders. */
+function captureDrafts() {
+  var el = $('parking-lot');
+  if (!el.firstChild) return null;
+  var state = {};
+  el.querySelectorAll('[data-id]').forEach(function (card) {
+    var id = card.getAttribute('data-id');
+    var s = {};
+    var note = card.querySelector('.note-input');
+    if (note && note.value) s.note = note.value;
+    var reason = card.querySelector('.reason-input');
+    if (reason && reason.value) s.reason = reason.value;
+    var rejectBox = card.querySelector('.reject-box');
+    if (rejectBox && !rejectBox.classList.contains('hidden')) s.rejectOpen = true;
+    var fb = card.querySelector('.fb-input');
+    if (fb && fb.value) s.fb = fb.value;
+    var answers = {};
+    card.querySelectorAll('.q-input').forEach(function (q) {
+      if (q.value) answers[q.getAttribute('data-question')] = q.value;
+    });
+    if (Object.keys(answers).length) s.answers = answers;
+    if (Object.keys(s).length) state[id] = s;
+  });
+  var focus = null;
+  var active = document.activeElement;
+  if (active && el.contains(active)) {
+    var fcard = active.closest('[data-id]');
+    if (fcard) {
+      focus = {
+        id: fcard.getAttribute('data-id'),
+        cls: active.classList.contains('q-input') ? 'q-input' : (active.classList.contains('note-input') ? 'note-input' : (active.classList.contains('reason-input') ? 'reason-input' : (active.classList.contains('fb-input') ? 'fb-input' : ''))),
+        question: active.getAttribute('data-question') || '',
+      };
+    }
+  }
+  return { state: state, focus: focus };
+}
+
+function applyDrafts(captured) {
+  if (!captured) return;
+  var el = $('parking-lot');
+  for (var id in captured.state) {
+    var card = el.querySelector('[data-id="' + id + '"]');
+    if (!card) continue;
+    var s = captured.state[id];
+    if (s.note) { var n = card.querySelector('.note-input'); if (n) n.value = s.note; }
+    if (s.reason) { var r = card.querySelector('.reason-input'); if (r) r.value = s.reason; }
+    if (s.fb) { var f = card.querySelector('.fb-input'); if (f) f.value = s.fb; }
+    if (s.rejectOpen) { var b = card.querySelector('.reject-box'); if (b) b.classList.remove('hidden'); }
+    if (s.answers) {
+      card.querySelectorAll('.q-input').forEach(function (q) {
+        var v = s.answers[q.getAttribute('data-question')];
+        if (v !== undefined) q.value = v;
+      });
+    }
+    // Restore focus (and caret position) if the user was mid-typing here.
+    if (captured.focus && captured.focus.id === id && captured.focus.cls) {
+      var target = null;
+      if (captured.focus.cls === 'q-input') {
+        card.querySelectorAll('.q-input').forEach(function (q) {
+          if (!target && (q.getAttribute('data-question') || '') === captured.focus.question) target = q;
+        });
+      } else {
+        target = card.querySelector('.' + captured.focus.cls);
+      }
+      if (target) {
+        target.focus();
+        try { target.setSelectionRange(target.value.length, target.value.length); } catch (e) { /* textarea/input without ranges */ }
+      }
+    }
+  }
+}
+
 function renderParking(p) {
   var cards = p.items.filter(isParked).sort(byParkOrder);
   var el = $('parking-lot');
@@ -706,7 +784,12 @@ function renderParking(p) {
     ' waiting on you · nothing else is blocked</div></div><div class="space-y-4">';
   html += cards.map(cardHtml).join('');
   html += '</div>';
+  // Skip the DOM replacement when untouched — and when it DOES change, carry
+  // in-progress drafts + focus across so live updates never erase typing.
+  if (el.innerHTML === html) return;
+  var captured = captureDrafts();
   el.innerHTML = html;
+  applyDrafts(captured);
 }
 
 function renderGlance(p) {

@@ -84,6 +84,10 @@ export interface ServeAppDeps {
   };
   /** SSE poll interval; 0 disables the timer (tests drive `flush()` directly). */
   intervalMs?: number;
+  /** Per-client SSE write-backlog cap in bytes (default 2 MiB). A client whose
+   *  socket stops draining is cut once its backlog exceeds this; reconnect
+   *  replay (bounded) is the recovery path. */
+  maxClientBufferedBytes?: number;
   clock?: { now(): number };
   /** "background" (prod): run/resume answer 202 immediately. "await" (tests): answer after completion. */
   runMode?: "background" | "await";
@@ -117,12 +121,20 @@ interface SseClient {
   lastEventId: number;
   /** Last status fingerprint delivered to this client. */
   fingerprint: string;
+  /** Bytes written while the socket is not draining (write() returned false
+   *  and no `drain` since). A stalled reader must not grow server memory
+   *  without bound; past the cap the connection is cut and reconnect replay
+   *  (bounded) catches the client up. Reset on every drained/accepted write. */
+  buffered: number;
+  /** Set when the client is cut (or gone); further writes are no-ops. */
+  closed?: boolean;
 }
 
 // ---------------------------------------------------------------- app factory
 
 export function createServeApp(deps: ServeAppDeps): ServeApp {
   const intervalMs = deps.intervalMs ?? 2000;
+  const maxClientBufferedBytes = deps.maxClientBufferedBytes ?? 2 * 1024 * 1024;
   const clock = deps.clock ?? { now: () => Date.now() };
   const clients = new Set<SseClient>();
   /** The shared poller's own position: max history id it has fetched (and sent). */
@@ -174,8 +186,34 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     return `event: status\ndata: ${JSON.stringify(payload)}\n\n`;
   }
 
-  function sendStatus(res: ServerResponse, chunk: string): void {
-    res.write(chunk);
+  /** Write `chunk` to a connected SSE client with backpressure bookkeeping.
+   *  Every SSE write for a tracked client must go through here: a reader that
+   *  stops draining (paused socket, dead tab) accumulates server-side write
+   *  buffer without bound otherwise. Once the accumulated non-drained bytes
+   *  pass the cap the client is cut — its reconnect (Last-Event-ID) replays
+   *  the bounded window and the snapshot resumes the stream. */
+  function clientWrite(client: SseClient, chunk: string): void {
+    if (client.closed) return;
+    let ok: boolean;
+    try {
+      ok = client.res.write(chunk);
+    } catch {
+      return; // already-gone socket — the `close` handler removes the client
+    }
+    if (ok) {
+      client.buffered = 0;
+      return;
+    }
+    client.buffered += chunk.length;
+    if (client.buffered > maxClientBufferedBytes) {
+      client.closed = true;
+      clients.delete(client);
+      try {
+        client.res.destroy();
+      } catch {
+        /* already gone */
+      }
+    }
   }
 
   /** SSE connect: optional bounded replay (afterId / Last-Event-ID), then one
@@ -199,6 +237,21 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     const payload = payloadFromSnapshot(snap);
     const byId = new Map(snap.items.map((i) => [i.id, i] as const));
     let last = snap.maxHistoryId ?? 0;
+    const client: SseClient = {
+      res,
+      lastEventId: Math.max(afterId ?? 0, last),
+      fingerprint: statusFingerprint(payload),
+      buffered: 0,
+    };
+    // Reset the backlog bookkeeping whenever the socket keeps up; `close`
+    // removes the client from the fan-out in every other path.
+    res.on("drain", () => {
+      client.buffered = 0;
+    });
+    res.on("close", () => {
+      clients.delete(client);
+      client.closed = true;
+    });
     if (afterId !== null) {
       // Replay exactly the missed rows before the status event (no gaps, no
       // duplicates). The read is bounded in the query itself — SQL LIMIT via
@@ -207,42 +260,50 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
       // cap the snapshot below is the whole truth.
       const replay = deps.db.getRecentHistorySince(afterId, MAX_SSE_REPLAY_ROWS);
       for (const row of replay) {
-        res.write(historyChunk(row, byId.get(row.item_id)?.slug ?? "(unknown)"));
+        clientWrite(client, historyChunk(row, byId.get(row.item_id)?.slug ?? "(unknown)"));
         last = Math.max(last, row.id);
       }
+      client.lastEventId = Math.max(client.lastEventId, last);
     }
-    sendStatus(res, statusChunk(payload));
-    const client: SseClient = {
-      res,
-      lastEventId: Math.max(afterId ?? 0, last),
-      fingerprint: statusFingerprint(payload),
-    };
-    clients.add(client);
+    clientWrite(client, statusChunk(payload));
+    // A client cut by the backlog cap during its own connect writes (e.g. a
+    // huge replay to an already-stalled socket) must not join the fan-out.
+    if (!client.closed) clients.add(client);
     // Advance the poller's cursor to the least-ahead connected client so the
     // first tick after an idle (zero-client) period never re-fetches rows
     // everyone has already seen. Safe because every client's position is ≥ the
     // cursor (connect snapshots deliver everything up to `last`; per-tick
     // delivery never falls behind the fetched window).
-    cursor = Math.max(cursor, Math.min(...[...clients].map((c) => c.lastEventId)));
-    res.on("close", () => clients.delete(client));
+    if (clients.size > 0) {
+      cursor = Math.max(cursor, Math.min(...[...clients].map((c) => c.lastEventId)));
+    }
   }
-
   /**
    * One poll tick — the single DB poll fanned out to every connected client.
    * Zero clients ⇒ zero work: no snapshot read, no payload build (rework
    * finding 3 — an idle open tab must not cost a whole-store rescan).
-   * DB read failures are swallowed (counter + stderr notice from the 5th),
-   * mirroring `wb watch`'s pollOnce; clients stay open. The payload is built
-   * ONCE from the tick's snapshot and the fingerprint derived from it; each
-   * client receives the history rows past its own position plus a `status`
-   * event iff its fingerprint is stale.
+   * The ENTIRE read step — snapshot, payload build (artifacts + known repos),
+   * fingerprint — sits inside one guarded block: a failed artifacts or repo
+   * read throws inside this synchronous interval callback and would kill the
+   * whole server (including any background run). On a failed step the cursor
+   * is NOT advanced, so the next tick re-fetches the same window once reads
+   * recover; failures are counted and reported like `wb watch`'s pollOnce.
    */
   function flush(): void {
     if (clients.size === 0) return;
+    const rowChunks = new Map<number, string>();
     let snap: WatchSnapshot;
+    let payload: StatusPayload;
+    let fingerprint: string;
+    let chunk: string;
+    let byId: Map<number, ItemRecord>;
     try {
       snap = deps.db.getWatchSnapshot(cursor);
+      payload = payloadFromSnapshot(snap);
       consecutiveReadFailures = 0;
+      fingerprint = statusFingerprint(payload);
+      byId = new Map(snap.items.map((i) => [i.id, i] as const));
+      chunk = statusChunk(payload);
     } catch {
       consecutiveReadFailures += 1;
       if (consecutiveReadFailures >= READ_FAILURE_NOTICE_THRESHOLD) {
@@ -250,15 +311,11 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
       }
       return;
     }
+    // Advance the cursor only after the whole read step succeeded (see above).
     cursor = snap.maxHistoryId ?? cursor;
-    const payload = payloadFromSnapshot(snap);
-    const fingerprint = statusFingerprint(payload);
-    const byId = new Map(snap.items.map((i) => [i.id, i] as const));
     // Hoisted wire serialization: each row's chunk and the status chunk are
     // built once per tick, before the per-client loop — a fan-out to N clients
     // serializes each event once, not N times.
-    const chunk = statusChunk(payload);
-    const rowChunks = new Map<number, string>();
     for (const row of snap.historySince) {
       rowChunks.set(row.id, historyChunk(row, byId.get(row.item_id)?.slug ?? "(unknown)"));
     }
@@ -266,10 +323,10 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
       for (const row of snap.historySince) {
         if (row.id <= client.lastEventId) continue;
         client.lastEventId = row.id;
-        client.res.write(rowChunks.get(row.id)!);
+        clientWrite(client, rowChunks.get(row.id)!);
       }
       if (client.fingerprint === fingerprint) continue;
-      sendStatus(client.res, chunk);
+      clientWrite(client, chunk);
       client.fingerprint = fingerprint;
     }
   }
