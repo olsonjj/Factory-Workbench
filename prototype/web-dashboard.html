@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE (throwaway) — web UI for the wb factory workbench.
+
+  Question: "What should the wb factory dashboard look like?"
+  Three radically different layout candidates on one page, switchable via
+  ?variant=A|B|C and a floating bottom bar. All data is mock. All actions are
+  stubs (toast only). Nothing here is production code.
+
+  Open directly in a browser: open prototype/web-dashboard.html (or with ?variant=B)
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wb — dashboard prototype</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        fontFamily: { mono: ['ui-monospace', 'SFMono-Regular', 'SF Mono', 'Menlo', 'Consolas', 'monospace'] },
+        colors: {
+          paper: '#fafaf9',
+          ink: { 950: '#1c1917', 900: '#292524', 800: '#44403c', 700: '#57534e', 500: '#78716c', 400: '#a8a29e', 300: '#d6d3d1', 200: '#e7e5e4', 100: '#f5f5f4' },
+        },
+      },
+    },
+  };
+</script>
+<style>
+  html { scroll-behavior: smooth; }
+  .proto-noise::after { /* cheap dot-grid background for variants that want texture */
+    content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background-image: radial-gradient(circle, rgba(0,0,0,.06) 1px, transparent 1px); background-size: 22px 22px;
+  }
+</style>
+</head>
+<body class="bg-paper text-ink-900">
+<div id="root"></div>
+
+<script>
+/* ============================================================
+   Mock data — same shape as the real DB rows (ItemRecord-ish)
+   ============================================================ */
+
+const MOCK_ITEMS = [
+  {
+    id: 7, slug: 'add-retry-backoff', title: 'Add retry backoff to webhook delivery', repo: 'acme/billing',
+    stage: 'spec', status: 'awaiting-approval', approvals: ['spec', 'review'],
+    parkedReason: 'awaiting-approval', parkedDetail: { stage: 'spec' },
+    gateAttempts: {}, infraAttempts: 0, branch: 'wb/add-retry-backoff',
+    artifacts: [{ stage: 'spec', name: 'spec.md', path: 'factory/7-add-retry-backoff/spec.md' }],
+    history: [
+      { ts: '09:41', event: 'claimed', stage: 'triage' },
+      { ts: '09:41', event: 'stage-pass', stage: 'triage' },
+      { ts: '09:44', event: 'stage-start', stage: 'spec' },
+      { ts: '10:02', event: 'parked', stage: 'spec' },
+    ],
+  },
+  {
+    id: 9, slug: 'csv-export-encoding', title: 'CSV export mangles non-ASCII names', repo: 'acme/portal',
+    stage: 'test', status: 'exhausted-rework',
+    parkedReason: 'exhausted-rework', parkedDetail: { stage: 'test' },
+    gateAttempts: { test: 3 }, infraAttempts: 0, branch: 'wb/csv-export-encoding',
+    artifacts: [{ stage: 'test', name: 'test-report.md', path: 'factory/9-csv-export-encoding/test-report.md' }],
+    feedback: 'Test gate failed 3 rounds: export still writes BOM, breaking downstream parser. Last findings: “test/export.spec.ts:14 expects no BOM”.',
+    history: [
+      { ts: '07:12', event: 'claimed', stage: 'triage' },
+      { ts: '07:30', event: 'stage-gate-fail', stage: 'test' },
+      { ts: '07:44', event: 'stage-gate-fail', stage: 'test' },
+      { ts: '08:01', event: 'stage-gate-fail', stage: 'test' },
+      { ts: '08:02', event: 'parked', stage: 'test' },
+    ],
+  },
+  {
+    id: 11, slug: 'rate-limit-login', title: 'Rate-limit the /login endpoint', repo: 'acme/auth',
+    stage: null, status: 'needs-human',
+    parkedReason: 'questions', parkedDetail: { questions: [
+      'Should the limiter be per-IP or per-account?',
+      'Is 10 req/min the right ceiling, or read config?'
+    ] },
+    gateAttempts: {}, infraAttempts: 0, branch: '', sourceFile: 'inbox/rate-limit-login.md',
+    history: [{ ts: '11:08', event: 'parked', stage: 'triage' }],
+  },
+  {
+    id: 12, slug: 'dark-mode-tokens', title: 'Dark mode design tokens', repo: 'acme/portal',
+    stage: 'implement', status: 'running', gateAttempts: {}, infraAttempts: 0, branch: 'wb/dark-mode-tokens',
+    history: [
+      { ts: '11:20', event: 'claimed', stage: 'triage' }, { ts: '11:21', event: 'stage-pass', stage: 'triage' },
+      { ts: '11:24', event: 'stage-start', stage: 'spec' }, { ts: '11:30', event: 'stage-pass', stage: 'spec' },
+      { ts: '11:31', event: 'stage-start', stage: 'implement' },
+    ],
+  },
+  {
+    id: 13, slug: 'webhook-signature-docs', title: 'Document webhook signatures', repo: 'acme/billing',
+    stage: 'review', status: 'running', gateAttempts: { review: 1 }, infraAttempts: 0, branch: 'wb/webhook-signature-docs',
+    history: [ { ts: '10:10', event: 'claimed', stage: 'triage' }, { ts: '10:15', event: 'stage-gate-fail', stage: 'review' }, { ts: '10:16', event: 'stage-retry', stage: 'review' } ],
+  },
+  {
+    id: 8, slug: 'orphan-session-cleanup', title: 'Clean up orphaned sessions', repo: 'acme/auth',
+    stage: 'implement', status: 'infrastructure-failure',
+    parkedReason: 'infra-budget', parkedDetail: { stage: 'implement' },
+    gateAttempts: {}, infraAttempts: 3, branch: 'wb/orphan-session-cleanup',
+    history: [ { ts: '06:05', event: 'claimed', stage: 'triage' }, { ts: '06:40', event: 'stage-infra-fail', stage: 'implement' }, { ts: '06:41', event: 'stage-infra-fail', stage: 'implement' } ],
+  },
+  {
+    id: 5, slug: 'audit-log-redaction', title: 'Redact PII from audit log', repo: 'acme/auth',
+    stage: 'pr', status: 'done', gateAttempts: { test: 1 }, infraAttempts: 1, branch: 'wb/audit-log-redaction',
+    pr: { url: 'github.com/acme/auth/pull/214', number: 214, state: 'ready-for-review' },
+    history: [ { ts: 'yest 16:02', event: 'pr-created', stage: 'pr' } ],
+  },
+  {
+    id: 6, slug: 'fix-flaky-e2e', title: 'Fix flaky checkout e2e', repo: 'acme/portal',
+    stage: 'triage', status: 'queued', gateAttempts: {}, infraAttempts: 0, branch: '', flags: ['stale base: main is 3 commits behind origin'],
+    history: [ { ts: '11:02', event: 'base-stale', stage: null } ],
+  },
+  {
+    id: 10, slug: 'legacy-api-cleanup', title: 'Remove legacy v1 API routes', repo: 'acme/portal',
+    stage: 'triage', status: 'malformed', parkedReason: 'malformed',
+    parkedDetail: { reason: 'missing repo: front-matter key' }, gateAttempts: {}, infraAttempts: 0, branch: '',
+    history: [],
+  },
+];
+
+const MOCK_INBOX = [
+  'inbox/webhooks-idempotency.md', 'inbox/geo-dns-routing.md', 'inbox/update-tailwind-4.md',
+];
+
+// Same as STAGES in src/types.ts — duplicated here so the prototype file is self-contained
+const STAGES2 = ['triage', 'spec', 'implement', 'test', 'review', 'pr'];
+
+const MOCK_LOCK = { pid: 4812, ageMs: 2 * 60_000, alive: true }; // "factory command in progress"
+
+const STATUS_STYLE = {
+  'awaiting-approval':      { dot: 'bg-amber-400',  text: 'text-amber-700',  bg: 'bg-amber-100',  ring: 'ring-amber-300',  label: 'awaiting approval' },
+  'exhausted-rework':       { dot: 'bg-red-500',    text: 'text-red-700',    bg: 'bg-red-100',    ring: 'ring-red-300',    label: 'exhausted rework' },
+  'infrastructure-failure': { dot: 'bg-orange-500', text: 'text-orange-700', bg: 'bg-orange-100', ring: 'ring-orange-300', label: 'infra failure' },
+  'needs-human':            { dot: 'bg-violet-500', text: 'text-violet-700', bg: 'bg-violet-100', ring: 'ring-violet-300', label: 'needs you' },
+  'running':                { dot: 'bg-blue-500',   text: 'text-blue-700',   bg: 'bg-blue-50',    ring: 'ring-blue-200',   label: 'running' },
+  'queued':                 { dot: 'bg-stone-400',  text: 'text-ink-700',    bg: 'bg-ink-100',    ring: 'ring-ink-300',    label: 'queued' },
+  'malformed':              { dot: 'bg-fuchsia-500',text: 'text-fuchsia-700',bg: 'bg-fuchsia-50', ring: 'ring-fuchsia-300',label: 'malformed' },
+  'done':                   { dot: 'bg-emerald-500',text: 'text-emerald-700',bg: 'bg-emerald-50', ring: 'ring-emerald-200',label: 'done' },
+};
+
+/* Shared fragments (data + micro-parts only — never whole-page layout) */
+
+function itemTitle(it) { return `#${it.id} ${it.slug}`; }
+
+function statusPill(it, cls = '') {
+  const s = STATUS_STYLE[it.status];
+  return `<span class="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-medium ${s.bg} ${s.text} ring-1 ${s.ring} ${cls}">
+    <span class="h-1.5 w-1.5 rounded-full ${s.dot} ${it.status === 'running' ? 'animate-pulse' : ''}"></span>${s.label}</span>`;
+}
+
+function actionButtons(it, size = 'sm') {
+  const big = 'px-3 py-1.5 text-sm', small = 'px-2 py-1 text-xs';
+  const on = (label, tone, extra = '') =>
+    `<button onclick="stub('${label}', ${it.id})" class="rounded-md font-medium border ${tone} ${size === 'sm' ? small : big} ${extra}">${label}</button>`;
+  if (it.status === 'awaiting-approval') return on('Approve', 'border-emerald-600 bg-emerald-600 text-white hover:bg-emerald-700') + on('Reject', 'border-ink-300 bg-white hover:bg-ink-100');
+  if (it.status === 'needs-human' && it.parkedDetail?.questions) return `<button onclick="stub('Answer', ${it.id})" class="rounded-md border border-ink-800 bg-ink-900 text-white font-medium ${size === 'sm' ? small : big}">Answer ${it.parkedDetail.questions.length} question${it.parkedDetail.questions.length > 1 ? 's' : ''}</button>`;
+  if (it.status === 'infrastructure-failure' || it.status === 'exhausted-rework') return on('Retry', 'border-ink-300 bg-white hover:bg-ink-100');
+  if (it.status === 'malformed') return on('Retry', 'border-ink-300 bg-white hover:bg-ink-100', "data-needs-fix='fix the item file first'");
+  if (it.pr) return `<a href="#" onclick="stub('Open PR'); return false" class="text-emerald-700 underline underline-offset-2 text-xs">PR ${it.pr.number}</a>`;
+  return '';
+}
+
+function artifactLink(a) {
+  return `<a href="#" onclick="stub('Open artifact', event)" class="text-xs text-blue-700 underline underline-offset-2 truncate block">${a.name} · ${a.stage}</a>`;
+}
+
+let toastTimer = null;
+function stub(label, itemId) {
+  let el = document.getElementById('proto-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'proto-toast';
+    el.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-50 rounded-lg bg-ink-950 text-white text-sm px-4 py-2 shadow-lg';
+    el.innerHTML = 'PROTOTYPE — actions are stubbed';
+    document.body.appendChild(el);
+  }
+  el.textContent = `PROTOTYPE — “${label}”${itemId ? ` on #${itemId}` : ''} would hit POST /api/...`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.remove(), 2200);
+}
+
+function eventLine(ev, itemId) {
+  const it = MOCK_ITEMS.find(i => i.id === itemId);
+  const slug = it ? it.slug : '?';
+  const color = { claimed: 'text-blue-600', 'stage-pass': 'text-emerald-600', 'stage-start': 'text-ink-500', parked: 'text-amber-600', 'stage-gate-fail': 'text-red-600', 'stage-infra-fail': 'text-orange-500', 'pr-created': 'text-emerald-600', 'base-stale': 'text-ink-500' }[ev] || 'text-ink-700';
+  const text = {
+    claimed: `claim ${ev === 'claimed' ? '· ' + it?.repo : ''}`, 'stage-pass': `${ev.split('-')[1]} gate passed`, 'stage-start': 'stage start',
+  }[ev];
+  return `<div class="flex gap-2 text-xs py-0.5"><span class="text-ink-400 shrink-0 tabular-nums">${ev?.ts ?? ''}</span><span class="${color} font-medium shrink-0">${ev}</span><span class="text-ink-700 truncate">${slug}</span></div>`;
+}
+
+function feedRows() {
+  // merge all item histories into one synthetic feed, newest first
+  const rows = [];
+  for (const it of MOCK_ITEMS) for (const h of it.history) rows.push({ item: it, ...h });
+  return rows.sort((a, b) => b.ts.localeCompare(a.ts)).slice(0, 40);
+}
+
+/* ============================================================
+   Shared header (per-variant header content differs slightly)
+   ============================================================ */
+
+function appHeader(active) {
+  return `<header class="relative z-10 border-b border-ink-200 bg-white/80 backdrop-blur px-5 py-3 flex items-center gap-4">
+    <div class="font-mono font-bold text-lg tracking-tight"><span class="text-ink-950">wb</span><span class="text-ink-400"> — factory workbench</span></div>
+    ${active}
+  </header>`;
+}
+
+function headerMeta() {
+  return `<div class="ml-auto flex items-center gap-4 text-xs">
+    <span class="inline-flex items-center gap-1.5 text-ink-500"><span class="h-2 w-2 rounded-full bg-blue-500 animate-pulse"></span>run in progress (pid ${MOCK_LOCK.pid})</span>
+    <span class="text-ink-400">inbox: ${MOCK_INBOX.length} waiting</span>
+    <button onclick="stub('Run all')" class="rounded-md bg-ink-950 text-white px-3 py-1.5 font-medium hover:bg-ink-800">▶ Run</button>
+  </div>`;
+}
+
+/* ============================================================
+   VARIANT A — “Production line” board
+   Spatial: factory as a kanban of pipeline stages. Where is every item,
+   and which column is congested? Actions live on the cards.
+   ============================================================ */
+
+const VariantA = (() => {
+  const byStageOf = (status) => (item) => item.status === status;
+  const cols = [
+    { key: 'inbox', label: 'Inbox', hint: 'awaiting claim', items: [], extra: MOCK_INBOX },
+    { key: 'triage', label: 'Triage', items: [] },
+    { key: 'spec', label: 'Spec', items: [] },
+    { key: 'implement', label: 'Implement', items: [] },
+    { key: 'test', label: 'Test', items: [] },
+    { key: 'review', label: 'Review', items: [] },
+    { key: 'parked', label: 'Needs you', items: [] },
+    { key: 'done', label: 'Done', items: [] },
+  ];
+  for (const it of MOCK_ITEMS) {
+    if (['awaiting-approval', 'exhausted-rework', 'infrastructure-failure', 'needs-human', 'malformed'].includes(it.status)) cols.find(c => c.key === 'parked').items.push(it);
+    else if (it.status === 'done') cols.find(c => c.key === 'done').items.push(it);
+    else if (it.stage) cols.find(c => c.key === it.stage)?.items.push(it);
+  }
+  const card = (it) => {
+    const s = STATUS_STYLE[it.status];
+    const isRunning = it.status === 'running';
+    return `<div class="rounded-lg border ${it.status === 'awaiting-approval' ? 'border-amber-300 bg-amber-50/60 ring-1 ring-amber-200' : 'border-ink-200 bg-white'} p-3 shadow-sm hover:shadow-md transition-shadow">
+      <div class="flex items-start justify-between gap-2">
+        <div class="font-mono text-xs text-ink-500">${itemTitle(it).replace(' ', '')}</div>
+        <span class="h-2 w-2 rounded-full ${s.dot} ${isRunning ? 'animate-pulse' : ''} mt-1"></span>
+      </div>
+      <div class="text-sm font-medium leading-snug mt-1">${it.title}</div>
+      <div class="mt-2 text-[11px] text-ink-500 flex gap-2 flex-wrap">
+        <span class="font-mono">${it.repo}</span>
+        ${Object.entries(it.gateAttempts).map(([st, n]) => `<span class="text-red-600">✕${st}·${n}/3</span>`).join('')}
+        ${it.infraAttempts ? `<span class="text-orange-500">⚡${it.infraAttempts}</span>` : ''}
+        ${(it.flags || []).map(f => `<span class="text-ink-500">⚑ ${f}</span>`).join('')}
+      </div>
+      ${it.artifacts ? `<div class="mt-2">${it.artifacts.map(artifactLink).join('')}</div>` : ''}
+      ${it.feedback ? `<div class="mt-2 text-[11px] text-ink-600 border-l-2 border-ink-300 pl-2 line-clamp-2">${it.feedback}</div>` : ''}
+      ${it.pr ? `<div class="mt-2 text-xs text-emerald-700">PR ${it.pr.number} · ${it.pr.state}</div>` : ''}
+      ${it.parkedDetail?.questions ? `<div class="mt-2 text-[11px] text-violet-700">${it.parkedDetail.questions.length} question(s) pending</div>` : ''}
+      <div class="mt-3 flex gap-1.5">${actionButtons(it)}</div>
+    </div>`;
+  };
+  const col = (c) => {
+    const needsYou = c.key === 'parked';
+    return `<div class="flex flex-col min-w-[236px] w-[236px] shrink-0">
+      <div class="flex items-center justify-between px-1 pb-2">
+        <div class="text-xs font-semibold uppercase tracking-wide ${needsYou ? 'text-amber-700' : 'text-ink-500'}">${c.label}</div>
+        <div class="text-[11px] rounded-full bg-ink-100 px-1.5 text-ink-500 tabular-nums">${(c.items.length + (c.extra?.length || 0))}</div>
+      </div>
+      <div class="flex flex-col gap-2 flex-1">
+        ${c.extra?.map(f => `<div class="rounded-lg border border-dashed border-ink-300 bg-white/60 p-2.5 text-xs font-mono text-ink-600 flex items-start gap-1.5"><span class="text-ink-400">📄</span>${f}</div>`).join('') || ''}
+        ${c.items.map(card).join('')}
+        ${!needsYou && c.items.length === 0 && !(c.extra && c.extra.length) ? `<div class="text-[11px] text-ink-300 text-center py-6 border border-dashed border-ink-200 rounded-lg">— idle —</div>` : ''}
+      </div>
+    </div>`;
+  };
+  return { name: 'Pipeline board', render: () => `
+    ${appHeader(headerMeta())}
+    <main class="relative z-10 overflow-x-auto p-5">
+      <div class="flex gap-3 h-[calc(100vh-120px)]">${cols.map(col).join('')}</div>
+    </main>`
+  };
+})();
+
+/* ============================================================
+   VARIANT B — “Control room” monitor
+   Dense terminal-style list of every item + a live side feed.
+   The event stream is the centerpiece; rows expand into detail.
+   ============================================================ */
+
+const VariantB = (() => {
+  const order = { 'running': 0, 'awaiting-approval': 1, 'needs-human': 2, 'exhausted-rework': 3, 'infrastructure-failure': 4, 'malformed': 5, 'queued': 6, 'done': 7 };
+  const items = [...MOCK_ITEMS].sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || b.id - a.id);
+  const row = (it) => {
+    const s = STATUS_STYLE[it.status];
+    const actionable = it.status !== 'done';
+    return `<div class="group border-b border-ink-200/70 last:border-0">
+      <div class="grid grid-cols-[8rem_1fr_14rem_11rem_9rem] gap-3 items-baseline px-3 py-2 font-mono text-sm hover:bg-ink-100/60">
+        <span class="${it.status === 'done' ? 'text-ink-400' : 'text-ink-950'}">#${it.id} ${it.slug}</span>
+        <span class="flex items-center gap-2"><span class="h-1.5 w-1.5 rounded-full ${s.dot} ${it.status === 'running' ? 'animate-pulse' : ''}"></span><span class="${s.text}">${s.label}</span>${it.stage ? `<span class="text-ink-400">stage=${it.stage}</span>` : ''}${Object.entries(it.gateAttempts).map(([st, n]) => `<span class="text-red-600 text-xs">✕${st}${n}/3</span>`).join('')}${it.infraAttempts ? `<span class="text-orange-500 text-xs">⚡${it.infraAttempts}</span>` : ''}</span>
+        <span class="text-ink-500 text-xs truncate">${it.repo}${it.branch ? `\n${it.branch}` : ''}</span>
+        <span class="text-ink-600 text-xs truncate">${(it.parkedReason || it.pr?.url || '')}</span>
+        <span class="${actionable ? 'opacity-0 group-hover:opacity-100 transition-opacity' : ''} flex gap-1 justify-end">${actionButtons(it)}</span>
+      </div>
+      ${it.artifacts || it.feedback || it.parkedDetail?.questions ? `<div class="px-3 pb-2 pl-3 text-xs text-ink-600 group-hover:text-ink-800">${it.feedback ? `<div class="border-l-2 border-ink-300 pl-2 mt-0.5">↳ ${it.feedback}</div>` : ''}${it.parkedDetail?.questions ? `<div class="border-l-2 border-violet-400 pl-2 mt-1 text-violet-700">${it.parkedDetail.questions.map(q => `<div>· ${q}</div>`).join('')}</div>` : ''}${it.artifacts ? `<div class="mt-1 flex gap-3">${it.artifacts.map(artifactLink).join(' ')}</div>` : ''}</div>` : ''}
+    </div>`;
+  };
+  return { name: 'Control room', render: () => `
+    ${appHeader(headerMeta())}
+    <main class="relative z-10 grid grid-cols-[1fr_340px] gap-0 h-[calc(100vh-64px)]">
+      <section class="overflow-y-auto pt-4 px-4 pb-24">
+        <div class="grid grid-cols-[8rem_1fr_14rem_11rem_9rem] gap-3 px-3 pb-1 text-[11px] uppercase tracking-wide text-ink-400 font-semibold border-b border-ink-300">
+          <span>item</span><span>state</span><span>repo / branch</span><span>parked / pr</span><span class="text-right">act</span>
+        </div>
+        ${items.map(row).join('')}
+      </section>
+      <aside class="bg-ink-950 text-ink-300 border-l border-ink-800 overflow-y-auto pb-24">
+        <div class="sticky top-0 bg-ink-950/95 backdrop-blur px-4 py-3 text-xs font-mono uppercase tracking-wider text-ink-400 border-b border-ink-800 flex justify-between">
+          <span>live feed</span><span class="text-emerald-400">● streaming</span>
+        </div>
+        <div class="px-3 py-2 font-mono">
+          ${feedRows().map(r => {
+            const it = r.item;
+            const color = { 'stage-pass': 'text-emerald-400', claimed: 'text-blue-400', parked: 'text-amber-400', 'stage-gate-fail': 'text-red-400', 'stage-infra-fail': 'text-orange-400', 'pr-created': 'text-emerald-400', 'base-stale': 'text-ink-500', 'stage-start': 'text-ink-500', 'stage-retry': 'text-blue-300' }[r.event] || 'text-ink-300';
+            return `<div class="flex gap-2 py-1 text-xs border-b border-ink-900">
+              <span class="text-ink-600 shrink-0 tabular-nums">${r.ts}</span>
+              <span class="${color} shrink-0 w-[7.5rem]">${r.event}</span>
+              <span class="truncate">${it.slug}${r.stage ? ` <span class="text-ink-500">${r.stage}</span>` : ''}${r.detail?.stage ? ` <span class="text-ink-500">→ ${r.detail.stage}</span>` : ''}</span>
+            </div>`;
+          }).join('')}
+        </div>
+      </aside>
+    </main>`
+  };
+})();
+
+/* ============================================================
+   VARIANT C — “Decision desk” (iterated pick)
+   Affordance-first: the parking lot IS the page. Now with:
+   - a colored “factory pulse” flow strip (stage counts, no wide screen needed)
+   - stage-progress dots per card (where in triage→pr each item sits)
+   - color-coded decision cards per park reason
+   - an ingest composer: author a spec and submit it to the inbox
+   ============================================================ */
+
+const VariantC = (() => {
+  const decisions = MOCK_ITEMS.filter(it => ['awaiting-approval', 'needs-human', 'exhausted-rework', 'infrastructure-failure', 'malformed'].includes(it.status));
+  const glance = MOCK_ITEMS.filter(it => ['running', 'queued', 'done'].includes(it.status));
+
+  const PARK_SKIN = {
+    'awaiting-approval':      { accent: 'border-amber-400',      band: 'from-amber-500/10 to-transparent',   tag: 'bg-amber-100 text-amber-800 border-amber-200',      action: 'Your spec approval',      icon: '⏸' },
+    'exhausted-rework':       { accent: 'border-red-500',        band: 'from-red-500/10 to-transparent',     tag: 'bg-red-100 text-red-800 border-red-200',            action: 'Rework exhausted',       icon: '✕' },
+    'needs-human':            { accent: 'border-violet-500',     band: 'from-violet-500/10 to-transparent',  tag: 'bg-violet-100 text-violet-800 border-violet-200',   action: 'Triage questions',       icon: '?' },
+    'infrastructure-failure': { accent: 'border-orange-500',     band: 'from-orange-500/10 to-transparent',  tag: 'bg-orange-100 text-orange-800 border-orange-200',   action: 'Infrastructure failure', icon: '⚡' },
+    'malformed':              { accent: 'border-fuchsia-500',    band: 'from-fuchsia-500/10 to-transparent', tag: 'bg-fuchsia-100 text-fuchsia-800 border-fuchsia-200',action: 'Bad front-matter',       icon: '✎' },
+  };
+
+  const stageDots = (it) => {
+    const doneThrough = it.stage ? STAGES2.indexOf(it.stage) : -1;
+    return `<div class="flex items-center gap-0 mt-3">${STAGES2.map((st, i) => `
+      ${i > 0 ? `<div class="h-px flex-1 ${i <= doneThrough ? 'bg-ink-400' : 'bg-ink-300'}"></div>` : ''}
+      <div class="flex flex-col items-center" title="${st}">
+        <div class="h-2.5 w-2.5 rounded-full ${i < doneThrough ? 'bg-emerald-500' : i === doneThrough
+          ? (it.status === 'running' ? 'bg-blue-500 animate-pulse' : STATUS_STYLE[it.status].dot.replace('bg-', 'bg-'))
+          : 'bg-ink-300'}"></div>
+        <span class="text-[9px] uppercase tracking-wide mt-1 ${i === doneThrough ? 'text-ink-800 font-semibold' : 'text-ink-400'}">${st}</span>
+      </div>`).join('')}</div>`;
+  };
+
+  const decisionCard = (it) => {
+    const s = STATUS_STYLE[it.status];
+    const skin = PARK_SKIN[it.status];
+    return `<div class="rounded-2xl border border-ink-200 bg-white shadow-sm overflow-hidden hover:shadow-md hover:-translate-y-px transition-all">
+      <div class="h-1 ${skin.accent.replace('border-', 'bg-')}"></div>
+      <div class="p-5 bg-gradient-to-r ${skin.band}">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <div class="flex items-center gap-2">
+              <span class="flex h-6 w-6 items-center justify-center rounded-full ${skin.tag} border text-[11px] font-bold">${skin.icon}</span>
+              <span class="text-[10px] font-semibold uppercase tracking-widest ${skin.tag.replace(/bg-\S+ /, '').split(' ')[0]}">${skin.action}</span>
+            </div>
+            <h3 class="font-semibold text-lg leading-tight mt-2">#${it.id} ${it.title}</h3>
+            <div class="text-xs text-ink-500 mt-0.5 font-mono">${it.slug} · ${it.repo} · ${it.branch || 'no branch yet'}</div>
+          </div>
+          ${statusPill(it)}
+        </div>
+
+        ${stageDots(it)}
+
+        <div class="mt-4 space-y-3">
+          ${it.status === 'awaiting-approval' && it.artifacts?.length ? `
+            <div class="rounded-lg bg-white/70 border border-amber-200 p-3 text-sm">
+              <div class="text-amber-800 text-xs uppercase tracking-wide font-semibold mb-1.5">Spec artifact — read before approving</div>
+              ${it.artifacts.map(artifactLink).join(' ')}
+            </div>` : ''}
+          ${it.parkedDetail?.questions ? `
+            <div class="space-y-2">
+              ${it.parkedDetail.questions.map((q, i) => `
+                <label class="block">
+                  <div class="text-sm text-ink-700 mb-1"><span class="text-violet-600 font-semibold mr-1">Q${i + 1}</span>${q}</div>
+                  <input placeholder="your answer…" onkeydown="if(event.key==='Enter')stub('Answer')" class="w-full rounded-md border border-violet-200 bg-white px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-400">
+                </label>`).join('')}
+            </div>` : ''}
+          ${it.feedback ? `<div class="flex items-start gap-2 text-xs text-ink-600 bg-white/70 border border-red-200 rounded-md p-2.5"><span class="text-red-700 font-semibold shrink-0">↳ feedback</span><span>${it.feedback}</span></div>` : ''}
+          ${it.parkedDetail?.reason ? `<div class="text-xs text-fuchsia-700">reason: ${it.parkedDetail.reason}</div>` : ''}
+        </div>
+
+        <div class="mt-4 flex items-center gap-2">
+          ${actionButtons(it, 'lg')}
+          <span class="ml-auto text-[11px] text-ink-400">${it.approvals?.length ? `approvals: ${it.approvals.join(', ')}` : ''}</span>
+        </div>
+      </div>
+    </div>`;
+  };
+
+  /* Ingest composer: maps 1:1 onto `wb new` / POST /api/new */
+  const composer = () => `
+    <div id="composer" class="rounded-2xl border-2 border-dashed border-indigo-300 bg-white shadow-sm overflow-hidden">
+      <button onclick="const c=document.getElementById('composer-body'); c.classList.toggle('hidden')" class="w-full flex items-center justify-between px-5 py-3 hover:bg-indigo-50/50 transition-colors">
+        <div class="flex items-center gap-2">
+          <span class="flex h-6 w-6 items-center justify-center rounded-full bg-indigo-600 text-white text-sm font-bold">+</span>
+          <span class="font-semibold text-sm">New work item</span>
+          <span class="text-xs text-ink-400">— write a spec and drop it in the inbox</span>
+        </div>
+        <span class="text-ink-400 text-xs font-mono">toggle</span>
+      </button>
+      <div id="composer-body" class="border-t border-indigo-100 p-5 space-y-4">
+        <div class="grid grid-cols-2 gap-3">
+          <label class="block col-span-2">
+            <div class="text-xs font-semibold text-ink-600 uppercase tracking-wide mb-1">Title <span class="text-red-500">*</span></div>
+            <input placeholder="Short imperative title, e.g. ‘Add retry backoff to webhooks’" class="w-full rounded-md border border-ink-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400">
+          </label>
+          <label class="block">
+            <div class="text-xs font-semibold text-ink-600 uppercase tracking-wide mb-1">Repository <span class="text-red-500">*</span></div>
+            <select class="w-full rounded-md border border-ink-300 bg-white px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-400">
+              <option>~/dev/acme/billing</option><option>~/dev/acme/portal</option><option>~/dev/acme/auth</option><option value=" browse">browse… (server validates)</option>
+            </select>
+          </label>
+          <label class="block">
+            <div class="text-xs font-semibold text-ink-600 uppercase tracking-wide mb-1">Base branch</div>
+            <input value="main" class="w-full rounded-md border border-ink-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-400">
+          </label>
+        </div>
+        <div>
+          <div class="text-xs font-semibold text-ink-600 uppercase tracking-wide mb-1">Approval gates <span class="text-ink-400 normal-case font-normal">— item parks for your sign-off after these stages</span></div>
+          <div class="flex flex-wrap gap-2 mt-1">
+            ${STAGES2.filter(st => st !== 'pr').map((st, i) => `
+              <label class="inline-flex items-center gap-1.5 rounded-full border ${i === 1 ? 'border-indigo-500 bg-indigo-50' : 'border-ink-300 bg-white'} px-3 py-1 text-xs cursor-pointer">
+                <input type="checkbox" ${i === 1 ? 'checked' : ''} class="accent-indigo-600"> ${st}
+              </label>`).join('')}
+          </div>
+        </div>
+        <label class="block">
+          <div class="text-xs font-semibold text-ink-600 uppercase tracking-wide mb-1">Description <span class="text-ink-400 normal-case font-normal">— markdown, the item’s source of truth</span></div>
+          <textarea rows="5" placeholder="## Goal\nWhat done looks like…\n\n## Constraints\n…" class="w-full rounded-md border border-ink-300 px-3 py-2 text-sm font-mono leading-relaxed focus:outline-none focus:ring-2 focus:ring-indigo-400"></textarea>
+        </label>
+        <div class="flex items-center gap-2">
+          <button onclick="stub('POST /api/new — validate + write inbox markdown')" class="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-semibold hover:bg-indigo-700">Write to inbox</button>
+          <button onclick="stub('prefill from ITEM_TEMPLATE')" class="rounded-md border border-ink-300 bg-white px-3 py-2 text-sm hover:bg-ink-100">Start from template</button>
+          <span class="text-xs text-ink-400 ml-1">next <span class="font-mono font-semibold text-ink-700">wb run</span> claims it</span>
+        </div>
+        <div class="rounded-lg bg-ink-100/70 border border-dashed border-ink-300 p-3 text-center text-xs text-ink-500">
+          …or drop existing item file(s) here as-is — <span class="font-mono">.md</span> with front-matter goes straight into <span class="font-mono">inbox/</span> (bad front-matter parks as malformed, recoverable)
+        </div>
+      </div>
+    </div>`;
+
+  /* Factory pulse: four stat tiles + one slim stacked flow bar.
+     Segment widths are proportional to reality — the parked vs in-flight
+     ratio is the factory's health in one glance. */
+  const pulse = () => {
+    const count = (pred) => MOCK_ITEMS.filter(pred).length;
+    const waiting = decisions.length;
+    const running = count(it => it.status === 'running');
+    const queued = count(it => it.status === 'queued');
+    const done = count(it => it.status === 'done');
+    // stacked bar segments, in factory order
+    const segs = [
+      { label: 'inbox', n: MOCK_INBOX.length, cls: 'bg-ink-300', text: 'text-ink-700' },
+      { label: 'queue', n: queued, cls: 'bg-ink-500', text: 'text-white' },
+      ...STAGES2.map(st => ({ label: st, n: count(it => it.stage === st && it.status === 'running'), cls: 'bg-blue-500 hover:bg-blue-600', text: 'text-white' })),
+      { label: 'parked', n: waiting, cls: 'bg-amber-400 hover:bg-amber-500', text: 'text-amber-950' },
+      { label: 'done', n: done, cls: 'bg-emerald-500 hover:bg-emerald-600', text: 'text-white' },
+    ].filter(s => s.n > 0);
+    const total = segs.reduce((a, s) => a + s.n, 0);
+    return `
+    <div class="grid grid-cols-4 gap-3">
+      <div class="rounded-xl border border-ink-200 bg-white shadow-sm p-4 pl-5 relative overflow-hidden hover:shadow-md transition-shadow cursor-pointer" onclick="stub('filter: waiting on you')">
+        <div class="absolute left-0 top-0 bottom-0 w-1 bg-amber-400"></div>
+        <div class="text-3xl font-bold tabular-nums text-amber-600 leading-none">${waiting}</div>
+        <div class="text-xs font-semibold text-ink-700 mt-1.5">waiting on you</div>
+        <div class="text-[10px] text-ink-400 uppercase tracking-wide">decisions pending</div>
+      </div>
+      <div class="rounded-xl border border-ink-200 bg-white shadow-sm p-4 pl-5 relative overflow-hidden hover:shadow-md transition-shadow cursor-pointer" onclick="stub('filter: in flight')">
+        <div class="absolute left-0 top-0 bottom-0 w-1 bg-blue-500"></div>
+        <div class="text-3xl font-bold tabular-nums text-blue-600 leading-none flex items-baseline gap-1.5">${running}<span class="text-sm font-medium text-ink-400">+${queued}</span></div>
+        <div class="text-xs font-semibold text-ink-700 mt-1.5">in flight</div>
+        <div class="text-[10px] text-ink-400 uppercase tracking-wide">running + queued</div>
+      </div>
+      <div class="rounded-xl border border-ink-200 bg-white shadow-sm p-4 pl-5 relative overflow-hidden hover:shadow-md transition-shadow cursor-pointer" onclick="stub('filter: inbox')">
+        <div class="absolute left-0 top-0 bottom-0 w-1 bg-ink-400"></div>
+        <div class="text-3xl font-bold tabular-nums text-ink-700 leading-none">${MOCK_INBOX.length}</div>
+        <div class="text-xs font-semibold text-ink-700 mt-1.5">inbox</div>
+        <div class="text-[10px] text-ink-400 uppercase tracking-wide">awaiting claim</div>
+      </div>
+      <div class="rounded-xl border border-ink-200 bg-white shadow-sm p-4 pl-5 relative overflow-hidden hover:shadow-md transition-shadow cursor-pointer" onclick="stub('filter: done')">
+        <div class="absolute left-0 top-0 bottom-0 w-1 bg-emerald-500"></div>
+        <div class="text-3xl font-bold tabular-nums text-emerald-600 leading-none">${done}</div>
+        <div class="text-xs font-semibold text-ink-700 mt-1.5">landed</div>
+        <div class="text-[10px] text-ink-400 uppercase tracking-wide">PRs ready for review</div>
+      </div>
+    </div>
+    <div class="mt-3 rounded-full overflow-hidden flex h-6 ring-1 ring-ink-200 bg-white shadow-sm" title="factory distribution — ${total} work units">
+      ${segs.map(s => `
+        <div class="${s.cls} flex items-center justify-center transition-colors cursor-pointer ${s.n / total >= 0.08 ? "" : ""}" style="width:${(s.n / total * 100).toFixed(1)}%" onclick="stub('drill down: ${s.label}')" title="${s.label}: ${s.n}" data-seg-label="${s.label} ${s.n}" data-seg-wide="${s.n / total >= 0.09 ? 1 : 0}">
+          <span class="${s.text} text-[10px] font-mono font-semibold tabular-nums whitespace-nowrap px-1">${s.n / total >= 0.09 ? `${s.label} ${s.n}` : '·'}</span>
+        </div>`).join('')}
+    </div>
+    <div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5">
+      ${segs.filter(s => s.n / total < 0.09).map(s => `
+        <span class="inline-flex items-center gap-1 text-[10px] text-ink-500">
+          <span class="h-2 w-2 rounded-full ${s.cls.replace('hover:', '')}"></span>${s.label} ${s.n}
+        </span>`).join('')}
+    </div>`;
+  };
+
+  return { name: 'Decision desk', render: () => `
+    ${appHeader(`<div class="hidden md:block h-1 w-24 rounded-full self-center bg-gradient-to-r from-amber-400 via-violet-500 to-indigo-600"></div>${headerMeta()}`)}
+    <main class="relative z-10 max-w-3xl mx-auto px-4 pb-24">
+      <div class="pt-4">${pulse()}</div>
+
+      <div class="mt-5">${composer()}</div>
+
+      ${decisions.length ? `
+        <div class="mt-10 mb-4 flex items-baseline justify-between">
+          <div>
+            <div class="text-[11px] font-semibold uppercase tracking-widest text-amber-700">The parking lot</div>
+            <div class="text-sm text-ink-500 mt-0.5">${decisions.length} item${decisions.length === 1 ? '' : 's'} waiting on you · nothing else is blocked</div>
+          </div>
+        </div>
+        <div class="space-y-4">${decisions.map(decisionCard).join('')}</div>` : `
+        <div class="text-center py-16 text-emerald-700"><div class="text-4xl mb-2">✓</div>Nothing is waiting on you.</div>`}
+
+      <div class="mt-10 border-t border-ink-200 pt-6">
+        <div class="text-[11px] font-semibold uppercase tracking-widest text-ink-400 mb-3">Factory at a glance</div>
+        <div class="flex flex-wrap gap-2">
+          ${glance.map(it => `<div class="inline-flex items-center gap-2 rounded-full border border-ink-200 bg-white px-3 py-1.5 text-xs shadow-sm">
+            <span class="h-1.5 w-1.5 rounded-full ${STATUS_STYLE[it.status].dot} ${it.status === 'running' ? 'animate-pulse' : ''}"></span>
+            <span class="font-medium">${it.slug}</span>
+            <span class="text-ink-400">${it.stage || ''}</span>
+            <button onclick="stub('Expand ${it.slug}')" class="text-ink-300 hover:text-ink-700">›</button>
+          </div>`).join('')}
+        </div>
+        <div class="mt-4 flex gap-2">
+          ${MOCK_INBOX.map(f => `<div class="rounded-md border border-dashed border-ink-300 bg-white/50 px-2.5 py-1 text-xs font-mono text-ink-500">📄 ${f}</div>`).join('')}
+        </div>
+      </div>
+    </main>`
+  };
+})();
+
+/* ============================================================
+   Floating prototype switcher (identical across variants)
+   ============================================================ */
+
+const VARIANTS = { A: VariantA, B: VariantB, C: VariantC };
+
+function switcher(current) {
+  return `<div class="fixed bottom-5 left-1/2 -translate-x-1/2 z-50 flex items-center gap-1 rounded-full bg-ink-950 text-white shadow-xl px-2 py-1.5 ring-1 ring-white/10">
+    <span class="px-2 text-[10px] uppercase tracking-wider text-ink-400 select-none">prototype</span>
+    <button onclick="cycleViaSwitch(-1)" class="rounded-full hover:bg-white/10 w-8 h-8 text-lg leading-none">←</button>
+    <span class="px-3 text-sm font-mono">${current} · ${VARIANTS[current].name}</span>
+    <button onclick="cycleViaSwitch(1)" class="rounded-full hover:bg-white/10 w-8 h-8 text-lg leading-none">→</button>
+  </div>`;
+}
+// Render a variant in-page (no navigation — works from file://) and keep the
+// URL param in sync via replaceState for shareability.
+function show(v) {
+  if (!VARIANTS[v]) v = 'A';
+  currentVariant = v;
+  try { history.replaceState(null, '', '?variant=' + v); } catch { /* file:// may refuse */ }
+  document.getElementById('root').innerHTML = VARIANTS[v].render() + switcher(v);
+}
+function cycleViaSwitch(d) {
+  const keys = Object.keys(VARIANTS);
+  const idx = keys.indexOf(currentVariant);
+  show(keys[(idx + d + keys.length) % keys.length]);
+}
+document.addEventListener('keydown', (e) => {
+  const t = e.target;
+  if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t.isContentEditable) return;
+  if (e.key === 'ArrowLeft') cycleViaSwitch(-1);
+  if (e.key === 'ArrowRight') cycleViaSwitch(1);
+});
+
+/* Boot: start on ?variant= (default A) */
+
+let currentVariant = new URLSearchParams(location.search).get('variant') || 'A';
+if (!(currentVariant in VARIANTS)) currentVariant = 'A';
+show(currentVariant);
+</script>
+</body>
+</html>
