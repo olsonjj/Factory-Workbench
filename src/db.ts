@@ -335,6 +335,28 @@ export class FactoryDb {
     }));
   }
 
+  /** Bounded history replay: at most `limit` rows after `afterId`, across all
+   *  items, in id order (the *most recent* ones). The bound is enforced in the
+   *  query itself (SQL LIMIT, descending scan), never by post-fetch slicing —
+   *  a far-behind replay reader costs O(limit) rows, not O(table) (rework
+   *  finding 6 / KB 2026-11-06 17:15). Read-only. */
+  getRecentHistorySince(afterId: number, limit: number): HistoryFeedRow[] {
+    const rows = this.stmt(
+      "SELECT id, item_id, ts, event, stage, detail FROM history WHERE id > ? ORDER BY id DESC LIMIT ?",
+    )
+      .all(afterId, limit) as { id: number; item_id: number; ts: string; event: string; stage: string | null; detail: string }[];
+    return rows
+      .reverse()
+      .map((r) => ({
+        id: r.id,
+        item_id: r.item_id,
+        ts: r.ts,
+        event: r.event,
+        stage: r.stage,
+        detail: parseHistoryDetail(r.detail),
+      }));
+  }
+
   /** Highest history row id (null when the history table is empty). */
   getMaxHistoryId(): number | null {
     const row = this.stmt("SELECT MAX(id) AS maxId FROM history").get() as

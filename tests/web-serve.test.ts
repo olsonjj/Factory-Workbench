@@ -1054,6 +1054,8 @@ describe("wb serve: per-tick query budget (counting proxy)", () => {
     prepares: number;
     /** Statement executions, keyed by SQL text. */
     execs: Map<string, number>;
+    /** Rows returned by `all()` calls, keyed by SQL text (read volume). */
+    rows: Map<string, number>;
     total: number;
   }
 
@@ -1063,7 +1065,7 @@ describe("wb serve: per-tick query budget (counting proxy)", () => {
    *  (e.g. getWatchSnapshot's transaction) resolve the patched own-property
    *  through `this`, so nothing escapes the count. */
   function instrumentDb(db: FactoryDb): StmtCounts {
-    const counts: StmtCounts = { prepares: 0, execs: new Map(), total: 0 };
+    const counts: StmtCounts = { prepares: 0, execs: new Map(), rows: new Map(), total: 0 };
     const raw = db.db as unknown as { prepare: (sql: string) => unknown };
     const orig = db.db.prepare.bind(db.db);
     raw.prepare = (sql: string) => {
@@ -1076,7 +1078,11 @@ describe("wb serve: per-tick query budget (counting proxy)", () => {
         wrapped[m] = (...args: unknown[]) => {
           counts.total += 1;
           counts.execs.set(sql, (counts.execs.get(sql) ?? 0) + 1);
-          return fn.apply(stmt, args);
+          const result = fn.apply(stmt, args);
+          if (m === "all" && Array.isArray(result)) {
+            counts.rows.set(sql, (counts.rows.get(sql) ?? 0) + result.length);
+          }
+          return result;
         };
       }
       return wrapped as unknown as ReturnType<FactoryDb["db"]["prepare"]>;
@@ -1092,9 +1098,21 @@ describe("wb serve: per-tick query budget (counting proxy)", () => {
     return n;
   }
 
+  /** Rows returned by `all()` executions of statements containing `needle` —
+   *  the read volume, not just the execution count (KB 2026-11-06 17:15: a
+   *  perf bound must be proven on the rows actually read). */
+  function rowsOf(counts: StmtCounts, needle: string): number {
+    let n = 0;
+    for (const [sql, c] of counts.rows) {
+      if (sql.includes(needle)) n += c;
+    }
+    return n;
+  }
+
   function reset(counts: StmtCounts): void {
     counts.prepares = 0;
     counts.execs.clear();
+    counts.rows.clear();
     counts.total = 0;
   }
 
@@ -1236,7 +1254,7 @@ describe("wb serve: per-tick query budget (counting proxy)", () => {
   });
 
   it("bounds reconnect replay to MAX_SSE_REPLAY_ROWS rows (snapshot beyond that)", async () => {
-    const { s } = await makeInstrumentedServer();
+    const { s, counts } = await makeInstrumentedServer();
     s.h.inboxFile("replay-cap", { title: "Replay cap", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
     claim(s.h);
     const id = s.h.db.listItems()[0]!.id;
@@ -1244,6 +1262,7 @@ describe("wb serve: per-tick query budget (counting proxy)", () => {
       s.h.db.appendHistory(id, "stage-start", "spec", { n: i });
     }
     const maxId = s.h.db.getMaxHistoryId()!;
+    reset(counts);
     const stream = connectEvents(s, { query: "afterId=0" }); // far behind: everything is missed
     await stream.waitUntil((n) => n >= MAX_SSE_REPLAY_ROWS + 1);
     expect(stream.events).toHaveLength(MAX_SSE_REPLAY_ROWS + 1);
@@ -1255,6 +1274,39 @@ describe("wb serve: per-tick query budget (counting proxy)", () => {
     const status = stream.events[stream.events.length - 1]!;
     expect(status.event).toBe("status");
     expect(status.id).toBeNull();
+    // The bound is enforced in the query, not by slicing: with MAX+100 rows
+    // after the cursor, the replay *read* returned exactly MAX rows (one
+    // execution of the LIMIT-ed statement — never a full-table scan).
+    expect(execsOf(counts, "ORDER BY id DESC LIMIT")).toBe(1);
+    expect(rowsOf(counts, "ORDER BY id DESC LIMIT")).toBe(MAX_SSE_REPLAY_ROWS);
+    // The unbounded reader is not on the replay path at all (exact SQL text —
+    // it is a prefix of the bounded statement, so a substring needle would
+    // match both).
+    const unboundedSql =
+      "SELECT id, item_id, ts, event, stage, detail FROM history WHERE id > ? ORDER BY id";
+    expect(counts.execs.get(unboundedSql) ?? 0).toBe(0);
+    stream.abort();
+  });
+
+  it("treats a negative afterId like a far-behind cursor (bounded, full replay)", async () => {
+    const { s, counts } = await makeInstrumentedServer();
+    s.h.inboxFile("negative-afterid", { title: "Negative afterId", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    claim(s.h);
+    const id = s.h.db.listItems()[0]!.id;
+    s.h.db.appendHistory(id, "stage-start", "spec", {});
+    s.h.db.appendHistory(id, "stage-pass", "spec", { nextStage: "implement" });
+    const maxId = s.h.db.getMaxHistoryId()!;
+    reset(counts);
+    const stream = connectEvents(s, { query: "afterId=-5" });
+    await stream.waitUntil((n) => n >= 4);
+    expect(stream.events).toHaveLength(4); // 3 history rows (claimed + 2 appended) + status
+    const history = stream.events.filter((e) => e.event === "history");
+    expect(history).toHaveLength(3);
+    expect(history.map((e) => e.id)).toEqual([maxId - 2, maxId - 1, maxId]);
+    expect(stream.events[stream.events.length - 1]!.event).toBe("status");
+    // The bounded reader handled the negative cursor, returning every row.
+    expect(execsOf(counts, "ORDER BY id DESC LIMIT")).toBe(1);
+    expect(rowsOf(counts, "ORDER BY id DESC LIMIT")).toBe(3);
     stream.abort();
   });
 });

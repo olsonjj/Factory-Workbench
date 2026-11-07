@@ -276,10 +276,13 @@ the `item`-field backstop).
 
 Headers: `text/event-stream`, `no-cache`, `keep-alive`, `X-Accel-Buffering:
 no`. On connect: one read snapshot; when `afterId` (query param, or the
-`Last-Event-ID` header EventSource sends) is present, the missed rows
-(`getHistorySince(afterId)`) are replayed first — bounded to the most
-recent 500 rows (`MAX_SSE_REPLAY_ROWS`; anything older is dropped in favor
-of the snapshot, which is authoritative for current state) — then one
+`Last-Event-ID` header EventSource sends) is present, the missed rows are
+replayed first — the replay *read* is bounded in the query itself
+(`getRecentHistorySince(afterId, MAX_SSE_REPLAY_ROWS)`: SQL
+`ORDER BY id DESC LIMIT ?`, reversed to ascending id order), so a
+far-behind client costs at most `MAX_SSE_REPLAY_ROWS` (500) rows of DB
+read, never a full-table scan; anything older is dropped in favor of the
+snapshot, which is authoritative for current state — then one
 `status` event carrying the full `StatusPayload` (no `id:` field; ids
 belong only to history rows). Per tick (one shared poll for all clients,
 `flush()`): zero connected clients means zero work (no snapshot read, no
@@ -290,7 +293,10 @@ fingerprint derived from the built payload; each client receives exactly
 the rows with `id > client.lastEventId` (in order, tagged `id:`), then a
 `status` event iff a fingerprint over (items' id/status/stage/parkedReason/
 parkedDetail/feedback/updatedAt + claimable inbox filenames + lock pid/ts)
-changed. Reconnect or a second tab gets a fresh snapshot; there is no
+changed. Wire serialization is hoisted: each tick builds every history-row
+chunk (a map keyed by row id) and the single status chunk once, before the
+per-client loop, so fanning out to N clients serializes each event once.
+Reconnect or a second tab gets a fresh snapshot; there is no
 client-side merge. DB read failures are swallowed with a consecutive-failure
 counter; from the 5th failure one stderr line per failing poll (watch parity).
 

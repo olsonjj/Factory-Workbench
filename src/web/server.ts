@@ -50,8 +50,9 @@ export const DEFAULT_SERVE_HOST = "127.0.0.1";
 export const MAX_BODY_BYTES = 2 * 1024 * 1024;
 /** Reconnect replay cap: a client returning after a long disconnect gets at
  *  most this many missed history rows; anything older is dropped in favor of
- *  the fresh `status` snapshot, which is authoritative for current state
- *  (bounds the replay query; rework finding 6). */
+ *  the fresh `status` snapshot, which is authoritative for current state. The
+ *  bound is enforced in the replay query itself (SQL LIMIT via
+ *  `getRecentHistorySince`), never by post-fetch slicing (rework finding 6). */
 export const MAX_SSE_REPLAY_ROWS = 500;
 /** From the 5th consecutive failing DB read, surface once per failing poll (watch parity). */
 const READ_FAILURE_NOTICE_THRESHOLD = 5;
@@ -149,7 +150,10 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     return buildStatusPayload({ root: deps.root, paths: deps.paths, db: deps.db, clock, snapshot: snap });
   }
 
-  function writeHistoryEvent(res: ServerResponse, row: HistoryFeedRow, slug: string): void {
+  /** Serialize one history row to its SSE wire chunk. Built once and shared
+   *  by every client (hoisted serialization — a fan-out tick writes each
+   *  row's chunk once, not once per client). */
+  function historyChunk(row: HistoryFeedRow, slug: string): string {
     const data = JSON.stringify({
       id: row.id,
       itemId: row.item_id,
@@ -161,11 +165,17 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     });
     // `id:` only ever on history rows, so browser Last-Event-ID means exactly
     // "last history row processed".
-    res.write(`id: ${row.id}\nevent: history\ndata: ${data}\n\n`);
+    return `id: ${row.id}\nevent: history\ndata: ${data}\n\n`;
   }
 
-  function sendStatus(res: ServerResponse, payload: StatusPayload): void {
-    res.write(`event: status\ndata: ${JSON.stringify(payload)}\n\n`);
+  /** Serialize one status payload to its SSE wire chunk (hoisted so a tick
+   *  serializes it once for all clients, not once per client). */
+  function statusChunk(payload: StatusPayload): string {
+    return `event: status\ndata: ${JSON.stringify(payload)}\n\n`;
+  }
+
+  function sendStatus(res: ServerResponse, chunk: string): void {
+    res.write(chunk);
   }
 
   /** SSE connect: optional bounded replay (afterId / Last-Event-ID), then one
@@ -191,16 +201,17 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     let last = snap.maxHistoryId ?? 0;
     if (afterId !== null) {
       // Replay exactly the missed rows before the status event (no gaps, no
-      // duplicates), bounded to the most recent MAX_SSE_REPLAY_ROWS rows —
-      // beyond that the snapshot below is the whole truth.
-      const missed = deps.db.getHistorySince(afterId);
-      const replay = missed.length > MAX_SSE_REPLAY_ROWS ? missed.slice(-MAX_SSE_REPLAY_ROWS) : missed;
+      // duplicates). The read is bounded in the query itself — SQL LIMIT via
+      // `getRecentHistorySince`, at most MAX_SSE_REPLAY_ROWS rows — so a
+      // far-behind client costs O(cap) DB rows, never O(table); beyond the
+      // cap the snapshot below is the whole truth.
+      const replay = deps.db.getRecentHistorySince(afterId, MAX_SSE_REPLAY_ROWS);
       for (const row of replay) {
-        writeHistoryEvent(res, row, byId.get(row.item_id)?.slug ?? "(unknown)");
+        res.write(historyChunk(row, byId.get(row.item_id)?.slug ?? "(unknown)"));
         last = Math.max(last, row.id);
       }
     }
-    sendStatus(res, payload);
+    sendStatus(res, statusChunk(payload));
     const client: SseClient = {
       res,
       lastEventId: Math.max(afterId ?? 0, last),
@@ -243,14 +254,22 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     const payload = payloadFromSnapshot(snap);
     const fingerprint = statusFingerprint(payload);
     const byId = new Map(snap.items.map((i) => [i.id, i] as const));
+    // Hoisted wire serialization: each row's chunk and the status chunk are
+    // built once per tick, before the per-client loop — a fan-out to N clients
+    // serializes each event once, not N times.
+    const chunk = statusChunk(payload);
+    const rowChunks = new Map<number, string>();
+    for (const row of snap.historySince) {
+      rowChunks.set(row.id, historyChunk(row, byId.get(row.item_id)?.slug ?? "(unknown)"));
+    }
     for (const client of clients) {
       for (const row of snap.historySince) {
         if (row.id <= client.lastEventId) continue;
         client.lastEventId = row.id;
-        writeHistoryEvent(client.res, row, byId.get(row.item_id)?.slug ?? "(unknown)");
+        client.res.write(rowChunks.get(row.id)!);
       }
       if (client.fingerprint === fingerprint) continue;
-      sendStatus(client.res, payload);
+      sendStatus(client.res, chunk);
       client.fingerprint = fingerprint;
     }
   }
