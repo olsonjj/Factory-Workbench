@@ -94,6 +94,25 @@ function makeContext() {
     addEventListener: () => {},
   };
 
+  /** Persistent per-context localStorage: the page's flight-panel preference
+   * store. A fresh context is a fresh origin, so "reload" is a NEW context
+   * whose store is seeded from the first page's (the same entries a browser
+   * would carry across a reload). */
+  const localStorage = (() => {
+    const store = new Map<string, string>();
+    return {
+      getItem: (key: string) => (store.has(key) ? store.get(key)! : null),
+      setItem: (key: string, value: string) => {
+        store.set(key, String(value));
+      },
+      removeItem: (key: string) => {
+        store.delete(key);
+      },
+      /** Test-side readback of everything stored (for seed-snapshot asserts). */
+      dump: () => Object.fromEntries(store),
+    };
+  })();
+
   const sseListeners = new Map<string, Array<(e: { data: string }) => void>>();
   class EventSource {
     private listeners = sseListeners;
@@ -127,10 +146,13 @@ function makeContext() {
     clearTimeout,
     setInterval,
     clearInterval,
+    localStorage,
   };
   vm.createContext(sandbox);
   return {
     sandbox,
+    /** The same object the page's script sees as global `localStorage`. */
+    localStorage,
     run: (script: string) => vm.runInContext(script, sandbox, { filename: "page-inline.js" }),
     el: (id: string) => document.getElementById(id),
     /** Pending fetch queue — a click while disabled must add nothing. */
@@ -150,6 +172,16 @@ function makeContext() {
       const markup = document.getElementById("glance").innerHTML;
       const body = document.getElementById("glance-body");
       if (/id="glance-body"[^>]*\bhidden\b/.test(markup)) body.classList.add("hidden");
+      else body.classList.remove("hidden");
+    },
+    /** Same class-sync discipline for the in-flight panel's body: the stub's
+     * classList is mirrored from the rendered #pulse markup (`id="flight-body"
+     * … hidden"` collapsed vs `…` open) before a toggle click, so a writer
+     * that stopped adding/removing `hidden` would fail the assertion. */
+    syncFlightBodyFromMarkup: () => {
+      const markup = document.getElementById("pulse").innerHTML;
+      const body = document.getElementById("flight-body");
+      if (/id="flight-body"[^>]*\bhidden\b/.test(markup)) body.classList.add("hidden");
       else body.classList.remove("hidden");
     },
     /** Dispatch a click on an element's registered click listeners, exactly
@@ -964,5 +996,386 @@ describe("wb serve page script (runtime behavior)", () => {
     expect(block).toContain("animation: none");
     // The spinner itself is a class-defined CSS animation (no inline style).
     expect(PAGE_HTML).toMatch(/\.wb-spin\s*\{[^}]*animation:\s*wb-spin/);
+  });
+
+  /* ---------- flow-order pulse tiles + in-flight panel (specs/
+   * wb-serve-flight-panel.md): the flight-panel fixtures/section. ---------- */
+
+  // Fake target for the delegated flight-panel toggle click: only `closest`
+  // matters (parking-lot/glance pattern). Distinct from the glance summary
+  // selector so the two delegated listeners cannot cross-fire.
+  const FLIGHT_SUMMARY_TARGET = {
+    closest: (sel: string) => (sel.indexOf("data-flight-summary") >= 0 ? { attributes: {} } : null),
+  };
+  const NOT_FLIGHT_SUMMARY_TARGET = { closest: () => null };
+
+  const MIXED_FLIGHT_PAYLOAD = payload(
+    [
+      { id: 11, slug: "alpha", title: "Alpha spec title", repo: "Code/factory-1", stage: "implement", status: "running" },
+      { id: 12, slug: "beta", title: "Beta queued title", repo: "Code/rel/other", stage: "spec", status: "queued" },
+      { id: 13, slug: "gamma", title: "Gamma landed title", repo: "Code/factory-1", status: "done" },
+    ],
+    null,
+  );
+
+  /** One chunk per data-flight-row marker: each chunk carries that row's
+   * content (title, repo, pill, six-dot track) up to the next row. */
+  function flightRows(markup: string): string[] {
+    return markup.split("data-flight-row=").slice(1);
+  }
+  /** The six stage-dot fills of one row, in stage order. */
+  function dotFills(chunk: string): string[] {
+    return [...chunk.matchAll(/class="h-2\.5 w-2\.5 rounded-full ([^"]*)"/g)].map((m) => m[1]);
+  }
+
+  it("renders the pulse row as three tiles in flow order — inbox → in flight → waiting on you — with no landed tile", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD);
+    const pulse = ctx.el("pulse").innerHTML;
+    expect(pulse).toContain("grid grid-cols-3"); // three tiles, not the old four
+    const inbox = pulse.indexOf(">inbox</div>");
+    const flight = pulse.indexOf(">in flight</div>");
+    const waiting = pulse.indexOf(">waiting on you</div>");
+    expect(inbox).toBeGreaterThanOrEqual(0);
+    expect(inbox).toBeLessThan(flight);
+    expect(flight).toBeLessThan(waiting);
+
+    // The landed tile is dropped from the pulse row entirely: neither its
+    // label, its sub, nor its accent lives in the tiles region (before the
+    // flow bar). It survives only in the flow bar + glance section.
+    const tiles = pulse.slice(0, pulse.indexOf("mt-3 rounded-full"));
+    expect(tiles).not.toContain("landed");
+    expect(tiles).not.toContain("PRs ready for review");
+    expect(tiles).not.toContain("bg-emerald-500");
+    // Accents stay attached to their tiles (D1): inbox stone, in-flight blue,
+    // waiting-on-you amber.
+    expect(tiles).toContain("bg-ink-400");
+    expect(tiles).toContain("bg-blue-500");
+    expect(tiles).toContain("bg-amber-400");
+  });
+
+  it("renders one panel row per queued/running item — title, repo, six dots, stage label — and updates across SSE snapshots", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    // Fresh page with items in flight: the panel is OPEN by default (D3).
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD);
+    let pulse = ctx.el("pulse").innerHTML;
+    expect(pulse).toContain("In flight");
+    expect(pulse).toContain("· 1 running · 1 queued");
+    expect(pulse).toContain('aria-expanded="true"');
+    expect(pulse).not.toMatch(/id="flight-body"[^>]*\bhidden\b/);
+
+    const rows = flightRows(pulse);
+    expect(rows).toHaveLength(2);
+
+    // Running row: title + repo, six-dot track filled through the current
+    // stage (emerald, blue pulsing head), stage label = current stage name.
+    const running = rows[0];
+    expect(running.startsWith('"11"')).toBe(true); // keyed by item id
+    expect(running).toContain("Alpha spec title");
+    expect(running).toContain("Code/factory-1");
+    expect(dotFills(running)).toEqual([
+      "bg-emerald-500",
+      "bg-emerald-500",
+      "bg-blue-500 animate-pulse",
+      "bg-ink-300",
+      "bg-ink-300",
+      "bg-ink-300",
+    ]);
+    expect(running).toContain("text-blue-700"); // running pill palette
+    // Stage label: the PILL carries the current stage name. Assert the pill
+    // markup specifically — stageDots also renders all six stage names as
+    // dotted-labels in every row, so a bare contains('implement') is vacuous.
+    expect(running).toMatch(/ring-blue-200\">implement<\/span>/);
+
+    // Queued row sits after the running row (attention order), all dots
+    // hollow, stage label 'queued', nothing animating.
+    const queued = rows[1];
+    expect(queued.startsWith('"12"')).toBe(true);
+    expect(queued).toContain("Beta queued title");
+    expect(queued).toContain("Code/rel/other");
+    expect(queued).toContain('">queued</span>');
+    expect(queued).not.toContain("bg-emerald-500");
+    expect(queued).not.toContain("animate-pulse");
+    expect(dotFills(queued)).toEqual(Array(6).fill("bg-ink-300"));
+    expect(pulse.indexOf('data-flight-row="11"')).toBeLessThan(pulse.indexOf('data-flight-row="12"'));
+
+    // Next snapshot: #11 lands, #14 starts at test — rows follow live, no reload.
+    ctx.fire(
+      "status",
+      payload(
+        [
+          { id: 14, slug: "delta", title: "Delta next title", repo: "Code/factory-1", stage: "test", status: "running" },
+          { id: 11, slug: "alpha", title: "Alpha spec title", repo: "Code/factory-1", status: "done" },
+          { id: 12, slug: "beta", title: "Beta queued title", repo: "Code/rel/other", stage: "spec", status: "queued" },
+        ],
+        null,
+      ),
+    );
+    pulse = ctx.el("pulse").innerHTML;
+    expect(pulse).not.toContain("Alpha spec title"); // landed → off the panel
+    const next = flightRows(pulse);
+    expect(next).toHaveLength(2);
+    expect(next[0].startsWith('"14"')).toBe(true);
+    expect(next[0]).toContain("Delta next title");
+    expect(next[0]).toContain("text-blue-700");
+    expect(dotFills(next[0])).toEqual([
+      "bg-emerald-500",
+      "bg-emerald-500",
+      "bg-emerald-500",
+      "bg-blue-500 animate-pulse",
+      "bg-ink-300",
+      "bg-ink-300",
+    ]);
+  });
+
+  it("defaults a fresh page's collapse: open when items are in flight, closed when idle", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle(); // initial paint: idle payload, no stored choice
+
+    const pulse = () => ctx.el("pulse").innerHTML;
+    expect(ctx.localStorage.dump()).toEqual({}); // nothing stored — the default owns the state
+    expect(pulse()).toMatch(/id="flight-body"[^>]*\bhidden\b/);
+    expect(pulse()).toContain('aria-expanded="false"');
+
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD); // running + queued > 0 → default open
+    expect(pulse()).toContain('aria-expanded="true"');
+    expect(pulse()).not.toMatch(/id="flight-body"[^>]*\bhidden\b/);
+
+    ctx.fire("status", payload([{ id: 13, slug: "gamma", status: "done" }], null)); // nothing in flight → closed
+    expect(pulse()).toMatch(/id="flight-body"[^>]*\bhidden\b/);
+    expect(pulse()).toContain('aria-expanded="false"');
+  });
+
+  it("persists an explicit open choice: it survives reload, shows the idle line, and beats the default", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle(); // idle → collapsed by default
+
+    // The operator opens the panel while the factory is idle — never a void.
+    ctx.syncFlightBodyFromMarkup();
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(true);
+    ctx.click("pulse", FLIGHT_SUMMARY_TARGET);
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(false);
+    // The choice was stored immediately (the browser persists it before any
+    // status event can re-render the panel).
+    expect(ctx.localStorage.getItem("wb:flight-panel")).toBe("open");
+
+    // The choice beats the default in every payload shape: a busy factory
+    // must NOT auto-close an explicitly opened panel either.
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD);
+    expect(ctx.el("pulse").innerHTML).toContain('aria-expanded="true"');
+    expect(ctx.el("pulse").innerHTML).not.toMatch(/id="flight-body"[^>]*\bhidden\b/);
+
+    // Reload: a fresh context carries the same stored choice. Idle factory,
+    // stored 'open' → the panel opens (the default would have kept it shut).
+    const ctx2 = makeContext();
+    const stored = ctx.localStorage.dump();
+    for (const key of Object.keys(stored)) ctx2.localStorage.setItem(key, stored[key]);
+    ctx2.run(pageScript(PAGE_HTML));
+    await ctx2.settle(); // /api/status responds with the default idle payload
+    expect(ctx2.el("pulse").innerHTML).toContain('aria-expanded="true"');
+    expect(ctx2.el("pulse").innerHTML).toContain("factory idle — 0 landed");
+  });
+
+  it("persists an explicit collapsed choice: no auto-open against the user, but header counts still update", async () => {
+    // First page: the panel opens by default on a busy factory; the operator
+    // collapses it — that choice persists.
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD);
+    ctx.syncFlightBodyFromMarkup();
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(false);
+    ctx.click("pulse", FLIGHT_SUMMARY_TARGET);
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(true);
+    expect(ctx.localStorage.getItem("wb:flight-panel")).toBe("collapsed");
+
+    // Reload with the stored choice: new in-flight arrivals do NOT auto-open.
+    const ctx2 = makeContext();
+    const stored = ctx.localStorage.dump();
+    for (const key of Object.keys(stored)) ctx2.localStorage.setItem(key, stored[key]);
+    ctx2.run(pageScript(PAGE_HTML));
+    await ctx2.settle();
+    ctx2.fire(
+      "status",
+      payload(
+        [
+          { id: 11, slug: "alpha", title: "Alpha spec title", repo: "Code/factory-1", stage: "implement", status: "running" },
+          { id: 14, slug: "delta", title: "Delta next title", repo: "Code/factory-1", stage: "test", status: "running" },
+          { id: 12, slug: "beta", title: "Beta queued title", repo: "Code/rel/other", stage: "spec", status: "queued" },
+        ],
+        null,
+      ),
+    );
+    const pulse2 = ctx2.el("pulse").innerHTML;
+    expect(pulse2).toMatch(/id="flight-body"[^>]*\bhidden\b/);
+    expect(pulse2).toContain('aria-expanded="false"');
+    // …but the collapsed header still recounts, live: 2 running · 1 queued.
+    expect(pulse2).toContain("· 2 running · 1 queued");
+    expect(pulse2).toContain('">3</span>'); // the right-edge live total
+  });
+
+  it("renders the idle line 'factory idle — N landed' when the open panel has no rows", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    const LANDED = payload(
+      [
+        { id: 2, slug: "first", status: "done" },
+        { id: 3, slug: "second", status: "done" },
+        { id: 4, slug: "third", status: "done" },
+      ],
+      null,
+    );
+    ctx.fire("status", LANDED);
+    // The body already carries the idle line for this payload.
+    expect(ctx.el("pulse").innerHTML).toContain("factory idle — 3 landed");
+    expect(flightRows(ctx.el("pulse").innerHTML)).toHaveLength(0);
+    // Default would keep it closed (zero in flight) — the operator opens it;
+    // the idle line is what becomes visible, never blank space.
+    ctx.syncFlightBodyFromMarkup();
+    ctx.click("pulse", FLIGHT_SUMMARY_TARGET);
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(false);
+  });
+
+  it("toggle is a real keyboard-activatable button via the shared click path; non-summary clicks are no-ops", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD);
+    let pulse = ctx.el("pulse").innerHTML;
+    // <button type="button">: Enter/Space synthesize the same click the
+    // delegated #pulse listener handles — the shared click path IS the
+    // keyboard path (glance-toggle pattern).
+    expect(pulse).toContain('<button type="button"');
+    expect(pulse).toContain("data-flight-summary");
+    expect(pulse).toContain('title="expand/collapse the in-flight detail"');
+
+    ctx.syncFlightBodyFromMarkup();
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(false);
+    ctx.click("pulse", FLIGHT_SUMMARY_TARGET);
+    // No re-render between click and assert: the writer's own classList change
+    // is the thing under test (the glanced-synced stub would otherwise erase it).
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(true);
+
+    // A click that does not originate on the summary button is ignored.
+    ctx.click("pulse", NOT_FLIGHT_SUMMARY_TARGET);
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(true); // still collapsed from the toggle above
+
+    // A later snapshot re-renders from the persisted choice: stays collapsed.
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD);
+    pulse = ctx.el("pulse").innerHTML;
+    expect(pulse).toMatch(/id="flight-body"[^>]*\bhidden\b/);
+    expect(pulse).toContain('aria-expanded="false"');
+  });
+
+  it("escapes untrusted row content: a hostile title/repo renders inert in the flight rows", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    // Untrusted data (item titles/repos) interpolated into rows must be
+    // escaped at the interpolation site (the page's KB 2026-10-27 rule).
+    ctx.fire(
+      "status",
+      payload(
+        [{ id: 15, slug: "hostile", title: "Alpha <img src=x onerror=alert(1)>", repo: "Code/rel<b>x</b>", stage: "implement", status: "running" }],
+        null,
+      ),
+    );
+    const row = flightRows(ctx.el("pulse").innerHTML)[0];
+    expect(row).toContain("Alpha &lt;img src=x"); // escaped at the site
+    expect(row).not.toContain("<img src=x"); // never a live tag
+    expect(row).toContain("&lt;b&gt;x&lt;/b&gt;");
+    expect(row).not.toContain("<b>x</b>");
+  });
+
+  it("restores keyboard focus to the flight summary button after a payload re-render", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    // A keyboard user has focused the flight summary button; an SSE status
+    // event re-renders #pulse (innerHTML replacement). The replacement button
+    // must receive focus() again — which requires the hadFocus capture to run
+    // BEFORE the write (after it, activeElement is already <body>).
+    let focusCalls = 0;
+    const fakeBtn = { focus: () => {
+      focusCalls++;
+    } };
+    (ctx.el("pulse") as unknown as { querySelector: (sel: string) => unknown }).querySelector =
+      (sel: string) => (sel === "button[data-flight-summary]" ? fakeBtn : null);
+    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = {
+      closest: (sel: string) => (sel === "button[data-flight-summary]" ? { attributes: {} } : null),
+    };
+
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD);
+    expect(focusCalls).toBe(1);
+
+    // Re-render with focus elsewhere: no refocus attempt, no crash.
+    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = undefined;
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD);
+    expect(focusCalls).toBe(1);
+  });
+
+  it("keeps an explicit toggle across snapshots even when the storage write fails (no flap)", async () => {
+    // Storage reads always return null and writes throw: the in-memory
+    // explicit choice must keep the panel collapsed across SSE snapshots —
+    // the next ~2s snapshot would otherwise re-derive the default and undo
+    // the user's click mid-session.
+    const ctx = makeContext();
+    ctx.sandbox.localStorage.getItem = () => null;
+    ctx.sandbox.localStorage.setItem = () => {
+      throw new Error("quota exceeded");
+    };
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD); // busy → default open
+    ctx.syncFlightBodyFromMarkup();
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(false);
+    ctx.click("pulse", FLIGHT_SUMMARY_TARGET); // collapse; the write throws
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(true);
+
+    // The next snapshot must NOT flap the panel back to the default-open.
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD);
+    const pulse = ctx.el("pulse").innerHTML;
+    expect(pulse).toMatch(/id="flight-body"[^>]*\bhidden\b/);
+    expect(pulse).toContain('aria-expanded="false"');
+  });
+
+  it("keeps an explicit toggle over a STALE stored pref when the storage write fails (no reopen)", async () => {
+    // Reads return a stored 'open' (a previous session's choice) but writes
+    // throw: the click's in-memory explicit choice — the newest user signal —
+    // must beat the persisted-but-stale pref across snapshots. Reading the
+    // old value instead would visibly reopen the panel after every SSE tick.
+    const ctx = makeContext();
+    ctx.sandbox.localStorage.getItem = (key: string) => (key === "wb:flight-panel" ? "open" : null);
+    ctx.sandbox.localStorage.setItem = () => {
+      throw new Error("quota exceeded");
+    };
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD); // busy → stored 'open' wins pre-toggle
+    ctx.syncFlightBodyFromMarkup();
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(false);
+    ctx.click("pulse", FLIGHT_SUMMARY_TARGET); // collapse; the write throws
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(true);
+
+    // The next snapshot must NOT flap the panel back to the stored 'open'.
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD);
+    const pulse = ctx.el("pulse").innerHTML;
+    expect(pulse).toMatch(/id="flight-body"[^>]*\bhidden\b/);
+    expect(pulse).toContain('aria-expanded="false"');
   });
 });
