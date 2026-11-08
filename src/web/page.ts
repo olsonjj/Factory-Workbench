@@ -310,7 +310,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
    * button). currentColor keeps it visible inside both the blue pill and
    * the dark button with no new palette entries; the size is pinned here
    * because the page's utility set has no h-3/w-3. */
-  .wb-spin { width: 12px; height: 12px; border-radius: 9999px; border: 2px solid currentColor; border-top-color: transparent; animation: wb-spin .8s linear infinite; }
+  .wb-spin { display: inline-block; width: 12px; height: 12px; border-radius: 9999px; border: 2px solid currentColor; border-top-color: transparent; animation: wb-spin .8s linear infinite; }
   @keyframes wb-spin { to { transform: rotate(360deg); } }
   .btn:disabled { opacity: .5; cursor: default; }
   /* prefers-reduced-motion: the animation-carrying affordances (the RUNNING

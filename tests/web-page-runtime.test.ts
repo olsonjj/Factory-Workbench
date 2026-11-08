@@ -781,17 +781,25 @@ describe("wb serve page script (runtime behavior)", () => {
     const fakeBtn = { focus: () => {
       focusCalls++;
     } };
-    (ctx.el("run-state") as unknown as { querySelector: (sel: string) => unknown }).querySelector =
-      (sel: string) => (sel === "button" ? fakeBtn : null);
-    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = {
+    (ctx.el("run-state") as unknown as {
+      querySelector: (sel: string) => unknown;
+      contains: (node: unknown) => boolean;
+    }).querySelector = (sel: string) => (sel === "button" ? fakeBtn : null);
+    const focusedPill = {
       closest: (sel: string) => (sel === "button" ? { attributes: {} } : null),
     };
+    (ctx.el("run-state") as unknown as { contains: (node: unknown) => boolean }).contains =
+      (node: unknown) => node === focusedPill;
+    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = focusedPill;
 
     ctx.fire("status", RUNNING_PAYLOAD);
     expect(focusCalls).toBe(1);
 
-    // Re-render with focus elsewhere: no refocus attempt, no crash.
-    (ctx.el("run-state") as unknown as { querySelector: (sel: string) => unknown }).querySelector = () => null;
+    // Re-render with focus on another button: the replacement stays available,
+    // so dropping the contains guard would incorrectly steal focus and fail.
+    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = {
+      closest: (sel: string) => (sel === "button" ? { attributes: {} } : null),
+    };
     ctx.fire("status", RUNNING_PAYLOAD);
     expect(focusCalls).toBe(1);
   });
