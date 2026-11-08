@@ -296,6 +296,14 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .transition-colors { transition-property: color, background-color, border-color, text-decoration-color, fill, stroke; transition-duration: 150ms; transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1); }
   .animate-pulse { animation: wb-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
   @keyframes wb-pulse { 50% { opacity: 0.5; } }
+  /* one-shot flash for the glance chips the header RUNNING pill targets
+   * (same blue as bg-blue-500, #3b82f6) — a class, never an inline style,
+   * so the style block stays the single source of styling. */
+  .wb-flash { animation: wb-flash 1.6s ease-out 1; }
+  @keyframes wb-flash {
+    0% { box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.45); }
+    100% { box-shadow: 0 0 0 3px rgba(59, 130, 246, 0); }
+  }
   .cursor-pointer { cursor: pointer; }
   .accent-indigo-600 { accent-color: #4f46e5; }
 
@@ -310,7 +318,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
 
 <header class="border-b border-ink-200 bg-white/80 backdrop-blur px-5 py-3 flex items-center gap-3 flex-wrap sticky top-0 z-20">
   <div class="font-mono font-bold text-lg tracking-tight"><span class="text-ink-950">wb</span><span class="text-ink-400"> — factory workbench</span></div>
-  <div id="lock-banner" class="hidden text-xs rounded-full bg-amber-100 text-amber-800 ring-1 ring-amber-300 px-3 py-1"></div>
+  <div id="run-state" class="hidden"></div>
   <div class="ml-auto flex items-center gap-2">
     <span id="feed-status" class="text-xs text-ink-400"></span>
     <button id="btn-run" class="btn btn-dark">▶ Run</button>
@@ -448,9 +456,13 @@ function esc(s) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
   });
 }
-function fmtAge(ms) {
-  if (ms < 60000) return 'just started';
-  return Math.round(ms / 60000) + ' min ago';
+/* Elapsed clock for the header RUNNING pill: mm:ss (both padded), rolling
+ * over to h:mm:ss past one hour. Pure and padStart-based — no Intl needed. */
+function fmtMMSS(ms) {
+  var s = Math.max(0, Math.floor(ms / 1000));
+  var p = function (n) { return String(n).padStart(2, '0'); };
+  if (s < 3600) return p(Math.floor(s / 60)) + ':' + p(s % 60);
+  return Math.floor(s / 3600) + ':' + p(Math.floor((s % 3600) / 60)) + ':' + p(s % 60);
 }
 function fmtClock(ts) {
   var d = new Date(ts);
@@ -523,7 +535,7 @@ function render(p) {
   renderDatalist(p.knownRepos || []);
   renderParking(p);
   renderGlance(p);
-  renderLock(p.lock);
+  renderRunState(p);
 }
 
 function tile(accent, big, small, title, sub) {
@@ -809,7 +821,7 @@ function renderGlance(p) {
       pr = '<a href="' + esc(it.prUrl) + '" target="_blank" rel="noopener" class="text-emerald-700 underline underline-offset-2">PR' +
         (it.prDraft ? ' (draft)' : '') + '</a>';
     }
-    return '<div class="inline-flex items-center gap-2 rounded-full border border-ink-200 bg-white px-3 py-1.5 text-xs shadow-sm">' +
+    return '<div data-item-id="' + it.id + '" class="inline-flex items-center gap-2 rounded-full border border-ink-200 bg-white px-3 py-1.5 text-xs shadow-sm">' +
       '<span class="h-1.5 w-1.5 rounded-full ' + (STATUS_DOT[it.status] || 'bg-ink-300') + (it.status === 'running' ? ' animate-pulse' : '') + '"></span>' +
       '<span class="font-medium">#' + it.id + ' ' + esc(it.slug) + '</span>' +
       '<span class="text-ink-400">' + esc(it.stage || '') + '</span>' + hint + pr + '</div>';
@@ -829,15 +841,65 @@ function renderGlance(p) {
     '</div>';
 }
 
-function renderLock(lock) {
-  var el = $('lock-banner');
-  if (!lock) { el.classList.add('hidden'); return; }
-  if (lock.alive) {
-    el.textContent = 'factory command in progress (pid ' + lock.pid + ', ' + fmtAge(lock.ageMs) + (lock.stale ? ' — possibly stale' : '') + ')';
-  } else {
-    el.textContent = 'stale factory lock (pid ' + lock.pid + ', ' + fmtAge(lock.ageMs) + ') — holder is not running';
+/* Header run-state pill. Three states (spec §Page): IDLE (calm stone chip,
+ * visibly inert) when no lock is held; RUNNING while a live lock exists —
+ * pulsing blue dot, "#id slug · stage" per running item (or the holder pid
+ * when no item is running), and a mm:ss elapsed clock; the verbatim
+ * stale-lock text for a dead holder. The clock anchor is re-derived from
+ * lock.ageMs on every status event; a single 1s interval (created once, at
+ * init) extrapolates between events — no extra polling, the SSE cadence is
+ * untouched. payloadLike is a whole status payload (render) or a {lock}
+ * fragment (409 handlers, via the renderLock shim); items defaults to []. */
+var runAnchor = { ageMs: 0, at: 0, running: false, itemIds: [] };
+
+function renderRunState(p) {
+  var el = $('run-state');
+  var lock = (p && p.lock) || null;
+  if (!lock) {
+    runAnchor.running = false;
+    el.innerHTML = '<span class="rounded-full text-[10px] font-semibold tracking-widest text-ink-400 bg-white ring-1 ring-ink-200 px-3 py-1">IDLE</span>';
+    el.classList.remove('hidden');
+    return;
   }
+  if (!lock.alive) {
+    runAnchor.running = false;
+    var mins = Math.floor((lock.ageMs || 0) / 60000);
+    var age = mins < 1 ? 'just started' : mins + ' min ago';
+    el.innerHTML = '<span class="rounded-full text-xs bg-amber-100 text-amber-800 ring-1 ring-amber-300 px-3 py-1">' +
+      'stale factory lock (pid ' + esc(lock.pid) + ', ' + esc(age) + ') — holder is not running</span>';
+    el.classList.remove('hidden');
+    return;
+  }
+  var running = (p.items || []).filter(function (it) { return it.status === 'running'; })
+    .sort(function (a, b) { return a.id - b.id; });
+  runAnchor = {
+    ageMs: lock.ageMs || 0,
+    at: Date.now(),
+    running: true,
+    itemIds: running.map(function (it) { return it.id; })
+  };
+  var frag = running.length
+    ? running.map(function (it) { return '#' + it.id + ' ' + esc(it.slug) + ' · ' + esc(it.stage || ''); }).join(' · ')
+    : '(pid ' + esc(lock.pid) + ')'; // live lock, no running item (a bounded CLI action holds it)
+  el.innerHTML =
+    // A <button> (not a div): keyboard users can Tab to the pill and press
+    // Enter/Space for the same scroll-and-flash action. The preflight resets
+    // button chrome (border 0, transparent bg, inherited font), so the pill
+    // renders identically to the former div.
+    '<button type="button" class="rounded-full ring-1 ' + STATUS_PILL.running + ' text-xs px-3 py-1 inline-flex items-center gap-1.5 cursor-pointer" title="factory pid ' + esc(lock.pid) + '">' +
+    '<span class="h-1.5 w-1.5 rounded-full bg-blue-500 animate-pulse"></span>' +
+    '<span class="text-[10px] font-semibold tracking-widest">RUNNING</span>' +
+    '<span>· ' + frag + '</span>' +
+    '<span class="font-mono tabular-nums" id="run-clock">' + fmtMMSS(runAnchor.ageMs) + '</span>' +
+    '</button>';
   el.classList.remove('hidden');
+}
+
+/* Compat shim for the busy-lock (409) handlers: they hold a fresh lock but
+ * no full payload — reuse the last-seen items so the pill can still name
+ * the running item (ageMs comes from the fresh lock). */
+function renderLock(lock) {
+  renderRunState({ lock: lock, items: (CURRENT && CURRENT.items) || [] });
 }
 
 /* ================= live feed (append-only) ================= */
@@ -1060,6 +1122,32 @@ es.addEventListener('history', function (e) {
 });
 es.onopen = function () { $('feed-status').textContent = '● live'; $('feed-status').className = 'text-xs text-emerald-600'; };
 es.onerror = function () { $('feed-status').textContent = 'reconnecting…'; $('feed-status').className = 'text-xs text-amber-600'; };
+
+/* Header RUNNING clock: one interval, created once at init. Each status
+ * event re-anchors the elapsed time from lock.ageMs (renderRunState); between
+ * events this tick extrapolates from the anchor. Cheap no-op — no DOM touch
+ * at all — when the factory is not running. */
+setInterval(function () {
+  if (!runAnchor.running) return;
+  var clock = $('run-clock');
+  if (clock) clock.textContent = fmtMMSS(runAnchor.ageMs + (Date.now() - runAnchor.at));
+}, 1000);
+
+/* Bonus affordance: clicking the RUNNING pill scrolls to the glance row and
+ * one-shot-flashes the running item's chip (wb-flash, removed on
+ * animationend so a later click can re-fire it). */
+$('run-state').addEventListener('click', function () {
+  if (!runAnchor.running) return;
+  var glance = $('glance');
+  if (glance.scrollIntoView) glance.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  (runAnchor.itemIds || []).forEach(function (id) {
+    var chip = glance.querySelector('[data-item-id="' + String(id) + '"]');
+    if (!chip) return;
+    chip.classList.remove('wb-flash');
+    chip.classList.add('wb-flash');
+    chip.addEventListener('animationend', function () { chip.classList.remove('wb-flash'); }, { once: true });
+  });
+});
 
 /* Instant paint ahead of the first SSE snapshot (identical shared payload). */
 refreshStatus();

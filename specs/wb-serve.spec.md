@@ -70,6 +70,7 @@ functional and the two never disagree about state.
 32. As an operator on a small screen, I want the page to be usable on a laptop-width window, so that I don't need a dedicated monitor to work the parking lot.
 33. As a CLI user, I want `wb status` and the web UI to render from one shared status layer, so that the two surfaces can never disagree.
 34. As an operator who trusts their muscle memory, I want the CLI to remain unchanged and fully functional alongside the UI, so that the web server is additive, not a cutover.
+35. As an operator, I want the header to show a live RUNNING state with the running item, stage, and a ticking clock, so that liveness is visible at a glance.
 
 ## Implementation Decisions
 
@@ -329,7 +330,14 @@ map (amber/red/orange/violet/fuchsia), stage-progress dots (stages before
 artifact links, note/reason inputs, per-question answer inputs, verbatim gate
 feedback, retry with inline 409/422 reasons, stale-base hint on the glance
 chips, PR links on done chips, human-rejected hint (Resume; no per-item
-button); Run/Resume buttons and the lock banner (pid + age) in the header; an
+button); Run/Resume buttons and the run-state pill in the header — IDLE (a
+calm stone chip, visibly inert: no pulse, no accent) when no lock is held,
+RUNNING while a live lock exists (pulsing blue dot, `#id slug · stage` per
+running item — or the holder pid when no item is running — and a `mm:ss`
+elapsed clock that ticks client-side every second and re-anchors from
+`lock.ageMs` on each status event; clicking the pill scrolls to the glance
+row and one-shot-flashes the running item's chip), the verbatim stale-lock
+text for a dead holder, and back to IDLE once the lock clears; an
 append-only live feed colored by event. EventSource auto-reconnect with
 `Last-Event-ID` provides gapless resume. Every untrusted string is rendered
 through `esc()`/`textContent` (no raw `innerHTML` interpolation of data); all

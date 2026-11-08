@@ -226,6 +226,13 @@ describe("wb serve: page, template, snapshot (CLI status contract)", () => {
     expect(PAGE_HTML).not.toContain("https://");
     expect(PAGE_HTML).not.toContain("http://");
     expect(PAGE_HTML).toContain("<style>");
+    // Header run-state pill: the SSE render path writes into #run-state, and
+    // the per-second clock tick and glance-chip flash class are the pieces a
+    // refactor could silently drop (full behavior covered in
+    // tests/web-page-runtime.test.ts).
+    expect(PAGE_HTML).toContain('id="run-state"');
+    expect(PAGE_HTML).toMatch(/setInterval\([\s\S]*?1000\)/);
+    expect(PAGE_HTML).toContain("wb-flash");
     // Combobox: the known-repos datalist options carry a per-repo item-count
     // label (escaped), and the repo input advertises the accepted forms.
     expect(PAGE_HTML).toContain("repos-dl");
