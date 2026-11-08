@@ -444,8 +444,10 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
   }
 
   /** Backgrounded run/resume (spec §6.2): lock acquired synchronously; the
-   *  claim pass + tick happen in a detached task (awaited in tests); progress
-   *  reaches clients only via the SSE stream. */
+   *  claim pass + drive-until-parked (`Orchestrator.resume()`) happen in a
+   *  detached task (awaited in tests); progress reaches clients only via the
+   *  SSE stream. Both verbs ("run" and "resume") drive identically — the web
+   *  Run button maps to the same resume loop the CLI's `wb resume` runs. */
   async function startRun(kind: "run" | "resume"): Promise<{ started: boolean; busy: boolean; capped?: boolean }> {
     let release: () => void;
     try {
@@ -473,13 +475,9 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
         // The claim pass belongs to run/resume (the openFactory-equivalent),
         // never to serve startup or per-item actions.
         scanInbox(deps.paths, db);
-        if (kind === "run") {
-          await orch.tickAll();
-          return {};
-        }
         const report = await orch.resume();
         if (report.capped) {
-          // Parity with the CLI's message: the client may need to press resume again.
+          // Parity with the CLI's message: the client may need to press Run again.
           console.error("resume hit its safety cap — run `wb resume` again to continue.");
         }
         return { capped: report.capped ?? false };
@@ -704,7 +702,7 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     let runStarted = false;
     let runBusy = false;
     if (body.runNow === true) {
-      const r = await startRun("run");
+      const r = await startRun("resume");
       runStarted = r.started;
       runBusy = r.busy;
     }
