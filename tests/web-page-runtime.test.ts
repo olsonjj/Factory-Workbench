@@ -1352,4 +1352,30 @@ describe("wb serve page script (runtime behavior)", () => {
     expect(pulse).toMatch(/id="flight-body"[^>]*\bhidden\b/);
     expect(pulse).toContain('aria-expanded="false"');
   });
+
+  it("keeps an explicit toggle over a STALE stored pref when the storage write fails (no reopen)", async () => {
+    // Reads return a stored 'open' (a previous session's choice) but writes
+    // throw: the click's in-memory explicit choice — the newest user signal —
+    // must beat the persisted-but-stale pref across snapshots. Reading the
+    // old value instead would visibly reopen the panel after every SSE tick.
+    const ctx = makeContext();
+    ctx.sandbox.localStorage.getItem = (key: string) => (key === "wb:flight-panel" ? "open" : null);
+    ctx.sandbox.localStorage.setItem = () => {
+      throw new Error("quota exceeded");
+    };
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD); // busy → stored 'open' wins pre-toggle
+    ctx.syncFlightBodyFromMarkup();
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(false);
+    ctx.click("pulse", FLIGHT_SUMMARY_TARGET); // collapse; the write throws
+    expect(ctx.el("flight-body").classList.contains("hidden")).toBe(true);
+
+    // The next snapshot must NOT flap the panel back to the stored 'open'.
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD);
+    const pulse = ctx.el("pulse").innerHTML;
+    expect(pulse).toMatch(/id="flight-body"[^>]*\bhidden\b/);
+    expect(pulse).toContain('aria-expanded="false"');
+  });
 });

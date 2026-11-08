@@ -658,8 +658,11 @@ var flightCollapsed = true;
 /* In-memory mirror of the last EXPLICIT user toggle, kept for the case where
  * storage writes fail while reads succeed: the next snapshot (~2s SSE) would
  * otherwise re-derive the default and silently undo the user's click
- * mid-session. Precedence per render: stored pref > flightExplicit > default
- * (storage still wins when it works; the default still applies pre-toggle). */
+ * mid-session. A persisted-but-STALE pref is the same trap: the stored value
+ * predates this session's click, so when the write throws the click — the
+ * newest user signal — must win. Precedence per render:
+ * flightExplicit > stored pref > default (pre-toggle and fresh-session, the
+ * stored pref is the newest signal and wins over the default). */
 var flightExplicit = null;
 
 function flightPref() {
@@ -686,7 +689,7 @@ function flightPanelHtml(p) {
   if (queuedCount > 0) segments.push(queuedCount + ' queued');
 
   var pref = flightPref();
-  flightCollapsed = pref !== null ? pref : (flightExplicit !== null ? flightExplicit : (inFlight.length === 0));
+  flightCollapsed = flightExplicit !== null ? flightExplicit : (pref !== null ? pref : (inFlight.length === 0));
 
   var body;
   if (inFlight.length === 0) {
@@ -1253,11 +1256,13 @@ $('glance').addEventListener('click', function (ev) {
  * is a <button type="button">, so Enter/Space synthesize the same click —
  * the shared click listener IS the keyboard path. The new state is
  * persisted immediately as an explicit user choice, which then always
- * beats the open/close default (flight-panel spec D3). */
+ * beats both the open/close default and any persisted-but-stale pref (the
+ * flightExplicit write-failure case) — newest user signal wins (flight-panel
+ * spec D3). */
 $('pulse').addEventListener('click', function (ev) {
   if (!ev.target.closest('button[data-flight-summary]')) return;
   var collapsed = !flightCollapsed;
-  flightExplicit = collapsed; // session-sticky even when the storage write fails
+  flightExplicit = collapsed; // session-sticky; beats even a stale stored pref when the write fails
   try { localStorage.setItem(FLIGHT_PREF_KEY, collapsed ? 'collapsed' : 'open'); } catch (e) { /* storage unavailable: flightExplicit keeps the choice for the session */ }
   applyFlightCollapsed(collapsed);
 });
