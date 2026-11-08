@@ -340,7 +340,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
           </label>
           <label class="block">
             <div class="lbl">Repository <span class="text-red-500">*</span></div>
-            <input id="f-repo" class="finput font-mono" list="repos-dl" placeholder="/path/to/target/repo">
+            <input id="f-repo" class="finput font-mono" list="repos-dl" placeholder="repo name, Code/rel/path, ~/path, or /abs/path">
             <datalist id="repos-dl"></datalist>
             <div class="ferr" data-err="repo"></div>
           </label>
@@ -571,10 +571,15 @@ function renderPulse(p) {
   $('pulse').innerHTML = html + bar;
 }
 
+/* Dropdown options carry a per-repo item-count label. Chromium/WebKit
+ * surface option labels; Firefox shows values only — acceptable, since the
+ * value (the absolute known-repo path) is the pick data and free-form entry
+ * keeps working regardless. */
 function renderDatalist(knownRepos) {
   var dl = $('repos-dl');
   dl.innerHTML = knownRepos.map(function (k) {
-    return '<option value="' + esc(k.repo) + '"></option>';
+    var label = k.count > 0 ? (k.count + (k.count === 1 ? ' item' : ' items')) : '';
+    return '<option value="' + esc(k.repo) + '">' + esc(label) + '</option>';
   }).join('');
 }
 
