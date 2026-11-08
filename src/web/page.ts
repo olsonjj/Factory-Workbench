@@ -928,33 +928,28 @@ var runAnchor = { ageMs: 0, at: 0, running: false, itemIds: [] };
 
 /* Header Start Processing button (spec §Page): idle reads "▶ Start
  * Processing"; while a LIVE factory lock exists (a drive in flight) it is
- * disabled and reads "Processing…" with a wb-spin spinner, carrying a tooltip
- * that says how to actually stop today. Derived purely from each status
- * payload — the same lock signal the run-state pill uses — so every paint is
- * correct by construction: a lock acquire or release always changes the tick
- * fingerprint (lock pid@ts vs '-') and emits a status event within one poll.
- * There is deliberately NO client-side pending-flight flag and no watchdog:
- * the only transient is the ≤2s window between a 202 and the next SSE tick,
- * where a second click hits the server's existing 409 single-flight, whose
- * renderLock shim disables the button through this same path. A stale
- * (dead) holder is not a drive in progress — enabled, tooltip cleared. The
- * element is mutated in place, never replaced, so the permanent click
- * listener survives and a disabled button is natively unfocusable (no
- * double-fire possible). */
+ * disabled and reads "Processing…" with a wb-spin spinner. The button and
+ * never-disabled run-state pill share the same stop hint, including the
+ * actual holder pid. A stale (dead) holder is not a drive in progress —
+ * enabled, hints cleared. Repeated paints in the same busy/idle state leave
+ * innerHTML untouched so the spinner animation does not restart. */
+var lastRunButtonBusy = null;
 function renderRunButton(p) {
   var btn = $('btn-run');
   var lock = (p && p.lock) || null;
-  if (lock && lock.alive) {
-    btn.disabled = true;
-    btn.title = 'Processing — a drive is in progress. To stop, end wb serve in its terminal (Ctrl+C).';
-    btn.setAttribute('aria-busy', 'true');
-    btn.innerHTML = '<span class="wb-spin" aria-hidden="true"></span>Processing…';
-  } else {
-    btn.disabled = false;
-    btn.title = '';
-    btn.setAttribute('aria-busy', 'false');
-    btn.innerHTML = '▶ Start Processing';
-  }
+  var busy = !!(lock && lock.alive);
+  var hint = busy
+    ? 'Processing — a drive is in progress (lock holder pid ' + lock.pid + '). To stop, end the command holding the lock (wb serve or wb run/wb resume in its terminal).'
+    : '';
+  btn.title = hint;
+  $('run-state').title = hint;
+  if (lastRunButtonBusy === busy) return;
+  lastRunButtonBusy = busy;
+  btn.disabled = busy;
+  btn.setAttribute('aria-busy', busy ? 'true' : 'false');
+  btn.innerHTML = busy
+    ? '<span class="wb-spin" aria-hidden="true"></span>Processing…'
+    : '▶ Start Processing';
 }
 
 function renderRunState(p) {
@@ -1095,7 +1090,13 @@ $('btn-run').addEventListener('click', function () {
   if (btn.disabled) return;
   postJSON('/api/run', {}).then(function (r) {
     if (r.status === 202) toast('processing started — progress lands in the feed' + (r.data && r.data.capped ? ' (hit its safety cap — press Start Processing again)' : ''));
-    else if (r.status === 409) { renderLock(r.data && r.data.lock); toast('factory is busy — a run is already in progress'); }
+    else if (r.status === 409) {
+      renderLock(r.data && r.data.lock);
+      toast('factory is busy — a run is already in progress');
+      // The holder may already have exited; reconcile immediately rather than
+      // waiting for an SSE event that an unchanged fingerprint can suppress.
+      refreshStatus();
+    }
     else toast((r.data && r.data.error) || ('HTTP ' + r.status));
   });
 });

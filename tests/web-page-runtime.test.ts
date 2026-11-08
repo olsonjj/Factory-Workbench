@@ -20,6 +20,7 @@ function pageScript(html: string): string {
 
 interface StubElement {
   innerHTML: string;
+  readonly innerHTMLWrites: number;
   textContent: string;
   className: string;
   value: string;
@@ -41,8 +42,12 @@ function makeStubElement(): StubElement {
   const listeners: Map<string, Array<() => void>> = new Map();
   const classes = new Set<string>();
   const attributes: Record<string, string> = {};
+  let html = "";
+  let innerHTMLWrites = 0;
   return {
-    innerHTML: "",
+    get innerHTML() { return html; },
+    set innerHTML(value) { html = value; innerHTMLWrites += 1; },
+    get innerHTMLWrites() { return innerHTMLWrites; },
     textContent: "",
     className: "",
     value: "",
@@ -266,7 +271,9 @@ describe("wb serve page script (runtime behavior)", () => {
     expect(btn.innerHTML).toContain("Processing…");
     expect(btn.innerHTML).toContain("wb-spin");
     expect(btn.innerHTML).not.toContain("▶ Start Processing");
-    expect(btn.title).toContain("To stop, end wb serve in its terminal");
+    expect(btn.title).toContain("lock holder pid 7");
+    expect(btn.title).toContain("wb serve or wb run/wb resume");
+    expect(ctx.el("run-state").title).toBe(btn.title);
     expect(btn.getAttribute("aria-busy")).toBe("true");
 
     // Stale (dead) holder is not a drive in progress: re-enabled, tooltip
@@ -275,6 +282,7 @@ describe("wb serve page script (runtime behavior)", () => {
     expect(btn.disabled).toBe(false);
     expect(btn.innerHTML).toContain("▶ Start Processing");
     expect(btn.title).toBe("");
+    expect(ctx.el("run-state").title).toBe("");
 
     // Lock cleared: fully reverted.
     ctx.fire("status", IDLE_PAYLOAD);
@@ -338,6 +346,35 @@ describe("wb serve page script (runtime behavior)", () => {
     await flush();
     expect(ctx.el("toast").textContent).toBe("factory is busy — a run is already in progress");
     expect(ctx.el("btn-run").disabled).toBe(true);
+
+    // A short-lived holder can disappear before this response arrives. The
+    // immediate status refresh is the re-enable path even when no later SSE
+    // fingerprint change occurs.
+    expect(ctx.fetches).toHaveLength(2);
+    expect(ctx.fetches[1].url).toBe("/api/status");
+    ctx.fetches[1].resolve({ status: 200, ok: true, json: async () => IDLE_PAYLOAD });
+    await flush();
+    expect(ctx.el("btn-run").disabled).toBe(false);
+  });
+
+  it("does not repaint the Start Processing spinner for repeated busy snapshots", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    const btn = ctx.el("btn-run");
+    ctx.fire("status", RUNNING_PAYLOAD);
+    const writesAfterFirstBusyPaint = btn.innerHTMLWrites;
+    ctx.fire("status", payload(
+      [{ id: 22, slug: "make-the-running-state-unmissable-in-the-web-ui-header", stage: "pr", status: "running" }],
+      { alive: true, pid: 7, ageMs: 70_000 },
+    ));
+    expect(btn.innerHTMLWrites).toBe(writesAfterFirstBusyPaint);
+    expect(btn.innerHTML).toContain("wb-spin");
+
+    ctx.fire("status", DEAD_PAYLOAD);
+    expect(btn.innerHTMLWrites).toBe(writesAfterFirstBusyPaint + 1);
+    expect(btn.disabled).toBe(false);
   });
 
   it("renders the glance collapsed by default with accurate counts, updating live over SSE without expanding", async () => {
