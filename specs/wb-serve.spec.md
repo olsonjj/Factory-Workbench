@@ -347,24 +347,49 @@ SSE), with the chips (stale-base hints, PR links) and inbox detail
 collapsed; toggling is a delegated click handler on the permanent `#glance`
 container through `applyGlanceCollapsed` (per-load state, never persisted;
 the empty state keeps the plain "no items in flight" line with no toggle);
-the single Start Processing button (backgrounded resume drive — idle label
-`▶ Start Processing`; while a live factory lock exists it reads `Processing…`
-with a `wb-spin` spinner and is `disabled` with `aria-busy` and the tooltip
-`Processing — a drive is in progress. To stop, end wb serve in its terminal
-(Ctrl+C).`, re-enabling and reverting on the status event that shows the lock
-cleared; the state is derived from the same SSE status payload as the
-run-state pill — no new endpoint, no polling, no client-side single-flight
-guard, no stop toggle, since a real stop would need a cancellation seam
-through the stage runner and is out of scope) and the run-state
-pill in the header — IDLE (a
-calm stone chip, visibly inert: no pulse, no accent) when no lock is held,
-RUNNING while a live lock exists (pulsing blue dot, `#id slug · stage` per
-running item — or the holder pid when no item is running — and a `mm:ss`
-elapsed clock that ticks client-side every second and re-anchors from
-`lock.ageMs` on each status event; clicking the pill scrolls to the glance
-row, auto-expanding it first if it is collapsed, and one-shot-flashes the
-running item's chip), the verbatim stale-lock
-text for a dead holder, and back to IDLE once the lock clears; an
+the single Start Processing button (backgrounded resume drive; idle label
+`▶ Start Processing`; it shows a `wb-spin` spinner and is `disabled` while
+a flight is open — from press until the next status snapshot confirms the
+run's live lock (backed by a bounded watchdog deadline: a no-op drive can
+acquire and release the lock between poll ticks without changing the
+status fingerprint, so no status event follows and the 202-accepted flight
+must still retire on its own), or the busy-409 handling completes (with an
+immediate status refresh, since the holder may already have exited and an
+unchanged fingerprint can suppress the event) — and repeated clicks never
+stack a second POST. While a live factory lock exists the button reads
+`Processing…` with `aria-busy` and a stop-hint tooltip naming the
+lock-holder pid and the command holding it (`wb serve` or `wb run`/`wb
+resume` in its terminal), mirrored on the never-disabled run-state pill,
+re-enabling and reverting on the status event that shows the lock cleared
+(a dead holder is not a drive in progress — enabled, hints cleared; the
+lock fingerprint includes `alive`, so a dead-holder transition always
+emits). The lock-driven state derives from the same SSE status payload as
+the run-state pill — no new endpoint, no polling; no stop toggle, since a
+real stop would need a cancellation seam through the stage runner and is
+out of scope; under `prefers-reduced-motion` no animation (spinner,
+pulse, flash) runs) and the run-state pill in the header — a four-state machine derived
+on every status payload with the priority RUNNING > NEEDS REVIEW >
+PAUSED > IDLE: IDLE (a calm stone chip, visibly inert: no pulse, no
+accent) when no lock is held and nothing is actionable; RUNNING while a
+live lock exists (a small spinner beside the pulsing blue dot, `#id slug
+· stage` per running item — or the holder pid when no item is running —
+and a `mm:ss` elapsed clock that ticks client-side every second and
+re-anchors from `lock.ageMs` on each status event; clicking the pill
+scrolls to the glance row, auto-expanding it first if it is collapsed, and
+one-shot-flashes the running item's chip); the verbatim stale-lock text
+for a dead holder (kept in lock-held priority ahead of the operator
+states, as a non-interactive span); NEEDS REVIEW when no live lock exists
+and `counts.decisions > 0` (an amber pill reading `NEEDS REVIEW · N
+parked — #<first parked id> at <its stage>`, first in parking-lot order;
+clicking it scrolls to the parking lot); PAUSED when no live lock, zero
+decisions, and at least one actionable item (queued/running; a stone pill
+reading `PAUSED · press Start Processing — #<first id> at <its stage>`,
+non-error blue/stone accent; clicking it calls the same shared pressRun
+path as the Start Processing button, including the busy-409 handling);
+the pill states that carry actions (RUNNING, NEEDS REVIEW, PAUSED) are
+plain `<button type="button">` elements so Tab/Enter/Space reach them
+(focus restored across re-renders like the glance summary), IDLE is a
+span; an
 append-only live feed colored by event. EventSource auto-reconnect with
 `Last-Event-ID` provides gapless resume. Every untrusted string is rendered
 through `esc()`/`textContent` (no raw `innerHTML` interpolation of data); all
@@ -410,12 +435,23 @@ message, exit 1).
 
 `tests/web-page-runtime.test.ts` — runs the page's inline script in a fresh
 V8 context with a minimal DOM stub and drives it exactly the way the browser
-does (`status` events on the EventSource): IDLE → RUNNING → stale-lock pill
-transitions with the ticking client-side clock, the glance's default-
-collapsed render with accurate per-status counts that update live over SSE,
-the click/keyboard toggle through the delegated summary handler, the
+does (`status` events on the EventSource): the four-state run-pill
+derivation and its priority (IDLE → RUNNING → stale-lock transitions with
+the ticking client-side clock and spinner; a live lock beats NEEDS REVIEW,
+and the verbatim stale text beats it too), the NEEDS REVIEW click scrolling
+to the parking lot (no POST fired), the PAUSED click firing exactly one
+`POST /api/run` (202 → the Start Processing button stays disabled with its
+spinner until the next status snapshot re-enables it — or, when a no-op
+drive leaves the fingerprint untouched and no snapshot follows, a watchdog
+deadline re-enables it; busy-409 → lock re-render + busy toast + immediate
+re-enable + an immediate status refresh), the no-double-fire guard across
+repeated button/pill clicks — including an SSE drop while a POST is still
+pending, which must not defeat the guard — the reduced-motion stylesheet
+block present in the page source, the glance's default-collapsed render
+with accurate per-status counts that update live over SSE, the
+click/keyboard toggle through the delegated summary handler, the
 RUNNING-pill auto-expand of a collapsed glance, the toggle-free empty
-state, the Start Processing button's label/disabled/tooltip lifecycle
+state, and the Start Processing button's label/disabled/tooltip lifecycle
 (idle → live-lock `Processing…` with spinner and the stop tooltip → stale
 and idle re-enable), its no-double-fire guard while disabled (zero
 `POST /api/run` entries), and the 202 toast copy (plain and capped

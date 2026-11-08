@@ -64,14 +64,12 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .btn-ok { background: #059669; color: #fff; }
   .btn-ok:hover { background: #047857; }
   /* Disabled buttons (Start Processing while a live drive runs): no pointer
-   * affordance, no hover darken, and the spinner is a class — never an
-   * inline style — so prefers-reduced-motion can retire it. */
+   * affordance, no hover darken. The wb-spin spinner class + keyframes live
+   * with the other component rules below (single definition), so
+   * prefers-reduced-motion retires every animation in one place. */
   .btn:disabled { cursor: default; }
   .btn-dark:disabled { background: #1c1917; }
   .btn-dark:disabled:hover { background: #1c1917; } /* suppress the hover darken */
-  .wb-spin { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 9999px; animation: wb-spin 1s linear infinite; }
-  @keyframes wb-spin { to { transform: rotate(360deg); } }
-  @media (prefers-reduced-motion: reduce) { .wb-spin { animation: none; } }
 
 /* ---- utilities: display / flex / grid / gaps ---- */
   .hidden { display: none; }
@@ -315,6 +313,19 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
     0% { box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.45); }
     100% { box-shadow: 0 0 0 3px rgba(59, 130, 246, 0); }
   }
+  /* Spinner for in-flight states (the RUNNING pill and the busy Run
+   * button). currentColor keeps it visible inside both the blue pill and
+   * the dark button with no new palette entries; the size is pinned here
+   * because the page's utility set has no h-3/w-3. */
+  .wb-spin { display: inline-block; width: 12px; height: 12px; border-radius: 9999px; border: 2px solid currentColor; border-top-color: transparent; animation: wb-spin .8s linear infinite; }
+  @keyframes wb-spin { to { transform: rotate(360deg); } }
+  .btn:disabled { opacity: .5; cursor: default; }
+  /* prefers-reduced-motion: the animation-carrying affordances (the RUNNING
+   * pulse, the pill-click flash, the spinners) all degrade to their static
+   * presentation — the click/scroll actions themselves still work. */
+  @media (prefers-reduced-motion: reduce) {
+    .animate-pulse, .wb-flash, .wb-spin { animation: none; }
+  }
   .cursor-pointer { cursor: pointer; }
   .accent-indigo-600 { accent-color: #4f46e5; }
 
@@ -545,6 +556,13 @@ async function act(url, body, card) {
 
 function render(p) {
   CURRENT = p;
+  /* Run single-flight retirement: a 202 has been received and no POST is
+   * pending — this is the first status snapshot after the server (which
+   * acquires the lock synchronously before responding) reported the run.
+   * The status fingerprint embeds the lock, so this snapshot necessarily
+   * reflects the new lock truth (acquired, or already released by a
+   * fast-finished drive) — either way the Run button must come back. */
+  if (runInFlight && flightAwaited && !flightPending) clearRunFlight();
   renderPulse(p);
   renderDatalist(p.knownRepos || []);
   renderParking(p);
@@ -915,15 +933,22 @@ function applyGlanceCollapsed(collapsed) {
   if (btn && btn.setAttribute) btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
 }
 
-/* Header run-state pill. Three states (spec §Page): IDLE (calm stone chip,
- * visibly inert) when no lock is held; RUNNING while a live lock exists —
- * pulsing blue dot, "#id slug · stage" per running item (or the holder pid
- * when no item is running), and a mm:ss elapsed clock; the verbatim
- * stale-lock text for a dead holder. The clock anchor is re-derived from
- * lock.ageMs on every status event; a single 1s interval (created once, at
- * init) extrapolates between events — no extra polling, the SSE cadence is
- * untouched. payloadLike is a whole status payload (render) or a {lock}
- * fragment (409 handlers, via the renderLock shim); items defaults to []. */
+/* Header run-state pill — a four-state operator machine (spec §Page),
+ * derived client-side on EVERY status payload (and on the 409 renderLock
+ * shim path) from data already present; no new API, no server change.
+ * Priority: RUNNING (live lock) > verbatim stale-lock text (dead holder —
+ * informational, kept ahead of the operator states so a dead lock is never
+ * silently displaced by a state that doesn't mention it) > NEEDS REVIEW
+ * (no live lock, counts.decisions > 0) > PAUSED (no lock, zero decisions,
+ * at least one queued/running item) > IDLE. The clock machinery (#26) stays
+ * as-is within RUNNING: runAnchor is re-derived from lock.ageMs on every
+ * lock.alive payload; a single 1s interval (created once, at init)
+ * extrapolates between events — no extra polling. payloadLike is a whole
+ * status payload (render) or a {lock} fragment (409 handlers, via the
+ * renderLock shim); on the shim path a lock is always present, so the
+ * machine always lands in a lock branch and the missing counts never
+ * matter. */
+var runStateKind = 'idle'; // set on every render — read by the delegated click handler
 var runAnchor = { ageMs: 0, at: 0, running: false, itemIds: [] };
 
 /* Header Start Processing button (spec §Page): idle reads "▶ Start
@@ -943,6 +968,7 @@ function renderRunButton(p) {
     : '';
   btn.title = hint;
   $('run-state').title = hint;
+  if (runInFlight) return; // the flight writer owns the button until the next snapshot retires it
   if (lastRunButtonBusy === busy) return;
   lastRunButtonBusy = busy;
   btn.disabled = busy;
@@ -952,17 +978,29 @@ function renderRunButton(p) {
     : '▶ Start Processing';
 }
 
+function deriveRunState(lock, decisions, actionable) {
+  if (lock && lock.alive) return 'running';
+  if (lock) return 'stale';              // dead holder — verbatim stale text, unchanged
+  if (decisions > 0) return 'review';
+  if (actionable >= 1) return 'paused';
+  return 'idle';
+}
+
 function renderRunState(p) {
   var el = $('run-state');
   renderRunButton(p);
   var lock = (p && p.lock) || null;
-  if (!lock) {
+  var counts = (p && p.counts) || null;
+  var decisions = counts ? (counts.decisions || 0) : 0;
+  var actionable = counts ? ((counts.queued || 0) + (counts.running || 0)) : 0;
+  runStateKind = deriveRunState(lock, decisions, actionable);
+  if (runStateKind === 'idle') {
     runAnchor.running = false;
     el.innerHTML = '<span class="rounded-full text-[10px] font-semibold tracking-widest text-ink-400 bg-white ring-1 ring-ink-200 px-3 py-1">IDLE</span>';
     el.classList.remove('hidden');
     return;
   }
-  if (!lock.alive) {
+  if (runStateKind === 'stale') {
     runAnchor.running = false;
     var mins = Math.floor((lock.ageMs || 0) / 60000);
     var age = mins < 1 ? 'just started' : mins + ' min ago';
@@ -971,29 +1009,63 @@ function renderRunState(p) {
     el.classList.remove('hidden');
     return;
   }
-  var running = (p.items || []).filter(function (it) { return it.status === 'running'; })
-    .sort(function (a, b) { return a.id - b.id; });
-  runAnchor = {
-    ageMs: lock.ageMs || 0,
-    at: Date.now(),
-    running: true,
-    itemIds: running.map(function (it) { return it.id; })
-  };
-  var frag = running.length
-    ? running.map(function (it) { return '#' + it.id + ' ' + esc(it.slug) + ' · ' + esc(it.stage || ''); }).join(' · ')
-    : '(pid ' + esc(lock.pid) + ')'; // live lock, no running item (a bounded CLI action holds it)
-  el.innerHTML =
-    // A <button> (not a div): keyboard users can Tab to the pill and press
-    // Enter/Space for the same scroll-and-flash action. The preflight resets
-    // button chrome (border 0, transparent bg, inherited font), so the pill
-    // renders identically to the former div.
-    '<button type="button" class="rounded-full ring-1 ' + STATUS_PILL.running + ' text-xs px-3 py-1 inline-flex items-center gap-1.5 cursor-pointer" title="factory pid ' + esc(lock.pid) + '">' +
-    '<span class="h-1.5 w-1.5 rounded-full bg-blue-500 animate-pulse"></span>' +
-    '<span class="text-[10px] font-semibold tracking-widest">RUNNING</span>' +
-    '<span>· ' + frag + '</span>' +
-    '<span class="font-mono tabular-nums" id="run-clock">' + fmtMMSS(runAnchor.ageMs) + '</span>' +
-    '</button>';
+  /* Keyboard focus carry across the innerHTML replacement (the renderGlance
+   * pattern): status events re-render #run-state on every changed
+   * fingerprint, which would otherwise drop a keyboard user off the pill to
+   * <body>. Only the button states need it — IDLE/stale are spans. */
+  var hadFocus = !!(document.activeElement && document.activeElement.closest &&
+    document.activeElement.closest('button') && (!el.contains || el.contains(document.activeElement)));
+  var html = '';
+  if (runStateKind === 'running') {
+    var running = (p.items || []).filter(function (it) { return it.status === 'running'; })
+      .sort(function (a, b) { return a.id - b.id; });
+    runAnchor = {
+      ageMs: lock.ageMs || 0,
+      at: Date.now(),
+      running: true,
+      itemIds: running.map(function (it) { return it.id; })
+    };
+    var frag = running.length
+      ? running.map(function (it) { return '#' + it.id + ' ' + esc(it.slug) + ' · ' + esc(it.stage || ''); }).join(' · ')
+      : '(pid ' + esc(lock.pid) + ')'; // live lock, no running item (a bounded CLI action holds it)
+    html =
+      // A <button> (not a div): keyboard users can Tab to the pill and press
+      // Enter/Space for the same scroll-and-flash action. The preflight resets
+      // button chrome (border 0, transparent bg, inherited font), so the pill
+      // renders identically to the former div.
+      '<button type="button" class="rounded-full ring-1 ' + STATUS_PILL.running + ' text-xs px-3 py-1 inline-flex items-center gap-1.5 cursor-pointer" title="factory pid ' + esc(lock.pid) + '">' +
+      '<span class="wb-spin shrink-0"></span>' +
+      '<span class="h-1.5 w-1.5 rounded-full bg-blue-500 animate-pulse"></span>' +
+      '<span class="text-[10px] font-semibold tracking-widest">RUNNING</span>' +
+      '<span>· ' + frag + '</span>' +
+      '<span class="font-mono tabular-nums" id="run-clock">' + fmtMMSS(runAnchor.ageMs) + '</span>' +
+      '</button>';
+  } else if (runStateKind === 'review') {
+    // The first pending thing, in the parking lot's own order (every parked
+    // item carries a non-empty stage; 'parked' is a defensive fallback).
+    var first = (p.items || []).filter(isParked).sort(byParkOrder)[0];
+    html =
+      '<button type="button" class="rounded-full ring-1 ' + STATUS_PILL['awaiting-approval'] + ' text-xs px-3 py-1 inline-flex items-center gap-1.5 cursor-pointer" title="items are parked waiting on you — click to jump to the parking lot">' +
+      '<span class="h-1.5 w-1.5 rounded-full bg-amber-400"></span>' +
+      '<span class="text-[10px] font-semibold tracking-widest">NEEDS REVIEW</span>' +
+      '<span>· ' + decisions + ' parked — #' + (first ? first.id : 0) + ' at ' + esc((first && first.stage) || 'parked') + '</span>' +
+      '</button>';
+  } else { // paused
+    var next = (p.items || []).filter(function (it) { return it.status === 'queued' || it.status === 'running'; })
+      .sort(function (a, b) { return a.id - b.id; })[0];
+    html =
+      '<button type="button" class="rounded-full ring-1 ' + STATUS_PILL.queued + ' text-xs px-3 py-1 inline-flex items-center gap-1.5 cursor-pointer" title="press Start Processing — clicking here does the same">' +
+      '<span class="h-1.5 w-1.5 rounded-full ' + STATUS_DOT.queued + '"></span>' +
+      '<span class="text-[10px] font-semibold tracking-widest">PAUSED</span>' +
+      '<span>· <span class="text-blue-700">press Start Processing</span> — #' + (next ? next.id : 0) + ' at ' + esc((next && next.stage) || 'parked') + '</span>' +
+      '</button>';
+  }
+  el.innerHTML = html;
   el.classList.remove('hidden');
+  if (hadFocus) {
+    var btn = el.querySelector('button');
+    if (btn && btn.focus) btn.focus();
+  }
 }
 
 /* Compat shim for the busy-lock (409) handlers: they hold a fresh lock but
@@ -1083,23 +1155,107 @@ $('parking-lot').addEventListener('click', function (ev) {
 
 /* ================= header: Start Processing ================= */
 
-$('btn-run').addEventListener('click', function () {
-  var btn = $('btn-run');
-  // Browsers never dispatch click on a native-disabled button; the DOM-stub
-  // harness does regardless — the guard keeps that path assertable there.
-  if (btn.disabled) return;
+/* Single-flight Start Processing. Both the Start Processing button and the
+ * PAUSED pill funnel through pressRun() — clicking the PAUSED pill is
+ * indistinguishable from pressing Start Processing (identical POST path,
+ * toasts, and busy-409 handling). While a flight is open the button shows a
+ * spinner and is disabled; repeated clicks (button or pill) never stack a
+ * second POST. Retirement rules: the busy-409 and error paths re-enable
+ * immediately; a 202 keeps the button busy until the NEXT status snapshot
+ * (render() retires the flight — the server acquires the lock synchronously
+ * before responding and the status fingerprint embeds the lock, so that
+ * snapshot always reflects the new lock truth, acquired or already released
+ * by a fast-finished drive). runInFlight guards the whole flight;
+ * flightPending marks the pre-response window (inert, so an unrelated
+ * lockless status event racing the POST cannot retire the flight early);
+ * flightAwaited marks "202 seen, retire on the next snapshot".
+ *
+ * Watchdog: a 202's "next snapshot" does not always exist. A no-op drive
+ * can acquire AND release the lock between two SSE poll ticks while changing
+ * nothing observable — no fingerprint change, so the poller emits no status
+ * event and the awaited-202 state would wedge the button forever. The
+ * watchdog backs that state with a deadline (RUN_FLIGHT_WATCHDOG_MS,
+ * comfortably above 2x the default 2s serve poll interval): if no snapshot
+ * retires the flight within the grace period, the timer does — and only
+ * when the flight is still awaited-and-not-pending. clearRunFlight() always
+ * clears the timer, so it can never fire late over a retired flight. */
+var runInFlight = false;
+var flightAwaited = false;
+var flightPending = false;
+var flightWatchdog = null;
+var RUN_FLIGHT_WATCHDOG_MS = 6000;
+
+/* Arms the re-enable deadline for the awaited-202 state. Called only from
+ * the 202 branch; the timer retires the flight itself if no status snapshot
+ * arrives first (render()'s pre-clear normally wins the race). */
+function armRunFlightWatchdog() {
+  if (flightWatchdog) clearTimeout(flightWatchdog);
+  flightWatchdog = setTimeout(function () {
+    flightWatchdog = null;
+    if (runInFlight && flightAwaited && !flightPending) clearRunFlight();
+  }, RUN_FLIGHT_WATCHDOG_MS);
+}
+
+function pressRun() {
+  if (runInFlight) return; // no double-fire
+  runInFlight = true;
+  flightPending = true;
+  setRunButtonBusy(true);
   postJSON('/api/run', {}).then(function (r) {
-    if (r.status === 202) toast('processing started — progress lands in the feed' + (r.data && r.data.capped ? ' (hit its safety cap — press Start Processing again)' : ''));
-    else if (r.status === 409) {
+    flightPending = false;
+    if (r.status === 202) {
+      flightAwaited = true;
+      armRunFlightWatchdog();
+      toast('processing started — progress lands in the feed' + (r.data && r.data.capped ? ' (hit its safety cap — press Start Processing again)' : ''));
+    } else if (r.status === 409) {
+      clearRunFlight(); // retire first so the lock-driven writer can apply the fresh lock
       renderLock(r.data && r.data.lock);
       toast('factory is busy — a run is already in progress');
       // The holder may already have exited; reconcile immediately rather than
       // waiting for an SSE event that an unchanged fingerprint can suppress.
       refreshStatus();
+    } else {
+      toast((r.data && r.data.error) || ('HTTP ' + r.status));
+      clearRunFlight();
     }
-    else toast((r.data && r.data.error) || ('HTTP ' + r.status));
+  }, function () {
+    flightPending = false;
+    clearRunFlight(); // rejected fetch: never wedge the button
   });
+}
+
+$('btn-run').addEventListener('click', function () {
+  // Browsers never dispatch click on a native-disabled button; the DOM-stub
+  // harness does regardless — the guard keeps that path assertable there.
+  if ($('btn-run').disabled) return;
+  pressRun();
 });
+
+function clearRunFlight() {
+  if (flightWatchdog) { clearTimeout(flightWatchdog); flightWatchdog = null; }
+  runInFlight = false;
+  flightAwaited = false;
+  flightPending = false; // every exit path leaves the flags consistent
+  setRunButtonBusy(false);
+}
+
+/* The flight-window writer of #btn-run's dynamic state: spinner + disabled
+ * while a Run flight is open (before the lock shows in a snapshot), the
+ * static ▶ Start Processing label otherwise. Lock-driven paints belong to
+ * renderRunButton — the two never fight because renderRunButton defers
+ * while runInFlight. */
+function setRunButtonBusy(busy) {
+  var btn = $('btn-run');
+  if (busy) {
+    btn.disabled = true;
+    if (btn.setAttribute) btn.setAttribute('aria-busy', 'true');
+    btn.innerHTML = '<span class="wb-spin shrink-0" aria-hidden="true"></span> Processing…';
+  } else {
+    btn.disabled = false;
+    if (btn.removeAttribute) btn.removeAttribute('aria-busy');
+    btn.innerHTML = '▶ Start Processing';
+  }
+}
 
 /* ================= composer ================= */
 
@@ -1236,7 +1392,18 @@ es.addEventListener('history', function (e) {
   try { appendFeed(JSON.parse(e.data)); } catch (err) { /* malformed row: skip */ }
 });
 es.onopen = function () { $('feed-status').textContent = '● live'; $('feed-status').className = 'text-xs text-emerald-600'; };
-es.onerror = function () { $('feed-status').textContent = 'reconnecting…'; $('feed-status').className = 'text-xs text-amber-600'; };
+es.onerror = function () {
+  $('feed-status').textContent = 'reconnecting…';
+  $('feed-status').className = 'text-xs text-amber-600';
+  // SSE died mid-run: never leave the operator with a permanently disabled
+  // Run button — but only the awaited-202 state is cleared here. A drop
+  // while a POST is still pending must not defeat the no-double-fire guard
+  // (that POST's own handlers re-enable on 409/error, and the watchdog
+  // covers a 202 whose snapshot never arrives). A later press while the
+  // old drive still holds the lock lands in the (unchanged) busy-409 path,
+  // which is correct.
+  if (runInFlight && flightAwaited && !flightPending) clearRunFlight();
+};
 
 /* Header RUNNING clock: one interval, created once at init. Each status
  * event re-anchors the elapsed time from lock.ageMs (renderRunState); between
@@ -1248,23 +1415,32 @@ setInterval(function () {
   if (clock) clock.textContent = fmtMMSS(runAnchor.ageMs + (Date.now() - runAnchor.at));
 }, 1000);
 
-/* Bonus affordance: clicking the RUNNING pill scrolls to the glance row,
- * auto-expanding it first if it is collapsed (a display:none chip can neither
- * be scrolled to nor produce a visible wb-flash), then one-shot-flashes the
- * running item's chip (wb-flash, removed on animationend so a later click can
- * re-fire it). */
+/* Header pill click actions — one delegated listener on the permanent
+ * #run-state container (it survives every innerHTML re-render),
+ * dispatching on the state machine: RUNNING → the #26 glance
+ * expand/scroll/flash affordance; NEEDS REVIEW → scroll to the parking
+ * lot; PAUSED → pressRun() (the same shared path as the Run button, flight
+ * guard included). IDLE is an inert span and the stale text is
+ * informational — both are no-ops. */
 $('run-state').addEventListener('click', function () {
-  if (!runAnchor.running) return;
-  applyGlanceCollapsed(false); // expand before scroll/flash — order matters
-  var glance = $('glance');
-  if (glance.scrollIntoView) glance.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  (runAnchor.itemIds || []).forEach(function (id) {
-    var chip = glance.querySelector('[data-item-id="' + String(id) + '"]');
-    if (!chip) return;
-    chip.classList.remove('wb-flash');
-    chip.classList.add('wb-flash');
-    chip.addEventListener('animationend', function () { chip.classList.remove('wb-flash'); }, { once: true });
-  });
+  if (runStateKind === 'running') {
+    if (!runAnchor.running) return;
+    applyGlanceCollapsed(false); // expand before scroll/flash — order matters
+    var glance = $('glance');
+    if (glance.scrollIntoView) glance.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    (runAnchor.itemIds || []).forEach(function (id) {
+      var chip = glance.querySelector('[data-item-id="' + String(id) + '"]');
+      if (!chip) return;
+      chip.classList.remove('wb-flash');
+      chip.classList.add('wb-flash');
+      chip.addEventListener('animationend', function () { chip.classList.remove('wb-flash'); }, { once: true });
+    });
+  } else if (runStateKind === 'review') {
+    var lot = $('parking-lot');
+    if (lot.scrollIntoView) lot.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (runStateKind === 'paused') {
+    pressRun();
+  }
 });
 
 /* Instant paint ahead of the first SSE snapshot (identical shared payload). */
