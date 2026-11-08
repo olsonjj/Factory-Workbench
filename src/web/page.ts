@@ -16,6 +16,13 @@
  * inner script deliberately uses string concatenation, never template
  * literals, so nothing inside needs escaping from the surrounding TS literal.
  *
+ * The item detail overlay (see specs/wb-serve-item-overlay.md) renders item
+ * and artifact markdown through a minimal hand-written renderer that is
+ * escaped-first and fail-closed: raw markdown text goes through esc() before
+ * any span recognition, and link targets are scheme-restricted to http:,
+ * https:, and relative paths — a hostile item file or artifact can never
+ * execute anything in the page.
+ *
  * XSS discipline (KB 2026-10-27 22:00 — the browser is an interpreter):
  * every untrusted string (titles, feedback, questions, reasons, artifact
  * names, repo paths, slugs from the stream) goes through `esc()` at the
@@ -336,6 +343,12 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   }
   .cursor-pointer { cursor: pointer; }
   .accent-indigo-600 { accent-color: #4f46e5; }
+  /* Item detail overlay: fixed, z-60 (above #toast's z-50 so the overlay
+   * covers the toast zone), backdrop-blurred, independently scrollable so
+   * long specs stay readable. The panel reuses the shadow-lg stack and the
+   * max-w-3xl width vocabulary. */
+  .wb-overlay { position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 60; background: rgba(28, 25, 23, .45); backdrop-filter: blur(8px); display: flex; align-items: flex-start; justify-content: center; overflow-y: auto; padding: 2.5rem 1rem; }
+  .wb-overlay-panel { background: #fff; border-radius: 16px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, .1), 0 4px 6px -4px rgba(0, 0, 0, .1); width: 100%; max-width: 48rem; }
 
 /* ---- important / hover variants ---- */
   .\\!bg-red-600 { background-color: #dc2626 !important; }
@@ -428,6 +441,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   </div>
 </main>
 
+<div id="item-overlay" class="wb-overlay hidden" role="dialog" aria-modal="true" aria-label="work item detail"></div>
 <div id="toast" class="hidden fixed top-4 left-1/2 -translate-x-1/2 z-50 rounded-lg bg-ink-950 text-white text-sm px-4 py-2 shadow-lg"></div>
 
 <script>
@@ -989,7 +1003,7 @@ function renderGlance(p) {
       '<span class="text-ink-400">' + esc(it.stage || '') + '</span>' + hint + pr + '</div>';
   }).join('');
   var inbox = (p.inbox.claimable || []).map(function (f) {
-    return '<div class="rounded-md border border-dashed border-ink-300 bg-white/50 px-2.5 py-1 text-xs font-mono text-ink-500">📄 ' + esc(f) + '</div>';
+    return '<div data-inbox-file="' + esc(f) + '" class="rounded-md border border-dashed border-ink-300 bg-white/50 px-2.5 py-1 text-xs font-mono text-ink-500 cursor-pointer" title="view this inbox file">📄 ' + esc(f) + '</div>';
   }).join('');
   var skipped = (p.inbox.alreadyClaimed || []).map(function (s) {
     return '<div class="text-[11px] text-ink-400">⚠ ' + esc(s.file) + ' will be skipped — slug already claimed (#' + s.item.id + ', ' + esc(s.item.status) + ')</div>';
@@ -1243,10 +1257,23 @@ function appendFeed(row) {
  * container's innerHTML on every changed payload, so a listener on the
  * generated summary button would not survive the next status event. The
  * summary is a <button type="button">, so Enter/Space synthesize the same
- * click — no separate keydown path. */
+ * click — no separate keydown path. The same delegated listener is also the
+ * item-detail overlay's glance entry point: a chip click ([data-item-id])
+ * or a claimable inbox file click ([data-inbox-file]) opens the overlay. */
 $('glance').addEventListener('click', function (ev) {
-  if (!ev.target.closest('button[data-glance-summary]')) return;
-  applyGlanceCollapsed(!glanceCollapsed);
+  if (ev.target.closest && ev.target.closest('button[data-glance-summary]')) {
+    applyGlanceCollapsed(!glanceCollapsed);
+    return;
+  }
+  var chip = ev.target.closest && ev.target.closest('[data-item-id]');
+  if (chip) {
+    openItemOverlay('item', Number(chip.getAttribute('data-item-id')), ev.target);
+    return;
+  }
+  var inb = ev.target.closest && ev.target.closest('[data-inbox-file]');
+  if (inb) {
+    openItemOverlay('inbox', inb.getAttribute('data-inbox-file'), ev.target);
+  }
 });
 
 /* In-flight panel collapse toggle — delegated to the permanent #pulse
@@ -1260,16 +1287,30 @@ $('glance').addEventListener('click', function (ev) {
  * flightExplicit write-failure case) — newest user signal wins (flight-panel
  * spec D3). */
 $('pulse').addEventListener('click', function (ev) {
-  if (!ev.target.closest('button[data-flight-summary]')) return;
-  var collapsed = !flightCollapsed;
-  flightExplicit = collapsed; // session-sticky; beats even a stale stored pref when the write fails
-  try { localStorage.setItem(FLIGHT_PREF_KEY, collapsed ? 'collapsed' : 'open'); } catch (e) { /* storage unavailable: flightExplicit keeps the choice for the session */ }
-  applyFlightCollapsed(collapsed);
+  if (ev.target.closest && ev.target.closest('button[data-flight-summary]')) {
+    var collapsed = !flightCollapsed;
+    flightExplicit = collapsed; // session-sticky; beats even a stale stored pref when the write fails
+    try { localStorage.setItem(FLIGHT_PREF_KEY, collapsed ? 'collapsed' : 'open'); } catch (e) { /* storage unavailable: flightExplicit keeps the choice for the session */ }
+    applyFlightCollapsed(collapsed);
+    return;
+  }
+  // Item-detail overlay entry: clicking an in-flight row opens its detail.
+  var row = ev.target.closest && ev.target.closest('div[data-flight-row]');
+  if (row) openItemOverlay('item', Number(row.getAttribute('data-flight-row')), ev.target);
 });
 
 $('parking-lot').addEventListener('click', function (ev) {
-  var btn = ev.target.closest('button[data-action]');
-  if (!btn) return;
+  var btn = ev.target.closest && ev.target.closest('button[data-action]');
+  if (!btn) {
+    // Item-detail overlay entry: a card click that did not originate inside
+    // an interactive control (button/input/textarea/label/anchor — an
+    // artifact link keeps its raw-link default). Never a write action.
+    var ctrl = ev.target.closest && ev.target.closest('button, input, textarea, label, a');
+    if (ctrl) return;
+    var card = ev.target.closest && ev.target.closest('[data-id]');
+    if (card) openItemOverlay('item', Number(card.getAttribute('data-id')), ev.target);
+    return;
+  }
   var card = btn.closest('[data-id]');
   var id = card.getAttribute('data-id');
   var action = btn.getAttribute('data-action');
@@ -1299,6 +1340,399 @@ $('parking-lot').addEventListener('click', function (ev) {
     if (!fb) { showCardError(card, 'write some feedback first'); return; }
     act('/api/items/' + id + '/answer', { feedback: fb }, card);
   }
+});
+
+/* ================= item detail overlay ================= */
+
+/* Point-in-time item inspection (spec §Item detail overlay). The overlay
+ * lives in the static #item-overlay container — present once in the body
+ * markup, OUTSIDE every innerHTML re-rendered region — so a live SSE
+ * snapshot re-render neither closes nor corrupts an open overlay, and the
+ * open state stays per-tab (module-level page state in the
+ * glanceCollapsed/flightCollapsed vocabulary, never persisted). Opening
+ * triggers exactly one lazy fetch (the SSE snapshot stays lean); closing
+ * discards all fetched state — reopening refetches. */
+var overlayState = null;
+var overlaySeq = 0; // monotonic per-open token: stale in-flight responses are ignored
+var TB = String.fromCharCode(96); // backtick, kept out of this source literal
+
+/* ---- minimal markdown renderer (escaped-first, fail-closed) ----
+ * Block pass: fenced code blocks, h1–h4, horizontal rules, blockquotes,
+ * ul/ol, paragraphs — one level only (nested constructs render as plain
+ * text). Span pass: every text run is esc()'d BEFORE any markup is
+ * recognized, so no tag can materialize except the ones emitted here — raw
+ * HTML in the source markdown renders inert. Link targets are additionally
+ * restricted to http:, https:, and relative paths; a javascript: or data:
+ * target drops the anchor outright and the bracket title renders as plain
+ * text. Every emitted anchor carries target="_blank" rel="noopener". */
+function renderBoldItalic(s) {
+  var out = s;
+  out = out.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+  out = out.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  out = out.replace(/\\*([^*]+)\\*/g, '<em>$1</em>');
+  out = out.replace(/(^|[^A-Za-z0-9])_([^_]+)_(?=$|[^A-Za-z0-9])/g, '$1<em>$2</em>');
+  return out;
+}
+
+function safeLinkTarget(t) {
+  var raw = String(t == null ? '' : t).trim();
+  var s = raw.toLowerCase();
+  if (s.length === 0) return null;
+  if (s.indexOf('https:') === 0 || s.indexOf('http:') === 0) return raw;
+  if (s.indexOf(':') !== -1) return null; // javascript:, data:, any other scheme — dropped outright
+  return raw; // relative path (no ':' scheme)
+}
+
+function renderLinks(s) {
+  var out = '';
+  var last = 0;
+  var re = /\\[([^\\]]*)\\]\\(([^)]*)\\)/g;
+  var m;
+  while ((m = re.exec(s)) !== null) {
+    out += renderBoldItalic(s.slice(last, m.index));
+    var target = safeLinkTarget(m[2]);
+    out += target === null
+      ? renderBoldItalic(m[0]) // dropped scheme: the bracket title renders as plain text
+      : '<a href="' + target + '" target="_blank" rel="noopener" class="text-blue-700 underline underline-offset-2">' + renderBoldItalic(m[1]) + '</a>';
+    last = m.index + m[0].length;
+  }
+  return out + renderBoldItalic(s.slice(last));
+}
+
+function renderSpans(escaped) {
+  var s = String(escaped == null ? '' : escaped);
+  var parts = s.split(TB);
+  if (parts.length % 2 === 0) {
+    // unbalanced backtick: the trailing segment renders literally
+    var tail = parts.pop();
+    if (parts.length > 0) parts[parts.length - 1] += TB + tail;
+    else parts.push(tail);
+  }
+  var out = '';
+  for (var k = 0; k < parts.length; k++) {
+    // odd segments are inline code: content already escaped, excluded from
+    // every further span treatment
+    out += (k % 2 === 1)
+      ? '<code class="bg-ink-100 rounded px-1 font-mono text-xs">' + parts[k] + '</code>'
+      : renderLinks(parts[k]);
+  }
+  return out;
+}
+
+function renderMarkdown(md) {
+  var lines = String(md == null ? '' : md).split('\\n');
+  var n = lines.length;
+  var out = [];
+  var para = [];
+  var i = 0;
+  function flushPara() {
+    if (para.length > 0) {
+      out.push('<p class="text-sm leading-relaxed mt-2">' + renderSpans(esc(para.join(' '))) + '</p>');
+      para = [];
+    }
+  }
+  while (i < n) {
+    var line = lines[i];
+    var t = line.trim();
+    if (t.indexOf(TB + TB + TB) === 0) { // fenced code block (info string discarded)
+      flushPara();
+      i += 1;
+      var code = [];
+      while (i < n && lines[i].trim().indexOf(TB + TB + TB) !== 0) { code.push(lines[i]); i += 1; }
+      i += 1; // closing fence — or past the end: an unterminated fence makes the rest code
+      out.push('<pre class="font-mono text-xs whitespace-pre-wrap bg-ink-100 rounded-md p-2.5 mt-2 overflow-x-auto"><code>' + esc(code.join('\\n')) + '</code></pre>');
+      continue;
+    }
+    if (/^([-*_])\\1{2,}$/.test(t)) { // horizontal rule (3+ of one marker char)
+      flushPara();
+      out.push('<hr class="border-t border-ink-200 mt-3">');
+      i += 1;
+      continue;
+    }
+    var h = /^(#{1,4})\\s+(.*)$/.exec(line); // h1–h4; ##### is NOT a heading
+    if (h) {
+      flushPara();
+      var tag = 'h' + h[1].length;
+      var cls = h[1].length === 1 ? 'text-lg' : 'text-sm';
+      out.push('<' + tag + ' class="' + cls + ' font-semibold mt-3">' + renderSpans(esc(h[2])) + '</' + tag + '>');
+      i += 1;
+      continue;
+    }
+    if (t.charAt(0) === '>') { // blockquote run (one '>' stripped per line)
+      flushPara();
+      var quote = [];
+      while (i < n && lines[i].trim().charAt(0) === '>') {
+        quote.push(lines[i].trim().replace(/^>\\s?/, ''));
+        i += 1;
+      }
+      out.push('<blockquote class="border-l-2 border-ink-300 pl-3 text-ink-600 mt-2 text-sm">' + renderSpans(esc(quote.join(' '))) + '</blockquote>');
+      continue;
+    }
+    if (/^\\s*[-*]\\s+/.test(line)) { // unordered list
+      flushPara();
+      var items = [];
+      while (i < n && /^\\s*[-*]\\s+/.test(lines[i])) {
+        items.push('<li class="mt-1">' + renderSpans(esc(lines[i].replace(/^\\s*[-*]\\s+/, ''))) + '</li>');
+        i += 1;
+      }
+      out.push('<ul class="list-disc pl-5 mt-2 text-sm">' + items.join('') + '</ul>');
+      continue;
+    }
+    if (/^\\s*\\d+[.)]\\s+/.test(line)) { // ordered list
+      flushPara();
+      var nums = [];
+      while (i < n && /^\\s*\\d+[.)]\\s+/.test(lines[i])) {
+        nums.push('<li class="mt-1">' + renderSpans(esc(lines[i].replace(/^\\s*\\d+[.)]\\s+/, ''))) + '</li>');
+        i += 1;
+      }
+      out.push('<ol class="list-decimal pl-5 mt-2 text-sm">' + nums.join('') + '</ol>');
+      continue;
+    }
+    if (t === '') { flushPara(); i += 1; continue; }
+    para.push(t);
+    i += 1;
+  }
+  flushPara();
+  return out.join('');
+}
+
+/* ---- overlay state machine ---- */
+
+function overlayPanel(inner) {
+  return '<div class="wb-overlay-panel" data-overlay-panel>' + inner + '</div>';
+}
+
+function overlayHeading(label) {
+  return '<div class="text-[11px] font-semibold uppercase tracking-widest text-ink-400 mt-5 mb-2">' + esc(label) + '</div>';
+}
+
+function showOverlayLoading() {
+  $('item-overlay').innerHTML = overlayPanel(
+    '<div class="p-8 flex items-center justify-center gap-3 text-sm text-ink-500">' +
+    '<span class="wb-spin" aria-hidden="true"></span>Loading…</div>');
+}
+
+function showOverlayError(msg) {
+  $('item-overlay').innerHTML = overlayPanel(
+    '<div class="p-5">' +
+    '<div class="flex items-start justify-between gap-3">' +
+    '<div class="text-sm text-red-700">' + esc(msg) + '</div>' +
+    '<button type="button" data-overlay-close class="btn btn-out shrink-0" title="close (Esc)">✕</button></div>' +
+    '<button type="button" data-overlay-retry class="btn btn-out mt-3">Retry</button>' +
+    '</div>');
+  focusOverlayClose();
+}
+
+function showOverlayInboxReady(file, text) {
+  $('item-overlay').innerHTML = overlayPanel(
+    '<div class="p-5">' +
+    '<div class="flex items-start justify-between gap-3">' +
+    '<div class="min-w-0"><h3 class="font-semibold text-lg leading-tight">📄 ' + esc(file) + '</h3>' +
+    '<div class="text-xs text-ink-400 mt-0.5">unclaimed inbox item</div></div>' +
+    '<button type="button" data-overlay-close class="btn btn-out shrink-0" title="close (Esc)">✕</button>' +
+    '</div>' +
+    '<div class="mt-4">' + renderMarkdown(text) + '</div>' +
+    '</div>');
+  focusOverlayClose();
+}
+
+function showOverlayReady(d) {
+  var it = (d && d.item) || {};
+  var det = it.parkedDetail || {};
+  var header =
+    '<div class="flex items-start justify-between gap-3">' +
+    '<div class="min-w-0">' +
+    '<h3 class="font-semibold text-lg leading-tight">#' + it.id + ' ' + esc(it.title) + '</h3>' +
+    '<div class="text-xs text-ink-500 mt-0.5 font-mono">' + esc(it.slug) + ' · ' + esc(it.repo) + ' · ' + esc(it.base) + ' · ' + esc(it.branchName || 'no branch yet') + '</div>' +
+    (it.prUrl ? '<div class="text-xs mt-1"><a href="' + esc(it.prUrl) + '" target="_blank" rel="noopener" class="text-emerald-700 underline underline-offset-2">PR' + (it.prDraft ? ' (draft)' : '') + '</a></div>' : '') +
+    '</div>' +
+    '<div class="flex items-center gap-2 shrink-0">' + statusPill(it) +
+    '<button type="button" data-overlay-close class="btn btn-out" title="close (Esc)">✕</button></div>' +
+    '</div>';
+  var rec = '<div class="mt-3 text-xs space-y-2">' +
+    '<div class="text-ink-500 font-mono">stage: ' + esc(it.stage || '—') + '</div>';
+  if (it.approvals && it.approvals.length) rec += '<div class="text-ink-500 font-mono">approvals: ' + esc(it.approvals.join(', ')) + '</div>';
+  var ga = '';
+  var attempts = it.gateAttempts || {};
+  for (var s in attempts) { if (attempts.hasOwnProperty(s)) { if (ga) ga += ', '; ga += s + '=' + attempts[s]; } }
+  if (ga) rec += '<div class="text-ink-500 font-mono">gate attempts: ' + esc(ga) + '</div>';
+  if (it.infraAttempts > 0) rec += '<div class="text-ink-500 font-mono">infra retries: ' + it.infraAttempts + '</div>';
+  rec += '<div class="text-ink-400 font-mono">created ' + esc(it.createdAt || '') + ' · updated ' + esc(it.updatedAt || '') + '</div>';
+  if (it.parkedReason) rec += '<div class="text-ink-500 font-mono">parked: ' + esc(it.parkedReason) + '</div>';
+  if (typeof det.stage === 'string' && det.stage !== it.stage) rec += '<div class="text-ink-500 font-mono">completed stage: ' + esc(det.stage) + '</div>';
+  if (typeof det.error === 'string') rec += '<div class="text-orange-700 bg-orange-50 border border-orange-200 rounded-md p-2.5 font-mono whitespace-pre-wrap">' + esc(det.error) + '</div>';
+  if (Array.isArray(det.questions) && det.questions.length) {
+    rec += '<div class="space-y-1">' + det.questions.map(function (q) {
+      return '<div class="text-ink-700"><span class="text-violet-600 font-semibold">Q</span> ' + esc(q) + '</div>';
+    }).join('') + '</div>';
+  }
+  if (it.parkedReason === 'stale-base' && typeof det.base === 'string' && typeof det.repo === 'string') {
+    rec += '<div class="text-amber-800">⚑ stale base — git pull in ' + esc(det.repo) + ' (' + esc(det.base) + ' is behind origin/' + esc(det.base) + ')</div>';
+  }
+  if (it.answers && it.answers.length) {
+    rec += '<div class="space-y-1">' + it.answers.map(function (pair) {
+      return '<div class="text-ink-700"><span class="text-violet-600 font-semibold">Q</span> ' + esc(pair.question) + ' — ' + esc(pair.answer) + '</div>';
+    }).join('') + '</div>';
+  }
+  rec += feedbackBox(it.feedback);
+  rec += '</div>' + stageDots(it);
+  var specHtml = '';
+  if (!d.spec) {
+    specHtml = '<div class="text-xs text-ink-400">no spec artifact yet</div>';
+  } else {
+    specHtml = '<div class="text-xs text-ink-500 font-mono mb-2">' + esc(d.spec.name) + ' · ' + esc(d.spec.createdAt) +
+      ' · <a href="/api/artifact?path=' + encodeURIComponent(d.spec.path) + '" target="_blank" rel="noopener" class="text-blue-700 underline underline-offset-2">view raw</a></div>';
+    if (d.spec.content === null || d.spec.content === undefined) {
+      specHtml += '<div class="text-xs text-ink-400">(' + esc(d.spec.error || 'file unreadable') + ')</div>';
+    } else {
+      specHtml += '<div class="mt-2">' + renderMarkdown(d.spec.content) + '</div>';
+    }
+  }
+  var artsHtml = '';
+  if (!d.artifacts || d.artifacts.length === 0) {
+    artsHtml = '<div class="text-xs text-ink-400">no artifacts yet</div>';
+  } else {
+    artsHtml = '<div class="space-y-1">' + d.artifacts.map(function (a) {
+      return '<div class="flex items-center gap-2 flex-wrap text-xs">' +
+        '<span class="font-mono">' + esc(a.name) + ' · ' + esc(a.stage || '—') + ' · ' + esc(a.createdAt) + '</span>' +
+        '<a href="/api/artifact?path=' + encodeURIComponent(a.path) + '" target="_blank" rel="noopener" class="text-blue-700 underline underline-offset-2">View raw</a>' +
+        '<button type="button" data-overlay-artifact="' + esc(a.path) + '" class="btn btn-out">View</button>' +
+        '</div>';
+    }).join('') + '</div>' +
+    '<div id="overlay-artifact-body" class="mt-2"></div>';
+  }
+  var srcHtml = '';
+  if (!d.source) {
+    srcHtml = '<div class="text-xs text-ink-400">no source file recorded</div>';
+  } else {
+    srcHtml = '<div class="text-xs text-ink-500 font-mono mb-2">' + esc(d.source.path) +
+      ' · <a href="/api/artifact?path=' + encodeURIComponent(d.source.path) + '" target="_blank" rel="noopener" class="text-blue-700 underline underline-offset-2">view raw</a></div>';
+    if (d.source.content === null || d.source.content === undefined) {
+      srcHtml += '<div class="text-xs text-ink-400">(' + esc(d.source.error || 'file unreadable') + ')</div>';
+    } else {
+      srcHtml += '<pre class="font-mono text-xs whitespace-pre-wrap bg-ink-100 rounded-md p-2.5 overflow-x-auto">' + esc(d.source.content) + '</pre>';
+    }
+  }
+  $('item-overlay').innerHTML = overlayPanel(
+    '<div class="p-5">' + header + rec +
+    overlayHeading('Spec') + specHtml +
+    overlayHeading('Artifacts') + artsHtml +
+    overlayHeading('Source') + srcHtml +
+    '</div>');
+  focusOverlayClose();
+}
+
+/* Move focus into the overlay so keyboard flow continues inside it (the
+ * close control is the natural anchor); the stub harness's querySelector is
+ * null, so the call is skipped there. */
+function focusOverlayClose() {
+  var btn = $('item-overlay').querySelector('button[data-overlay-close]');
+  if (btn && typeof btn.focus === 'function') btn.focus();
+}
+
+function closeOverlay() {
+  var st = overlayState;
+  overlayState = null; // closing discards all fetched state — reopening refetches
+  var el = $('item-overlay');
+  el.classList.add('hidden');
+  el.innerHTML = '';
+  if (st && st.opener && typeof st.opener.focus === 'function') st.opener.focus();
+}
+
+function openItemOverlay(mode, key, openerHint) {
+  var active = document.activeElement;
+  var opener = null;
+  if (active && typeof active === 'object') opener = active;
+  else if (openerHint && typeof openerHint === 'object') opener = openerHint;
+  var seq = ++overlaySeq;
+  overlayState = { mode: mode, key: key, seq: seq, opener: opener, phase: 'loading' };
+  var el = $('item-overlay');
+  el.classList.remove('hidden');
+  showOverlayLoading();
+  if (mode === 'item') {
+    fetch('/api/items/' + encodeURIComponent(String(key))).then(function (res) {
+      if (!overlayState || overlayState.seq !== seq) return;
+      if (!res.ok) { overlayState.phase = 'error'; showOverlayError('HTTP ' + res.status); return; }
+      res.json().then(function (data) {
+        if (!overlayState || overlayState.seq !== seq) return;
+        overlayState.phase = 'ready';
+        overlayState.data = data;
+        showOverlayReady(data);
+      }, function () {
+        if (!overlayState || overlayState.seq !== seq) return;
+        overlayState.phase = 'error';
+        showOverlayError('the detail response could not be read');
+      });
+    }, function () {
+      if (!overlayState || overlayState.seq !== seq) return;
+      overlayState.phase = 'error';
+      showOverlayError('the detail request failed');
+    });
+  } else {
+    fetch('/api/artifact?path=' + encodeURIComponent('inbox/' + key)).then(function (res) {
+      if (!overlayState || overlayState.seq !== seq) return;
+      if (!res.ok) { overlayState.phase = 'error'; showOverlayError('HTTP ' + res.status); return; }
+      res.text().then(function (text) {
+        if (!overlayState || overlayState.seq !== seq) return;
+        overlayState.phase = 'ready';
+        overlayState.text = text;
+        showOverlayInboxReady(key, text);
+      }, function () {
+        if (!overlayState || overlayState.seq !== seq) return;
+        overlayState.phase = 'error';
+        showOverlayError('the file could not be read');
+      });
+    }, function () {
+      if (!overlayState || overlayState.seq !== seq) return;
+      overlayState.phase = 'error';
+      showOverlayError('the file request failed');
+    });
+  }
+}
+
+/* Inline artifact view: one fetch through the hardened artifact route,
+ * rendered through the same markdown renderer (logs land in fenced/plain
+ * text — everything the route serves is markdown). */
+function loadOverlayArtifact(rel) {
+  var body = $('overlay-artifact-body');
+  if (!body) return;
+  body.innerHTML = '<div class="text-xs text-ink-400"><span class="wb-spin" aria-hidden="true"></span> loading…</div>';
+  fetch('/api/artifact?path=' + encodeURIComponent(rel)).then(function (res) {
+    if (!res.ok) {
+      body.innerHTML = '<div class="text-red-700 text-xs">' + esc('artifact unavailable (HTTP ' + res.status + ') — it may have been removed') + '</div>';
+      return;
+    }
+    res.text().then(function (text) {
+      body.innerHTML = '<div class="mt-1">' + renderMarkdown(text) + '</div>';
+    }, function () {
+      body.innerHTML = '<div class="text-red-700 text-xs">artifact unavailable — the file could not be read</div>';
+    });
+  }, function () {
+    body.innerHTML = '<div class="text-red-700 text-xs">artifact unavailable — the request failed</div>';
+  });
+}
+
+/* Overlay interactions — one delegated click listener on the permanent
+ * #item-overlay container (never re-rendered), plus one document keydown
+ * for Esc installed once here. Backdrop dismissal: a click that did not
+ * originate inside the panel closes the overlay. */
+$('item-overlay').addEventListener('click', function (ev) {
+  var t = ev.target;
+  if (!t) return;
+  if (t.closest && t.closest('button[data-overlay-close]')) { closeOverlay(); return; }
+  if (t.closest && t.closest('button[data-overlay-retry]')) {
+    var st = overlayState;
+    if (st) openItemOverlay(st.mode, st.key, st.opener);
+    return;
+  }
+  var art = t.closest && t.closest('[data-overlay-artifact]');
+  if (art) { loadOverlayArtifact(art.getAttribute('data-overlay-artifact')); return; }
+  var panel = t.closest ? t.closest('[data-overlay-panel]') : null;
+  if (!panel) closeOverlay();
+});
+
+document.addEventListener('keydown', function (ev) {
+  if (ev && ev.key === 'Escape' && overlayState) closeOverlay();
 });
 
 /* ================= header: Start Processing ================= */

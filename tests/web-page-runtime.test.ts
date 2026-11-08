@@ -81,6 +81,9 @@ function makeStubElement(): StubElement {
 /** Script context stubs: elements auto-vivify per id (one per id, browser-like), and the fetch/EventSource pair is handed to the test. */
 function makeContext() {
   const elements = new Map<string, StubElement>();
+  /** Document-level listeners (e.g. the overlay's Esc keydown), captured so
+   *  tests can dispatch synthetic events exactly like the browser would. */
+  const documentListeners = new Map<string, Array<(ev: unknown) => void>>();
   const document = {
     getElementById: (id: string) => {
       let el = elements.get(id);
@@ -91,7 +94,11 @@ function makeContext() {
       return el;
     },
     querySelector: () => null,
-    addEventListener: () => {},
+    addEventListener: (t: string, fn: (ev: unknown) => void) => {
+      const fns = documentListeners.get(t) ?? [];
+      fns.push(fn);
+      documentListeners.set(t, fns);
+    },
   };
 
   /** Persistent per-context localStorage: the page's flight-panel preference
@@ -197,13 +204,19 @@ function makeContext() {
         (fn as (ev: { target: unknown }) => void)({ target: evTarget ?? el });
       }
     },
+    /** Dispatch a captured document-level listener (e.g. the overlay's Esc
+     * keydown) — the same call the browser makes for a real key press. */
+    dispatchDocument: (t: string, ev: unknown) => {
+      for (const fn of documentListeners.get(t) ?? []) fn(ev);
+    },
     /** Let the script's `refreshStatus()` promise (and any .then) settle.
      * The optional responder resolves per-URL — the POST `/api/run` cases
      * need a real `status` field (202/409), which the generic IDLE-shaped
-     * default (no `status`) cannot express. Unhandled URLs fall back to the
-     * default. */
+     * default (no `status`) cannot express; overlay fetches need `text()`
+     * for the artifact-route (markdown) responses. Unhandled URLs fall
+     * back to the default. */
     settle: async (respond?: (url: string) => unknown) => {
-      const def = { ok: true, json: async () => IDLE_PAYLOAD };
+      const def = { ok: true, status: 200, json: async () => IDLE_PAYLOAD, text: async () => "" };
       for (const f of fetches.splice(0)) f.resolve(respond ? respond(f.url) ?? def : def);
       await new Promise((r) => setTimeout(r, 10));
     },
@@ -1377,5 +1390,371 @@ describe("wb serve page script (runtime behavior)", () => {
     const pulse = ctx.el("pulse").innerHTML;
     expect(pulse).toMatch(/id="flight-body"[^>]*\bhidden\b/);
     expect(pulse).toContain('aria-expanded="false"');
+  });
+
+  /* ---------- item detail overlay (specs/wb-serve-item-overlay.md):
+   * open/close/focus/SSE-coexistence/error+retry and the escaped-first
+   * markdown renderer, all through the page seam. ---------- */
+
+  /** Fake targets for the delegated entry clicks: each implements `closest`
+   * itself (the established pattern) and answers only the selector(s) the
+   * handler under test probes. */
+  const FLIGHT_ROW_TARGET = {
+    closest: (sel: string) => (sel === "div[data-flight-row]" ? { getAttribute: () => "11" } : null),
+  };
+  const CARD_TARGET = {
+    closest: (sel: string) => (sel === "[data-id]" ? { getAttribute: () => "20" } : null),
+  };
+  const GLANCE_CHIP_TARGET = {
+    closest: (sel: string) => (sel === "[data-item-id]" ? { getAttribute: () => "13" } : null),
+  };
+  const INBOX_ROW_TARGET = {
+    closest: (sel: string) => (sel === "[data-inbox-file]" ? { getAttribute: () => "a.md" } : null),
+  };
+  const OVERLAY_CLOSE_TARGET = {
+    closest: (sel: string) => (sel === "button[data-overlay-close]" ? {} : null),
+  };
+  const OVERLAY_RETRY_TARGET = {
+    closest: (sel: string) => (sel === "button[data-overlay-retry]" ? {} : null),
+  };
+  const OVERLAY_ARTIFACT_TARGET = {
+    closest: (sel: string) => (sel === "[data-overlay-artifact]" ? { getAttribute: () => "items/alpha/artifacts/20261108-090500-001-implement.md" } : null),
+  };
+  const BACKDROP_TARGET = { closest: () => null };
+  const PANEL_INSIDE_TARGET = {
+    closest: (sel: string) => (sel === "[data-overlay-panel]" ? {} : null),
+  };
+  /** A card click that originates on an action button: handled by the action
+   *  branch (never opens the overlay). The fake card carries just enough for
+   *  the harmless reject-cancel action to complete. */
+  const ACTION_TARGET = {
+    closest: (sel: string) => {
+      if (sel !== "button[data-action]") return null;
+      return {
+        getAttribute: () => "reject-cancel",
+        closest: () => ({
+          getAttribute: () => "20",
+          querySelector: () => ({ classList: { add: () => {}, remove: () => {} } }),
+        }),
+      };
+    },
+  };
+  const INTERACTIVE_CONTROL_TARGET = {
+    closest: (sel: string) => (sel === "button, input, textarea, label, a" ? {} : null),
+  };
+
+  const RUNNING_ALPHA = payload(
+    [{ id: 11, slug: "alpha", title: "Alpha spec title", repo: "Code/factory-1", stage: "implement", status: "running" }],
+    null,
+  );
+
+  const DETAIL = {
+    item: {
+      id: 11, slug: "alpha", title: "Alpha spec title", repo: "Code/factory-1", base: "main",
+      approvals: ["review"], stage: "implement", status: "running", parkedReason: null,
+      parkedDetail: null, feedback: null, answers: [], sourceFile: "/x/items/alpha/item.md",
+      branchName: "factory/alpha", gateAttempts: { test: 2 }, infraAttempts: 1,
+      createdAt: "2026-11-08T09:00:00.000Z", updatedAt: "2026-11-08T09:05:00.000Z",
+    },
+    artifacts: [
+      { name: "spec", stage: "spec", path: "items/alpha/artifacts/20261108-090000-000-spec.md", createdAt: "2026-11-08T09:00:00.000Z" },
+      { name: "implement-log", stage: "implement", path: "items/alpha/artifacts/20261108-090500-001-implement.md", createdAt: "2026-11-08T09:05:00.000Z" },
+    ],
+    spec: {
+      stage: "spec", name: "spec", path: "items/alpha/artifacts/20261108-090000-000-spec.md",
+      createdAt: "2026-11-08T09:00:00.000Z", content: "# Spec title\n\n- one\n- two\n",
+    },
+    source: { path: "items/alpha/item.md", content: "---\ntitle: Alpha\n---\n\nBody." },
+  };
+
+  const DETAIL_RESPONSE = { ok: true, status: 200, json: async () => DETAIL, text: async () => "" };
+
+  /** Fresh context with the overlay container's static `hidden` state seeded
+   *  onto the stub (the stub never parses the served markup, so a class
+   *  assertion would be vacuous without it — the syncGlanceBodyFromMarkup
+   *  discipline). */
+  async function makeOverlayContext() {
+    const ctx = makeContext();
+    ctx.el("item-overlay").classList.add("hidden");
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    return ctx;
+  }
+
+  it("opens the overlay from a flight row: loading shell, exactly one fetch, then the ready pane", async () => {
+    const ctx = await makeOverlayContext();
+    ctx.fire("status", RUNNING_ALPHA);
+    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    const overlay = ctx.el("item-overlay");
+    expect(overlay.classList.contains("hidden")).toBe(false);
+    expect(overlay.innerHTML).toContain("wb-spin");
+    expect(overlay.innerHTML).toContain("Loading…");
+    expect(ctx.countRequests("/api/items/11")).toBe(1);
+    await ctx.settle((url) => (url === "/api/items/11" ? DETAIL_RESPONSE : undefined));
+    const html = overlay.innerHTML;
+    // header: id + title, slug/repo/base/branch, status pill, close control
+    expect(html).toContain("#11 Alpha spec title");
+    expect(html).toContain("alpha · Code/factory-1 · main · factory/alpha");
+    expect(html).toContain("bg-blue-50 text-blue-700 ring-blue-200"); // running pill palette
+    expect(html).toContain("data-overlay-close");
+    // record grid: stage, approvals, gate attempts, infra retries, timestamps
+    expect(html).toContain("stage: implement");
+    expect(html).toContain("approvals: review");
+    expect(html).toContain("gate attempts: test=2");
+    expect(html).toContain("infra retries: 1");
+    expect(html).toContain("created 2026-11-08T09:00:00.000Z · updated 2026-11-08T09:05:00.000Z");
+    // spec section: name + timestamp, raw link, rendered markdown content
+    expect(html).toContain(">Spec</div>");
+    expect(html).toContain("spec · 2026-11-08T09:00:00.000Z");
+    expect(html).toContain("/api/artifact?path=items%2Falpha%2Fartifacts%2F20261108-090000-000-spec.md");
+    expect(html).toContain('<h1 class="text-lg font-semibold mt-3">Spec title</h1>');
+    expect(html).toContain('<ul class="list-disc pl-5 mt-2 text-sm"><li class="mt-1">one</li><li class="mt-1">two</li></ul>');
+    // artifacts section: every row + View raw + inline View control
+    expect(html).toContain(">Artifacts</div>");
+    expect(html).toContain("implement-log · implement · 2026-11-08T09:05:00.000Z");
+    expect(html).toContain('data-overlay-artifact="items/alpha/artifacts/20261108-090500-001-implement.md"');
+    expect(html).toContain("id=\"overlay-artifact-body\"");
+    // source section: raw link + verbatim escaped content (front-matter included)
+    expect(html).toContain(">Source</div>");
+    expect(html).toContain("items/alpha/item.md");
+    expect(html).toContain("---\ntitle: Alpha\n---");
+  });
+
+  it("opens the overlay from a parked card and a glance chip; action/control clicks never open it", async () => {
+    const ctx = await makeOverlayContext();
+    const PARKED = payload(
+      [{ id: 20, slug: "approve-me", title: "Approve me", stage: "spec", status: "awaiting-approval" }],
+      null,
+    );
+    PARKED.counts.decisions = 1;
+    ctx.fire("status", PARKED);
+    ctx.click("parking-lot", CARD_TARGET);
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);
+    expect(ctx.countRequests("/api/items/20")).toBe(1);
+    await ctx.settle((url) => (url === "/api/items/20" ? DETAIL_RESPONSE : undefined));
+    ctx.dispatchDocument("keydown", { key: "Escape" });
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(true);
+
+    // glance chip: same overlay, keyed by the chip's item id
+    ctx.fire("status", payload([{ id: 13, slug: "gamma", status: "done", prUrl: "https://github.com/x/y/pull/9" }], null));
+    ctx.click("glance", GLANCE_CHIP_TARGET);
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);
+    expect(ctx.countRequests("/api/items/13")).toBe(1);
+    await ctx.settle((url) => (url === "/api/items/13" ? { ok: true, status: 200, json: async () => DETAIL, text: async () => "" } : undefined));
+    ctx.dispatchDocument("keydown", { key: "Escape" });
+
+    // negative controls: an action button, an interactive control, and the
+    // glance summary toggle never open the overlay
+    ctx.fire("status", PARKED);
+    ctx.click("parking-lot", ACTION_TARGET);
+    ctx.click("parking-lot", INTERACTIVE_CONTROL_TARGET);
+    ctx.click("glance", SUMMARY_TARGET);
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(true);
+    expect(ctx.fetches).toHaveLength(0);
+  });
+
+  it("opens an unclaimed inbox file in inbox mode: artifact-route fetch, rendered markdown, filename header", async () => {
+    const ctx = await makeOverlayContext();
+    ctx.fire("status", payload([], null, { claimable: ["a.md"] }));
+    // the claimable row carries the click target attribute
+    expect(ctx.el("glance").innerHTML).toContain('data-inbox-file="a.md"');
+    ctx.click("glance", INBOX_ROW_TARGET);
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);
+    expect(ctx.countRequests("/api/artifact?path=inbox%2Fa.md")).toBe(1);
+    await ctx.settle((url) =>
+      url === "/api/artifact?path=inbox%2Fa.md"
+        ? { ok: true, status: 200, text: async () => "---\ntitle: Inbox item\n---\n\n## Goal\n\nShip it.\n" }
+        : undefined,
+    );
+    const html = ctx.el("item-overlay").innerHTML;
+    expect(html).toContain("📄 a.md");
+    expect(html).toContain("unclaimed inbox item");
+    expect(html).toContain('<h2 class="text-sm font-semibold mt-3">Goal</h2>');
+    expect(html).toContain("Ship it.");
+    // front-matter renders as plain text (--- separators as hr), never special-cased
+    expect(html).toContain("title: Inbox item");
+    expect(html).toContain('<hr class="border-t border-ink-200 mt-3">');
+  });
+
+  it("dismisses on Esc, backdrop click, and the close button — focus returns to the opener each time", async () => {
+    const ctx = await makeOverlayContext();
+    const focusLog: string[] = [];
+    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = {
+      focus: () => {
+        focusLog.push("opener");
+      },
+      closest: () => null,
+    };
+    ctx.fire("status", RUNNING_ALPHA);
+
+    // Esc
+    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);
+    ctx.dispatchDocument("keydown", { key: "Escape" });
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("item-overlay").innerHTML).toBe("");
+    expect(focusLog).toHaveLength(1);
+
+    // a non-Escape key never closes it
+    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    ctx.dispatchDocument("keydown", { key: "Enter" });
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);
+
+    // backdrop click (a click that did not originate inside the panel)
+    ctx.click("item-overlay", BACKDROP_TARGET);
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(true);
+    expect(focusLog).toHaveLength(2);
+
+    // the close button
+    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    ctx.click("item-overlay", OVERLAY_CLOSE_TARGET);
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(true);
+    expect(focusLog).toHaveLength(3);
+
+    // a click inside the panel body (an anchor, an artifact button, …) keeps it open
+    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    ctx.click("item-overlay", PANEL_INSIDE_TARGET);
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);
+    expect(focusLog).toHaveLength(3);
+    ctx.dispatchDocument("keydown", { key: "Escape" });
+  });
+
+  it("keeps an open overlay across a live SSE snapshot re-render (per-tab, point-in-time)", async () => {
+    const ctx = await makeOverlayContext();
+    ctx.fire("status", RUNNING_ALPHA);
+    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    await ctx.settle((url) => (url === "/api/items/11" ? DETAIL_RESPONSE : undefined));
+    const before = ctx.el("item-overlay").innerHTML;
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);
+
+    // a live status event re-renders the status-driven containers normally…
+    ctx.fire("status", MIXED_FLIGHT_PAYLOAD);
+    expect(ctx.el("pulse").innerHTML).toContain("In flight");
+    expect(ctx.el("pulse").innerHTML).toContain("Beta queued title");
+    expect(ctx.el("glance").innerHTML).toContain("Factory at a glance");
+    // …without touching the open overlay: same content, still open
+    expect(ctx.el("item-overlay").innerHTML).toBe(before);
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);
+
+    // and closing clears the fetched state: reopening refetches
+    ctx.dispatchDocument("keydown", { key: "Escape" });
+    expect(ctx.el("item-overlay").innerHTML).toBe("");
+    expect(ctx.totalRequests("/api/items/11")).toBe(1);
+    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    expect(ctx.totalRequests("/api/items/11")).toBe(2);
+    await ctx.settle((url) => (url === "/api/items/11" ? DETAIL_RESPONSE : undefined));
+  });
+
+  it("shows an inline error with a retry affordance on a failed fetch; retry re-issues exactly one fetch", async () => {
+    const ctx = await makeOverlayContext();
+    ctx.fire("status", RUNNING_ALPHA);
+    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    await ctx.settle((url) => (url === "/api/items/11" ? { ok: false, status: 500, json: async () => ({}), text: async () => "" } : undefined));
+    const html = ctx.el("item-overlay").innerHTML;
+    expect(html).toContain("HTTP 500");
+    expect(html).toContain("text-red-700");
+    expect(html).toContain("data-overlay-retry");
+
+    // retry: exactly one new fetch for the same key
+    expect(ctx.totalRequests("/api/items/11")).toBe(1);
+    ctx.click("item-overlay", OVERLAY_RETRY_TARGET);
+    expect(ctx.totalRequests("/api/items/11")).toBe(2);
+    expect(ctx.countRequests("/api/items/11")).toBe(1); // the retried fetch is the only pending one
+    await ctx.settle((url) => (url === "/api/items/11" ? DETAIL_RESPONSE : undefined));
+    expect(ctx.el("item-overlay").innerHTML).toContain("#11 Alpha spec title");
+  });
+
+  it("renders an artifact inline through the artifact route into the overlay's body region", async () => {
+    const ctx = await makeOverlayContext();
+    ctx.fire("status", RUNNING_ALPHA);
+    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    await ctx.settle((url) => (url === "/api/items/11" ? DETAIL_RESPONSE : undefined));
+    ctx.click("item-overlay", OVERLAY_ARTIFACT_TARGET);
+    expect(ctx.countRequests("/api/artifact?path=items%2Falpha%2Fartifacts%2F20261108-090500-001-implement.md")).toBe(1);
+    await ctx.settle((url) =>
+      url === "/api/artifact?path=items%2Falpha%2Fartifacts%2F20261108-090500-001-implement.md"
+        ? { ok: true, status: 200, text: async () => "# Log\n\nran 3 steps\n" }
+        : undefined,
+    );
+    const body = ctx.el("overlay-artifact-body").innerHTML;
+    expect(body).toContain('<h1 class="text-lg font-semibold mt-3">Log</h1>');
+    expect(body).toContain("ran 3 steps");
+
+    // a vanished artifact degrades to an inline error, never a broken page
+    ctx.click("item-overlay", OVERLAY_ARTIFACT_TARGET);
+    await ctx.settle((url) =>
+      url === "/api/artifact?path=items%2Falpha%2Fartifacts%2F20261108-090500-001-implement.md"
+        ? { ok: false, status: 404, text: async () => "" }
+        : undefined,
+    );
+    expect(ctx.el("overlay-artifact-body").innerHTML).toContain("artifact unavailable (HTTP 404)");
+  });
+
+  it("renders the spec through the escaped-first markdown renderer: hostile fixtures come out inert", async () => {
+    const ctx = await makeOverlayContext();
+    ctx.fire("status", RUNNING_ALPHA);
+    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    const hostile =
+      "# <script>alert(1)</script> heading\n\n" +
+      "- <img src=x onerror=alert(1)> item\n\n" +
+      "para with <script>alert(2)</script> inline\n\n" +
+      "[click](javascript:alert(1)) and [x](data:text/html,x)\n\n" +
+      "[ok](https://example.com/x) and [rel](docs/x.md)\n\n" +
+      "```\n<b>code block</b>\n```\n\n" +
+      "**bold** and *italic* and `code`\n\n" +
+      "## h2 title\n\n> quoted\n\n---\n\n1. first\n2. second\n";
+    await ctx.settle((url) =>
+      url === "/api/items/11"
+        ? { ok: true, status: 200, json: async () => ({ ...DETAIL, spec: { ...DETAIL.spec, content: hostile } }), text: async () => "" }
+        : undefined,
+    );
+    const html = ctx.el("item-overlay").innerHTML;
+    // no raw script/img tag anywhere in the rendered overlay
+    expect(html).not.toContain("<script>");
+    expect(html).not.toContain("<script ");
+    expect(html).not.toContain("<img ");
+    // hostile text renders as escaped entities
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt; heading");
+    expect(html).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(html).toContain("&lt;script&gt;alert(2)&lt;/script&gt;");
+    // javascript:/data: link targets drop the anchor; the titles stay text
+    expect(html).not.toContain('href="javascript:');
+    expect(html).not.toContain('href="data:');
+    expect(html).toContain("[click](javascript:alert(1))");
+    expect(html).toContain("[x](data:text/html,x)");
+    // allowed targets become anchors with the hardening attributes
+    expect(html).toContain('<a href="https://example.com/x" target="_blank" rel="noopener"');
+    expect(html).toContain('<a href="docs/x.md" target="_blank" rel="noopener"');
+    // fenced code with embedded tags renders escaped inside pre/code
+    expect(html).toContain("<pre");
+    expect(html).toContain("&lt;b&gt;code block&lt;/b&gt;");
+    // spans: bold, italic, inline code
+    expect(html).toContain("<strong>bold</strong>");
+    expect(html).toContain("<em>italic</em>");
+    expect(html).toContain('<code class="bg-ink-100 rounded px-1 font-mono text-xs">code</code>');
+    // blocks: h2, blockquote, hr, ordered list
+    expect(html).toContain('<h2 class="text-sm font-semibold mt-3">h2 title</h2>');
+    expect(html).toContain("<blockquote");
+    expect(html).toContain("quoted");
+    expect(html).toContain('<hr class="border-t border-ink-200 mt-3">');
+    expect(html).toContain('<ol class="list-decimal pl-5 mt-2 text-sm"><li class="mt-1">first</li><li class="mt-1">second</li></ol>');
+  });
+
+  it("surfaces spec.content === null and missing source as muted notes, never errors", async () => {
+    const ctx = await makeOverlayContext();
+    ctx.fire("status", RUNNING_ALPHA);
+    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    const degraded = {
+      ...DETAIL,
+      spec: { ...DETAIL.spec, content: null, error: "file unreadable" },
+      source: null,
+    };
+    await ctx.settle((url) =>
+      url === "/api/items/11" ? { ok: true, status: 200, json: async () => degraded, text: async () => "" } : undefined,
+    );
+    const html = ctx.el("item-overlay").innerHTML;
+    expect(html).toContain("(file unreadable)");
+    expect(html).not.toContain("<h1"); // the renderer never ran on null content
+    expect(html).toContain("no source file recorded");
   });
 });

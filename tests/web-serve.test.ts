@@ -28,7 +28,7 @@ import { createServeApp, SERVE_CSP, MAX_SSE_REPLAY_ROWS, type ServeApp, type Ser
 import { FactoryDb } from "../src/db.js";
 import { PAGE_HTML } from "../src/web/page.js";
 import { ITEM_TEMPLATE, parseItemMarkdown } from "../src/frontmatter.js";
-import { classifyInbox } from "../src/status.js";
+import { classifyInbox, statusFingerprint, type StatusPayload } from "../src/status.js";
 import { STAGES, type ItemRecord, type StageRequest, type StageResult, type StageRunner } from "../src/types.js";
 import { acquireFactoryLock } from "../src/lock.js";
 import type { BaseFreshnessChecker, BaseFreshnessResult } from "../src/baseFreshness.js";
@@ -1198,6 +1198,223 @@ describe("wb serve: artifact symlink hardening", () => {
     expect(await get(`items/${slug}/artifacts/outside.md`)).toBe(404);
     expect(await get(`items/${slug}/artifacts/inside.md`)).toBe(404);
     expect(await get(`items/${slug}/artifacts/escape-dir/secret.md`)).toBe(403);
+  });
+});
+
+describe("wb serve: item detail endpoint (GET /api/items/:id)", () => {
+  /** Claim + drive to awaiting-approval at the spec gate (a spec artifact exists). */
+  async function seedSpecItem(s: ServerHarness, baseName: string): Promise<number> {
+    s.h.inboxFile(baseName, { title: "Feature X", repo: "/tmp/repo", base: "main", approvals: ["spec"] }, "Do feature X.");
+    claim(s.h);
+    const orch = makeOrchestrator(s.h, new ScriptedRunner({ spec: [pass("spec")] }));
+    await orch.tickAll();
+    await orch.tickAll();
+    return s.h.db.listItems().find((i) => i.slug === baseName)!.id;
+  }
+
+  interface DetailBody {
+    item: Record<string, unknown> & { prUrl?: string; prDraft?: boolean; artifacts?: unknown[] };
+    artifacts: { name: string; stage: string | null; path: string; createdAt: string }[];
+    spec: { stage: string | null; name: string; path: string; createdAt: string; content: string | null; error?: string } | null;
+    source: { path: string; content: string | null; error?: string } | null;
+  }
+
+  it("returns the item envelope: status-serialized item, all artifacts, spec content, source", async () => {
+    const s = await makeServer();
+    const id = await seedSpecItem(s, "detail-item");
+    const res = await fetch(`${s.url}/api/items/${id}`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json");
+    const detail = (await res.json()) as DetailBody;
+    // the item is serialized exactly like the status snapshot's item
+    const status = (await (await fetch(s.url + "/api/status")).json()) as { items: Record<string, unknown>[] };
+    expect(detail.item).toEqual(status.items.find((i) => i.id === id));
+    // the COMPLETE artifact list (any status): the spec row plus its record shape
+    const specRow = detail.artifacts.find((a) => a.name === "spec")!;
+    expect(detail.artifacts.length).toBeGreaterThan(0);
+    expect(specRow.stage).toBe("spec");
+    // root-relative as stored, under the item's artifact tree
+    expect(specRow.path.startsWith(`items${path.sep}detail-item${path.sep}artifacts${path.sep}`)).toBe(true);
+    // spec.content equals the file's on-disk text
+    expect(detail.spec).not.toBeNull();
+    expect(detail.spec!.name).toBe("spec");
+    expect(detail.spec!.stage).toBe(specRow.stage);
+    expect(detail.spec!.createdAt).toBe(specRow.createdAt);
+    expect(detail.spec!.content).toBe(s.h.readFile(path.join(s.h.root, specRow.path)));
+    // source: the claimed item file, root-relative, with its content
+    expect(detail.source).not.toBeNull();
+    expect(detail.source!.path).toBe(`items${path.sep}detail-item${path.sep}item.md`);
+    const onDisk = s.h.db.getItem(id)!.sourceFile!;
+    expect(detail.source!.content).toBe(s.h.readFile(onDisk));
+  });
+
+  it("404s for unknown, zero, and non-numeric ids (numeric-only route)", async () => {
+    const s = await makeServer();
+    s.h.inboxFile("some-item", { title: "Some item", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    claim(s.h);
+    // a numeric id that matches no item hits the handler's 404
+    const unknown = await fetch(s.url + "/api/items/999");
+    expect(unknown.status).toBe(404);
+    expect(((await unknown.json()) as PostBody).error).toContain("unknown item id 999");
+    // zero / non-numeric ids never match the numeric route: generic 404
+    for (const p of ["/api/items/0", "/api/items/abc", "/api/items/11abc"]) {
+      const res = await fetch(s.url + p);
+      expect(res.status, p).toBe(404);
+      expect(((await res.json()) as PostBody).error).toBe("not found");
+    }
+  });
+
+  it("degrades gracefully when the spec artifact or the source file is missing from disk", async () => {
+    const s = await makeServer();
+    const id = await seedSpecItem(s, "gc-victim");
+    const specPath = s.h.db.getArtifacts(id).find((a) => a.name === "spec")!.path;
+    rmSync(path.join(s.h.root, specPath));
+    let detail = (await (await fetch(`${s.url}/api/items/${id}`)).json()) as DetailBody;
+    expect(detail.spec).not.toBeNull(); // the DB row still exists
+    expect(detail.spec!.content).toBeNull();
+    expect(detail.spec!.error).toBe("file unreadable");
+    rmSync(s.h.db.getItem(id)!.sourceFile!); // the claimed item file is gone too
+    detail = (await (await fetch(`${s.url}/api/items/${id}`)).json()) as DetailBody;
+    expect(detail.source).not.toBeNull();
+    expect(detail.source!.content).toBeNull();
+    expect(detail.source!.error).toBe("file unreadable");
+  });
+
+  it("answers 200 with spec: null and an empty artifact list for a queued item (mid-flight claim)", async () => {
+    const s = await makeServer();
+    s.h.inboxFile("queued-detail", { title: "Queued detail", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    claim(s.h);
+    const id = s.h.db.listItems()[0]!.id;
+    const detail = (await (await fetch(`${s.url}/api/items/${id}`)).json()) as DetailBody;
+    expect(detail.item.status).toBe("queued");
+    expect(detail.spec).toBeNull();
+    expect(detail.artifacts).toEqual([]);
+    expect(detail.source).not.toBeNull();
+    expect(typeof detail.source!.content).toBe("string");
+  });
+
+  it("carries prUrl/prDraft and the pr-stage artifacts for a done item", async () => {
+    const s = await makeServer();
+    s.h.inboxFile("done-detail", { title: "Done detail", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    const run = await post(`${s.url}/api/run`, {});
+    expect(run.status).toBe(202);
+    const id = s.h.db.listItems()[0]!.id;
+    expect(s.h.db.getItem(id)!.status).toBe("done");
+    const detail = (await (await fetch(`${s.url}/api/items/${id}`)).json()) as DetailBody;
+    expect(detail.item.status).toBe("done");
+    expect(typeof detail.item.prUrl).toBe("string");
+    expect(detail.item.prDraft).toBe(false);
+    // the complete artifact list for ANY status (not just parked/done
+    // trimming): every stage the scripted drive produced is listed
+    const stages = detail.artifacts.map((a) => a.stage);
+    expect(stages).toContain("spec");
+    expect(stages).toContain("review");
+    expect(detail.artifacts.every((a) => a.path.startsWith("items/"))).toBe(true);
+  });
+
+  it("takes no factory lock: answers 200 for the detail endpoint and inbox artifacts while a lock is held", async () => {
+    const s = await makeServer();
+    const id = await seedSpecItem(s, "locked-detail");
+    s.h.writeFile(path.join(s.h.paths.inbox, "held-inbox.md"), "---\ntitle: Held\nrepo: /tmp/repo\n---\n\nHeld body.\n");
+    const release = acquireFactoryLock(s.h.root);
+    try {
+      const detail = await fetch(`${s.url}/api/items/${id}`);
+      expect(detail.status).toBe(200);
+      const inbox = await fetch(s.url + "/api/artifact?path=" + encodeURIComponent("inbox/held-inbox.md"));
+      expect(inbox.status).toBe(200);
+      expect(await inbox.text()).toContain("Held body.");
+    } finally {
+      release();
+    }
+  });
+
+  it("serves inbox files byte-exact and keeps every containment rule (allowlist now items/ + inbox/)", async () => {
+    const s = await makeServer();
+    s.h.writeFile(path.join(s.h.paths.inbox, "a.md"), "# inbox a\n\nbody\n");
+    const good = await fetch(s.url + "/api/artifact?path=" + encodeURIComponent("inbox/a.md"));
+    expect(good.status).toBe(200);
+    expect(good.headers.get("content-type")).toContain("text/markdown");
+    expect(good.headers.get("cache-control")).toBe("no-store");
+    expect(await good.text()).toBe("# inbox a\n\nbody\n");
+    // containment matrix: traversal, absolute, outside-root, non-allowed prefixes
+    const cases: [string, number][] = [
+      ["inbox/../factory.db", 403],
+      ["/etc/passwd", 403],
+      ["../../../etc/passwd", 403],
+      ["factory.db", 403],
+      ["kb/some.md", 403],
+      ["inbox/missing.md", 404],
+    ];
+    for (const [p, expected] of cases) {
+      const res = await fetch(s.url + "/api/artifact?path=" + encodeURIComponent(p));
+      expect(res.status, p).toBe(expected);
+    }
+    // a symlink as the inbox file itself → 404 (lstat: not a regular file)
+    const outside = mkdtempSync(path.join(os.tmpdir(), "wb-serve-inbox-decoy-"));
+    extraDirs.push(outside);
+    writeFileSync(path.join(outside, "secret.md"), "# secret\n");
+    symlinkSync(path.join(outside, "secret.md"), path.join(s.h.paths.inbox, "link.md"));
+    expect((await fetch(s.url + "/api/artifact?path=" + encodeURIComponent("inbox/link.md"))).status).toBe(404);
+    // a symlinked intermediate directory escaping the root → 403 (realpath containment)
+    const slug = "inbox-link-item";
+    const artDir = path.join(s.h.paths.items, slug, "artifacts");
+    s.h.writeFile(path.join(artDir, "real.md"), "# real\n");
+    symlinkSync(outside, path.join(artDir, "escape-dir"));
+    expect(
+      (await fetch(s.url + "/api/artifact?path=" + encodeURIComponent(`items/${slug}/artifacts/escape-dir/secret.md`))).status,
+    ).toBe(403);
+    // a symlinked directory pointing INSIDE the root: containment passes, but
+    // the realpath allowlist re-check must still reject non-allowed real paths
+    // (the KB 2026-11-07 08:23 gap — factory.db served under items/ otherwise).
+    symlinkSync(s.h.root, path.join(artDir, "root-link"));
+    expect(
+      (await fetch(s.url + "/api/artifact?path=" + encodeURIComponent(`items/${slug}/artifacts/root-link/factory.db`))).status,
+    ).toBe(403);
+    // the same trick cannot smuggle inbox files either
+    symlinkSync(s.h.root, path.join(artDir, "root-link-2"));
+    expect(
+      (await fetch(s.url + "/api/artifact?path=" + encodeURIComponent(`items/${slug}/artifacts/root-link-2/inbox/a.md`))).status,
+    ).toBe(200); // realRel = inbox/a.md — an allowed real path
+  });
+
+  it("guards the new route with the API Host check like every /api/* request (403 foreign Host)", async () => {
+    const s = await makeServer();
+    s.h.inboxFile("host-check", { title: "Host check", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    claim(s.h);
+    const id = s.h.db.listItems()[0]!.id;
+    const port = (s.server.address() as { port: number }).port;
+    const foreign = await new Promise<{ status: number }>((resolve, reject) => {
+      const req = http.request(
+        { host: "127.0.0.1", port, method: "GET", path: `/api/items/${id}`, headers: { host: `evil.example:${port}` } },
+        (res) => {
+          res.resume();
+          res.on("end", () => resolve({ status: res.statusCode ?? -1 }));
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+    expect(foreign.status).toBe(403);
+    // the same request with the matching Host passes the guard (then 200)
+    expect((await fetch(`${s.url}/api/items/${id}`)).status).toBe(200);
+  });
+
+  it("does not fatten the status snapshot: no detail fields ride /api/status, fingerprint untouched", async () => {
+    const s = await makeServer();
+    const id = await seedSpecItem(s, "lean-snapshot");
+    const first = (await (await fetch(s.url + "/api/status")).json()) as Record<string, unknown> & { items: Record<string, unknown>[] };
+    const it = first.items.find((i) => i.id === id)!;
+    // exactly the pre-existing keys: ItemRecord + the parked stage's artifacts
+    expect(Object.keys(it).sort()).toEqual([
+      "answers", "approvals", "artifacts", "base", "branchName", "createdAt", "feedback", "gateAttempts",
+      "id", "infraAttempts", "parkedDetail", "parkedReason", "repo", "slug", "sourceFile",
+      "stage", "status", "title", "updatedAt",
+    ]);
+    for (const key of ["spec", "source", "content"]) expect(it).not.toHaveProperty(key);
+    // the fingerprint is derived only from item/inbox/lock fields: two reads
+    // of the same state agree (artifact presence changes nothing)
+    const second = (await (await fetch(s.url + "/api/status")).json()) as typeof first;
+    expect(statusFingerprint(second as unknown as StatusPayload)).toBe(statusFingerprint(first as unknown as StatusPayload));
   });
 });
 

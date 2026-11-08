@@ -152,7 +152,7 @@ read `FACTORY_ROOT` or an existing config's `root` value.
 | `wb resume` | Recover interrupted/rejected items and continue until they park or finish. |
 | `wb status [--all]` | Show items other than completed ones and their parked reasons; `--all` includes done items. |
 | `wb watch [--interval <seconds>]` | Poll read-only for new events, show a compact status card, and notify when items park (default: 5 seconds; Ctrl+C to stop). |
-| `wb serve [--port <n>] [--host <addr>] [--interval <seconds>]` | Host a local browser UI over the factory (default: http://127.0.0.1:7466, poll every 2 seconds): live status snapshot, parked-item decision cards (approve/reject/answer/retry), work intake (compose an item or drop `.md` files into the inbox), and backgrounded Run/Resume. Binds to localhost only by default; `--host` is the escape hatch. |
+| `wb serve [--port <n>] [--host <addr>] [--interval <seconds>]` | Host a local browser UI over the factory (default: http://127.0.0.1:7466, poll every 2 seconds): live status snapshot, parked-item decision cards (approve/reject/answer/retry), work intake (compose an item or drop `.md` files into the inbox), backgrounded Run/Resume, and an item detail overlay — click any work item (inbox file, in-flight row, parked card, landed chip) for an inline view of its record, spec, artifacts, and source. Binds to localhost only by default; `--host` is the escape hatch. |
 | `wb approve <id-or-slug> [-n <note>]` | Release a parked approval gate. |
 | `wb reject <id-or-slug> -r <reason>` | Reject stage output; the reason becomes rework feedback. |
 | `wb answer <id-or-slug> -a <answers...>` | Answer parked triage questions in order; triage re-runs. |
@@ -179,7 +179,8 @@ and the CLI can never interleave destructively. Run/Resume execute in the
 background and their progress arrives on the page over a server-sent event
 stream. As a CSRF/DNS-rebinding guard, the API accepts only JSON requests
 whose Host/Origin match the bound localhost address, and artifact links are
-served only from real files under `items/` inside the factory root (no
+served only from real files under `items/` and `inbox/` inside the factory
+root (no
 symlinks). `--port` must be an integer between 1 and 65535; a taken or
 invalid port exits with a friendly error.
 

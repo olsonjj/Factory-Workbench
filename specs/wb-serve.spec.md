@@ -224,7 +224,8 @@ method) is therefore guarded before routing:
 | `GET /api/status` | 200 `StatusPayload` |
 | `GET /api/events?afterId=<n>` | 200 `text/event-stream` (below) |
 | `GET /api/template` | 200 `text/markdown` — `ITEM_TEMPLATE` |
-| `GET /api/artifact?path=<rel>` | 200 file / 400 missing path / 403 escape or non-`items/` / 404 missing |
+| `GET /api/artifact?path=<rel>` | 200 file / 400 missing path / 403 escape or non-`items/`+`inbox/` prefix / 404 missing |
+| `GET /api/items/:id` | 200 `{item, artifacts, spec, source}` detail envelope / 404 unknown id |
 | `POST /api/items` `{title, repo, base?, approvals?, description, runNow?}` | 201 `{ok, file, slug, runStarted, runBusy?}` / 422 `{errors: [{field, reason}]}` / 409 busy. `repo` is expanded before validation (`~`/`~/sub` → operator home, bare known-repo name → that repo, otherwise resolved against the factory root); an unresolvable repo yields a 422 field error on `repo` naming the expanded path. |
 | `POST /api/items/drop` `{filename, content}` | 201 `{ok, file}` / 400 bad name / 409 collision / 409 busy |
 | `POST /api/items/:id/approve` `{note?}` | 200 `{item}` / 404 / 409 |
@@ -240,6 +241,22 @@ orchestrator errors → 409 with the message. `FactoryBusyError` → 409 with
 422 field-shaped errors (order: title → repo → base → approvals →
 description; `authorItem`'s composite reason — duplicate slug, EEXIST — is
 the `item`-field backstop).
+
+### Item detail (`GET /api/items/:id`)
+
+Read-only like `/api/status` (no lock, readonly DB only); numeric ids only
+(`0`/non-numeric fall to the generic 404). Response envelope: `item` — the
+exact `toStatusItem` serialization the status snapshot uses (now exported
+from `src/status.ts`; the snapshot payload and fingerprint are untouched);
+`artifacts` — the item's complete artifact list (any status, not just the
+parked/done trimming); `spec` — the most recent artifact row named `spec`
+plus its markdown content, `null` when none exists; `source` — the item's
+own file (root-relative, only under `items/` or `inbox/`) plus its content,
+`null` when absent/outside the allowlist. Missing or unreadable files are
+never error statuses — the field carries `content: null` and
+`error: "file unreadable"` — so old items, GC'd trees, and mid-flight
+claims all render. File reads are async (`node:fs/promises`) and never
+throw to the response.
 
 ## Actions
 
@@ -311,13 +328,17 @@ counter; from the 5th failure one stderr line per failing poll (watch parity).
 
 `GET /api/artifact?path=<root-relative>`: missing path → 400; absolute or
 `..` segments → 403 (before resolving); `path.resolve(root, requested)` +
-`path.relative` prefix check → 403 on escape; the served prefix is
-allowlisted to `items/` → 403 otherwise; an `lstat` file check → 404
+`path.relative` prefix check → 403 on escape; the served prefixes are
+allowlisted to `items/` and `inbox/` (unclaimed inbox item files ride the
+same hardened path — no second file-serving route) → 403 otherwise; an
+`lstat` file check → 404
 (lstat, not stat: a symlink is not a regular file here, so symlinks are
 rejected outright rather than followed); both sides are then `realpathSync`'d
-and the containment check is repeated on the real paths → 403 on escape (a
-symlinked intermediate directory cannot smuggle a file out of the root),
-404 if the real resolution fails; served as `text/markdown; charset=utf-8`
+and the containment check **and the prefix allowlist** are repeated on the
+real paths → 403 on either failure (a symlinked intermediate directory can
+neither smuggle a file out of the root nor expose a non-allowed real path —
+e.g. `factory.db` — under an allowed-looking requested path), 404 if the
+real resolution fails; served as `text/markdown; charset=utf-8`
 with `Cache-Control: no-store`.
 
 ## Page (`PAGE_HTML`)
@@ -400,6 +421,43 @@ lbl/finput/ferr/btn component classes) — no CDN script, no remote CSS, and a
 strict CSP rides on every response (Request hardening above). Width:
 `max-w-3xl`, laptop-first.
 
+### Item detail overlay (`#item-overlay`)
+
+Clicking any work item — a queued/running row in the in-flight panel
+(`div[data-flight-row]`), a parking-lot card (`[data-id]`; only clicks that
+did not originate inside a button/input/textarea/label/anchor — artifact
+links keep their raw-link default), a glance chip (`[data-item-id]`), or a
+claimable inbox row (a `data-inbox-file` attribute on the claimable rows;
+already-claimed rows stay non-clickable) — opens a fixed, z-60,
+backdrop-blurred modal over the workbench. The container is static in the
+body, OUTSIDE every innerHTML re-rendered region, so a live SSE snapshot
+re-render neither closes nor corrupts an open overlay, and its state is
+module-level page state (glance/flight vocabulary), never persisted —
+per-tab, per page load. Opening issues exactly one lazy fetch (`GET
+/api/items/:id`; inbox rows instead fetch `GET /api/artifact?path=inbox/<file>`
+and render the file's markdown) — the streamed status snapshot stays lean
+and unchanged. While loading it shows the spinner shell; a failed fetch shows
+an inline error with a retry control (stale in-flight responses are ignored
+via a monotonic per-open token); closing (close button, Esc via one document
+keydown listener, a backdrop click — any click that did not originate inside
+the panel — or a page reload) discards all fetched state and returns focus to
+the opener. The ready pane renders the item's full record (header with
+status pill and `prUrl` on done items; stage dots, approvals, gate attempts,
+infra retries, timestamps, parked reason + the known parkedDetail shapes
+including the stale-base hint, feedback, stored answers), a first-class Spec
+section (artifact name/timestamp, raw link, content rendered as markdown), an
+Artifacts section (every artifact with a View-raw link and an inline View
+control that fetches through the hardened artifact route; failures degrade
+to inline error notes), and a Source section (raw link + verbatim escaped
+monospace content). The inline spec/artifact markdown goes through a minimal
+hand-written renderer: escaped-first (raw text is `esc()`'d before any span
+recognition, so only the renderer's own tags can materialize), blocks are
+fenced code / h1–h4 / hr / blockquote / ul / ol / paragraphs (one level),
+spans are bold/italic/inline-code/links; link targets are restricted to
+`http:`, `https:`, and relative paths — `javascript:` and `data:` targets
+drop the anchor outright — and every emitted anchor carries
+`target="_blank" rel="noopener"`.
+
 ## Tests
 
 `tests/web-serve.test.ts` — HTTP-seam only: `createServeApp` wired to a temp
@@ -431,7 +489,17 @@ no remote URLs) plus the Start Processing button's static markers (idle
 label, composer checkbox wording, spinner/disabled CSS, old-string absence);
 CLI entry (spawned): fresh-root refusal
 (exit 0), invalid `--port` (friendly message, exit 1), EADDRINUSE (friendly
-message, exit 1).
+message, exit 1); the item detail endpoint (`GET /api/items/:id`: envelope
+equality with the status snapshot's item, complete artifact list, spec
+content equal to the on-disk file, root-relative source path + content; 404
+for unknown/zero/non-numeric ids; graceful degradation to `content: null` +
+`"file unreadable"` for missing spec/source files; queued items with
+`spec: null`; done items with `prUrl`; 200 with a lock held — no lock
+acquisition; the API Host guard covers the route; the status snapshot gains
+no detail fields and the fingerprint is unchanged) plus the artifact route's
+`inbox/` extension (byte-exact serve, the full containment matrix including
+symlink files, symlinked dirs escaping the root, and symlinked dirs pointing
+inside the root caught by the realpath allowlist re-check).
 
 `tests/web-page-runtime.test.ts` — runs the page's inline script in a fresh
 V8 context with a minimal DOM stub and drives it exactly the way the browser
@@ -455,4 +523,11 @@ state, and the Start Processing button's label/disabled/tooltip lifecycle
 (idle → live-lock `Processing…` with spinner and the stop tooltip → stale
 and idle re-enable), its no-double-fire guard while disabled (zero
 `POST /api/run` entries), and the 202 toast copy (plain and capped
-suffix).
+suffix); the item detail overlay (open from a flight row / parked card /
+glance chip / inbox row with exactly one fetch; action/control clicks never
+open it; inbox mode via the artifact route; Esc/backdrop/close dismissals
+with focus returned to the opener; an open overlay survives a live SSE
+snapshot re-render untouched; the failed-fetch retry re-issues exactly one
+fetch; hostile markdown fixtures render inert through the escaped-first
+renderer while good links, bold/italic/code, and every block shape render —
+asserted via `#item-overlay`'s innerHTML, never by importing the renderer).

@@ -40,7 +40,7 @@ import { scanInbox } from "../inbox.js";
 import { GitBaseFreshnessChecker, type BaseFreshnessChecker } from "../baseFreshness.js";
 import { parseIntervalSeconds } from "../watch.js";
 import { sleep } from "../util.js";
-import { buildStatusPayload, statusFingerprint, type StatusPayload } from "../status.js";
+import { buildStatusPayload, statusFingerprint, toStatusItem, type StatusPayload } from "../status.js";
 import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, agentEnvFor } from "../adapters/sandcastle.js";
 import { PAGE_HTML } from "./page.js";
 
@@ -70,6 +70,11 @@ const READ_FAILURE_NOTICE_THRESHOLD = 5;
 export const SERVE_CSP =
   "default-src 'none'; frame-ancestors 'none'; style-src 'unsafe-inline'; " +
   "script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:";
+
+/** Allowed served prefixes for the artifact route: claimed items' artifact
+ *  trees and unclaimed inbox item files. No other prefix (`archive/`, `kb/`,
+ *  `proposals/`, `logs/`, store files) is ever served. */
+const ALLOWED_PREFIXES = ["items/", "inbox/"];
 
 // ---------------------------------------------------------------- seam types
 
@@ -753,13 +758,69 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     sendJson(res, 201, { ok: true, file: path.join("inbox", filename) });
   }
 
+  /** Detail envelope for `GET /api/items/:id` (spec §Item detail overlay):
+   *  the same item serialization the status snapshot uses, the COMPLETE
+   *  artifact list (any status), the most recent `spec` artifact's markdown
+   *  content, and the source item file — everything the detail overlay
+   *  renders. Read-only; no factory lock. Missing/unreadable files degrade
+   *  to visible `content: null` + `error` markers, never error statuses, so
+   *  old items, GC'd trees, and mid-flight claims always render. */
+  async function handleItemDetail(id: number, res: ServerResponse): Promise<void> {
+    const item = deps.db.getItem(id);
+    if (!item) throw new HttpError(404, { error: `unknown item id ${id}` });
+    const artifacts = deps.db.getArtifacts(id);
+    const artifactsByItem = new Map<number, typeof artifacts>([[id, artifacts]]);
+    // "Most recent spec" mirrors `buildPrBody`'s latest() exactly: the last
+    // row named `spec` in row-id order (the name is stable).
+    const specRow = [...artifacts].reverse().find((a) => a.name === "spec") ?? null;
+    let spec: { stage: string | null; name: string; path: string; createdAt: string; content: string | null; error?: string } | null = null;
+    if (specRow) {
+      const content = await readContentOrNull(specRow.path);
+      spec = content === null
+        ? { stage: specRow.stage, name: specRow.name, path: specRow.path, createdAt: specRow.createdAt, content: null, error: "file unreadable" }
+        : { stage: specRow.stage, name: specRow.name, path: specRow.path, createdAt: specRow.createdAt, content };
+    }
+    // `ItemRecord.sourceFile` is absolute (scanInbox stores itemFile(slug));
+    // the payload carries the root-relative form and only when it lands
+    // under the same prefixes the artifact route serves.
+    let source: { path: string; content: string | null; error?: string } | null = null;
+    if (item.sourceFile) {
+      const rel = path.relative(deps.root, item.sourceFile);
+      const contained = rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+      if (contained && ALLOWED_PREFIXES.some((p) => rel.startsWith(p))) {
+        const content = await readContentOrNull(rel);
+        source = content === null ? { path: rel, content: null, error: "file unreadable" } : { path: rel, content };
+      }
+    }
+    sendJson(res, 200, {
+      item: toStatusItem(item, artifactsByItem),
+      artifacts,
+      spec,
+      source,
+    });
+  }
+
+  /** Read one root-relative file's text; any failure (ENOENT, EACCES, a GC'd
+   *  tree, a mid-rewrite) is a visible `null` in a 200 payload — never an
+   *  error status. Async like handleArtifact's read (rework-5 discipline). */
+  async function readContentOrNull(rel: string): Promise<string | null> {
+    try {
+      return await readFile(path.join(deps.root, rel), "utf8");
+    } catch {
+      return null;
+    }
+  }
+
   /** Artifact serving with containment (spec §6.4): reject absolute inputs
    *  and `..` segments before resolving, resolve+prefix-check against the
-   *  root, allowlist the served prefix to items/, reject symlinks via lstat,
-   *  re-verify containment on the realpath'd pair (root, file) so symlinked
-   *  intermediate directories cannot escape, then serve as markdown. The
-   *  containment checks stay synchronous; the file read itself is async so a
-   *  large artifact never blocks the tick loop (rework finding 5). */
+   *  root, allowlist the served prefixes to items/ and inbox/ (unclaimed
+   *  inbox item files ride the same hardened path — no second file-serving
+   *  route), reject symlinks via lstat, re-verify containment AND the prefix
+   *  allowlist on the realpath'd pair (root, file) so symlinked intermediate
+   *  directories can neither escape the root nor smuggle a non-allowed file
+   *  under an allowed path, then serve as markdown. The containment checks
+   *  stay synchronous; the file read itself is async so a large artifact
+   *  never blocks the tick loop (rework finding 5). */
   async function handleArtifact(url: URL, res: ServerResponse): Promise<void> {
     const requested = url.searchParams.get("path");
     if (requested === null || requested.length === 0) {
@@ -776,8 +837,8 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
       sendJson(res, 403, { error: "path escapes the factory root" });
       return;
     }
-    if (!(rel.startsWith("items/"))) {
-      sendJson(res, 403, { error: "only artifact files under items/ are served" });
+    if (!ALLOWED_PREFIXES.some((p) => rel.startsWith(p))) {
+      sendJson(res, 403, { error: "only artifact files under items/ and inbox/ are served" });
       return;
     }
     // lstat (not stat): a symlink is not a regular file here — symlinks are
@@ -807,6 +868,15 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     const realRel = path.relative(realRoot, realAbs);
     if (realRel === "" || realRel.startsWith("..") || path.isAbsolute(realRel)) {
       sendJson(res, 403, { error: "path escapes the factory root" });
+      return;
+    }
+    // Repeat the prefix allowlist on the real path too (KB 2026-11-07 08:23
+    // observation (a), closed here): a symlinked intermediate directory
+    // pointing INSIDE the root would otherwise expose e.g. factory.db or
+    // config.json under an allowed-looking requested path. Containment first,
+    // allowlist second — mirroring the original pair.
+    if (!ALLOWED_PREFIXES.some((p) => realRel.startsWith(p))) {
+      sendJson(res, 403, { error: "only artifact files under items/ and inbox/ are served" });
       return;
     }
     let bytes: Buffer;
@@ -866,6 +936,11 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     }
     if (method === "GET" && url.pathname === "/api/artifact") {
       await handleArtifact(url, res);
+      return;
+    }
+    const dm = /^\/api\/items\/([1-9]\d*)$/.exec(url.pathname);
+    if (method === "GET" && dm) {
+      await handleItemDetail(Number(dm[1]), res);
       return;
     }
     if (method === "POST" && url.pathname === "/api/items") {
