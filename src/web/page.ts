@@ -23,7 +23,11 @@
  * only escaped/structural markup. All actions are same-origin fetch POSTs
  * with `Content-Type: application/json`; no CORS headers are emitted. The
  * glance section's collapse state is client-side only (one module-level var,
- * always collapsed on load) — never persisted, no localStorage.
+ * always collapsed on load) — never persisted, no localStorage. The in-flight
+ * panel's collapse follows the same module-level pattern, but an EXPLICIT user
+ * toggle is persisted ('wb:flight-panel' in localStorage — a UI-only preference,
+ * no server state, no new seam); the built-in default (open iff items are in
+ * flight) applies only when no choice was ever stored.
  */
 
 export const PAGE_HTML = `<!DOCTYPE html>
@@ -87,6 +91,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .justify-between { justify-content: space-between; }
   .justify-center { justify-content: center; }
   .grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .col-span-2 { grid-column: span 2 / span 2; }
   .gap-0 { gap: 0; }
@@ -97,6 +102,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .gap-x-3 { column-gap: 0.75rem; }
   .gap-y-0\\.5 { row-gap: 0.125rem; }
   .space-y-0\\.5 > * + * { margin-top: 0.125rem; }
+  .space-y-2 > * + * { margin-top: 0.5rem; }
   .space-y-3 > * + * { margin-top: 0.75rem; }
   .space-y-4 > * + * { margin-top: 1rem; }
 
@@ -131,6 +137,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .\\!w-52 { width: 13rem !important; }
   .max-w-3xl { max-width: 48rem; }
   .max-h-72 { max-height: 18rem; }
+  .min-w-0 { min-width: 0; }
   .min-h-\\[3rem\\] { min-height: 3rem; }
 
 /* ---- spacing ---- */
@@ -274,6 +281,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .border-fuchsia-200 { border-color: #f5d0fe; }
   .border-indigo-100 { border-color: #e0e7ff; }
   .border-indigo-300 { border-color: #a5b4fc; }
+  .border-ink-100 { border-color: #f5f5f4; } /* matches .bg-ink-100 */
   .border-ink-200 { border-color: #e7e5e4; }
   .border-ink-300 { border-color: #d6d3d1; }
   .border-orange-200 { border-color: #fed7aa; }
@@ -581,11 +589,16 @@ function tile(accent, big, small, title, sub) {
 
 function renderPulse(p) {
   var c = p.counts;
-  var html = '<div class="grid grid-cols-4 gap-3">' +
-    tile('bg-amber-400', c.decisions, '', 'waiting on you', 'decisions pending') +
-    tile('bg-blue-500', c.running, '+ ' + c.queued, 'in flight', 'running + queued') +
+  /* Pulse-tile row (flight-panel spec D1): three tiles in lifecycle/flow
+   * order — inbox → in flight → waiting on you — the eye walks the same
+   * direction the items do. The landed tile is dropped from the row: a
+   * monotonic lifetime counter is not an attention tile. Landed stays where
+   * it belongs — the flow bar's done segment (below) and the glance chips
+   * (unchanged). Accent colors stay attached to their tiles. */
+  var html = '<div class="grid grid-cols-3 gap-3">' +
     tile('bg-ink-400', c.inbox, '', 'inbox', 'awaiting claim') +
-    tile('bg-emerald-500', c.done, '', 'landed', 'PRs ready for review') +
+    tile('bg-blue-500', c.running, '+ ' + c.queued, 'in flight', 'running + queued') +
+    tile('bg-amber-400', c.decisions, '', 'waiting on you', 'decisions pending') +
     '</div>';
   var total = 0;
   (p.flow || []).forEach(function (s) { total += s.n; });
@@ -612,7 +625,118 @@ function renderPulse(p) {
     bar = '<div class="mt-3 rounded-full overflow-hidden flex h-6 ring-1 ring-ink-200 bg-white shadow-sm">' + segs + '</div>' +
       (legend ? '<div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5">' + legend + '</div>' : '');
   }
-  $('pulse').innerHTML = html + bar;
+  /* The panel rides under the flow bar inside #pulse — the same pulse band it
+   * details, directly above the composer (flight-panel spec D2). Its markup
+   * is part of the status-driven render, so SSE snapshots keep it live.
+   * Keyboard focus carry across the innerHTML replacement (renderGlance/
+   * renderRunState pattern): capture BEFORE the write — activeElement is
+   * already <body> the moment innerHTML is replaced — then restore to the
+   * new summary button so Enter/Space keep toggling without a Tab-back. */
+  var hadFlightFocus = !!(document.activeElement && document.activeElement.closest &&
+    document.activeElement.closest('button[data-flight-summary]'));
+  $('pulse').innerHTML = html + bar + flightPanelHtml(p);
+  if (hadFlightFocus) {
+    var fbtn = $('pulse').querySelector('button[data-flight-summary]');
+    if (fbtn && fbtn.focus) fbtn.focus();
+  }
+}
+
+/* In-flight detail panel (flight-panel spec D2/D3). Rows come straight from
+ * the snapshot's items — every queued/running item, nothing else — so no
+ * backend or StatusPayload change is involved. One row: title + repo, the
+ * six-dot stage-progress track (the same stageDots the parking-lot cards
+ * render; queued items are all-hollow), and a stage label pill — the
+ * running item's current stage name, or 'queued'. Collapse state follows
+ * the glance pattern (one module-level var, recomputed per render) with one
+ * addition: FLIGHT_PREF_KEY stores an explicit user choice in localStorage
+ * ('open' | 'collapsed', UI-only) which always beats the default — open
+ * when running+queued > 0, closed when 0. A payload re-render never
+ * auto-expands against a stored choice; it only repaints the header counts
+ * (always visible) and, when open, the rows. */
+var FLIGHT_PREF_KEY = 'wb:flight-panel';
+var flightCollapsed = true;
+/* In-memory mirror of the last EXPLICIT user toggle, kept for the case where
+ * storage writes fail while reads succeed: the next snapshot (~2s SSE) would
+ * otherwise re-derive the default and silently undo the user's click
+ * mid-session. Precedence per render: stored pref > flightExplicit > default
+ * (storage still wins when it works; the default still applies pre-toggle). */
+var flightExplicit = null;
+
+function flightPref() {
+  try {
+    var v = localStorage.getItem(FLIGHT_PREF_KEY);
+    if (v === 'open') return false;
+    if (v === 'collapsed') return true;
+  } catch (e) { /* storage unavailable (fresh context, private mode): the default applies */ }
+  return null;
+}
+
+function flightPanelHtml(p) {
+  var inFlight = (p.items || []).filter(function (it) { return it.status === 'queued' || it.status === 'running'; })
+    .sort(function (a, b) {
+      // Running rows first (attention order), then queued; both by id.
+      var qa = (a.status === 'running' ? 0 : 1);
+      var qb = (b.status === 'running' ? 0 : 1);
+      return (qa - qb) || (a.id - b.id);
+    });
+  var runningCount = 0, queuedCount = 0;
+  inFlight.forEach(function (it) { if (it.status === 'running') runningCount++; else queuedCount++; });
+  var segments = [];
+  if (runningCount > 0) segments.push(runningCount + ' running');
+  if (queuedCount > 0) segments.push(queuedCount + ' queued');
+
+  var pref = flightPref();
+  flightCollapsed = pref !== null ? pref : (flightExplicit !== null ? flightExplicit : (inFlight.length === 0));
+
+  var body;
+  if (inFlight.length === 0) {
+    /* Open while empty is the user's explicit state — never a blank void. */
+    var landed = (p.counts && p.counts.done) || 0;
+    body = '<div class="text-xs text-ink-400">factory idle — ' + landed + ' landed</div>';
+  } else {
+    body = '<div class="space-y-2">' + inFlight.map(function (it) {
+      var label = it.status === 'running' ? esc(it.stage || 'starting') : 'queued';
+      var pill = STATUS_PILL[it.status] || 'bg-ink-100 text-ink-700 ring-ink-300';
+      return '<div class="rounded-lg border border-ink-200 bg-white/70 p-2.5" data-flight-row="' + it.id + '">' +
+        '<div class="flex items-start justify-between gap-2">' +
+        '<div class="min-w-0"><div class="text-sm font-medium">' + esc(it.title) + '</div>' +
+        '<div class="text-[11px] font-mono text-ink-500 mt-0.5">' + esc(it.repo) + '</div></div>' +
+        '<span class="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 ' + pill + '">' + label + '</span>' +
+        '</div>' + stageDots(it) + '</div>';
+    }).join('') + '</div>';
+  }
+  return '<div class="mt-3 rounded-2xl border border-ink-200 bg-white shadow-sm">' +
+    // A <button type="button">: Enter/Space synthesize the same click the
+    // delegated #pulse listener handles — the shared click path IS the
+    // keyboard path (glance-toggle pattern).
+    '<button type="button" data-flight-summary aria-expanded="' + (flightCollapsed ? 'false' : 'true') + '" title="expand/collapse the in-flight detail" ' +
+    'class="w-full flex items-center justify-between px-5 py-3 cursor-pointer hover:bg-indigo-50/50 transition-colors">' +
+    '<span class="flex items-center gap-2">' +
+    '<span data-flight-glyph class="text-ink-400 font-mono">' + (flightCollapsed ? '▸' : '▾') + '</span>' +
+    '<span class="font-semibold text-sm">In flight</span>' +
+    (segments.length ? '<span class="text-ink-500 text-xs">· ' + segments.join(' · ') + '</span>' : '') +
+    '</span>' +
+    '<span class="text-ink-400 text-xs font-mono tabular-nums">' + inFlight.length + '</span>' +
+    '</button>' +
+    '<div id="flight-body" class="border-t border-ink-100 p-4 space-y-2' + (flightCollapsed ? ' hidden' : '') + '">' + body + '</div>' +
+    '</div>';
+}
+
+/* The single writer of in-flight collapse state on toggle — surgical DOM
+ * updates, never a re-render (same reasoning as applyGlanceCollapsed: a full
+ * repaint would destroy the just-clicked button and drop keyboard focus).
+ * Payload re-renders instead rebuild the panel from flightCollapsed, which
+ * renderPulse re-derives from the preference/default on every snapshot.
+ * classList add/remove only — the runtime-test stub has no toggle. */
+function applyFlightCollapsed(collapsed) {
+  flightCollapsed = collapsed;
+  var body = $('flight-body');
+  if (!body) return;
+  if (collapsed) body.classList.add('hidden'); else body.classList.remove('hidden');
+  var glyph = $('pulse').querySelector('[data-flight-glyph]');
+  if (glyph) glyph.textContent = collapsed ? '▸' : '▾';
+  var btn = $('pulse').querySelector('button[data-flight-summary]');
+  if (btn && btn.setAttribute) btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
 }
 
 /* Dropdown options carry a per-repo item-count label. Chromium/WebKit
@@ -628,7 +752,10 @@ function renderDatalist(knownRepos) {
 }
 
 function stageDots(it) {
-  var doneThrough = STAGES.indexOf(it.stage);
+  /* Queued rows (the in-flight panel) render all six dots hollow — a queued
+   * item has not entered any stage yet, whatever its record's last stage
+   * says (flight-panel spec D2). Parking-lot cards never have this status. */
+  var doneThrough = it.status === 'queued' ? -1 : STAGES.indexOf(it.stage);
   var dot = STATUS_DOT[it.status] || 'bg-ink-300';
   var cls = it.status === 'running' ? 'bg-blue-500 animate-pulse' : dot;
   var out = '<div class="flex items-center gap-0 mt-3">';
@@ -1117,6 +1244,22 @@ function appendFeed(row) {
 $('glance').addEventListener('click', function (ev) {
   if (!ev.target.closest('button[data-glance-summary]')) return;
   applyGlanceCollapsed(!glanceCollapsed);
+});
+
+/* In-flight panel collapse toggle — delegated to the permanent #pulse
+ * container (renderPulse replaces the panel's innerHTML on every changed
+ * payload, so a listener on the generated summary button would not survive
+ * the next status event; same reasoning as the glance toggle). The summary
+ * is a <button type="button">, so Enter/Space synthesize the same click —
+ * the shared click listener IS the keyboard path. The new state is
+ * persisted immediately as an explicit user choice, which then always
+ * beats the open/close default (flight-panel spec D3). */
+$('pulse').addEventListener('click', function (ev) {
+  if (!ev.target.closest('button[data-flight-summary]')) return;
+  var collapsed = !flightCollapsed;
+  flightExplicit = collapsed; // session-sticky even when the storage write fails
+  try { localStorage.setItem(FLIGHT_PREF_KEY, collapsed ? 'collapsed' : 'open'); } catch (e) { /* storage unavailable: flightExplicit keeps the choice for the session */ }
+  applyFlightCollapsed(collapsed);
 });
 
 $('parking-lot').addEventListener('click', function (ev) {
