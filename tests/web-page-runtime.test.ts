@@ -112,6 +112,19 @@ function makeContext() {
       if (!lastES) throw new Error("page never constructed an EventSource");
       lastES._fire(t, { data: JSON.stringify(payload) });
     },
+    /** Dispatch a click on an element's registered click listeners, exactly
+     * like a browser click: handlers receive `{ target }` (the element
+     * itself unless the test passes a fake inner target, e.g. for delegated
+     * handlers that expect `ev.target.closest(...)`). Note for keyboard
+     * coverage: browsers synthesize `click` from Enter/Space on
+     * `<button type="button">`, so the shared click listener IS the
+     * keyboard path — no separate keydown synthesis is needed. */
+    click: (id: string, evTarget?: unknown) => {
+      const el = document.getElementById(id);
+      for (const fn of el.listeners.get("click") ?? []) {
+        (fn as (ev: { target: unknown }) => void)({ target: evTarget ?? el });
+      }
+    },
     /** Let the script's `refreshStatus()` promise (and any .then) settle. */
     settle: async () => {
       for (const f of fetches.splice(0)) f.resolve({ ok: true, json: async () => IDLE_PAYLOAD });
@@ -120,14 +133,24 @@ function makeContext() {
   };
 }
 
-/** Full status payload — every render*() field the script reads off a snapshot. */
-function payload(items: unknown[], lock: unknown) {
+/** Full status payload — every render*() field the script reads off a snapshot.
+ * Items may be running/queued/done (counts derive from them); `opts.claimable`
+ * feeds both `inbox.claimable` and the inbox count. */
+function payload(items: unknown[], lock: unknown, opts?: { claimable?: string[] }) {
+  const claimable = opts?.claimable ?? [];
+  const count = (s: string) => items.filter((i: any) => i.status === s).length;
   return {
     items,
     knownRepos: [],
-    counts: { decisions: 0, running: items.filter((i: any) => i.status === "running").length, queued: 0, inbox: 0, done: 0 },
+    counts: {
+      decisions: 0,
+      running: count("running"),
+      queued: count("queued"),
+      inbox: claimable.length,
+      done: count("done"),
+    },
     flow: [],
-    inbox: { claimable: [], alreadyClaimed: [], error: null },
+    inbox: { claimable, alreadyClaimed: [], error: null },
     lock,
   };
 }
@@ -138,6 +161,13 @@ const RUNNING_PAYLOAD = payload(
   { alive: true, pid: 7, ageMs: 65_500 },
 );
 const DEAD_PAYLOAD = payload([], { alive: false, pid: 7, ageMs: 90_000 });
+
+/** Fake event target for the delegated glance click: the handler only needs
+ * `closest` to return truthy for the summary button (parking-lot pattern). */
+const SUMMARY_TARGET = {
+  closest: (sel: string) => (sel.indexOf("data-glance-summary") >= 0 ? { attributes: {} } : null),
+};
+const NOT_SUMMARY_TARGET = { closest: () => null };
 
 describe("wb serve page script (runtime behavior)", () => {
   it("transitions IDLE → RUNNING → stale → IDLE from status events, with a ticking clock", async () => {
@@ -182,5 +212,110 @@ describe("wb serve page script (runtime behavior)", () => {
     ctx.fire("status", IDLE_PAYLOAD);
     expect(runState.innerHTML).toContain("IDLE");
     expect(runState.innerHTML).not.toContain("RUNNING");
+  });
+
+  it("renders the glance collapsed by default with accurate counts, updating live over SSE without expanding", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle(); // initial paint is the idle payload
+
+    const MIXED = payload(
+      [
+        { id: 11, slug: "alpha", stage: "build", status: "running" },
+        { id: 12, slug: "beta", stage: "claim", status: "queued" },
+        { id: 13, slug: "gamma", status: "done" },
+      ],
+      null,
+      { claimable: ["a.md", "b.md"] },
+    );
+    ctx.fire("status", MIXED);
+    const glance = ctx.el("glance");
+    // Collapsed by default: one clickable summary row (a real button, so
+    // Enter/Space synthesize the same click) + a hidden body container.
+    expect(glance.innerHTML).toContain("data-glance-summary");
+    expect(glance.innerHTML).toContain('<button type="button"');
+    expect(glance.innerHTML).toContain("1 running · 1 queued · 1 landed");
+    expect(glance.innerHTML).toContain("2 in inbox");
+    expect(glance.innerHTML).toContain('id="glance-body" class="mt-3 hidden"');
+    expect(glance.innerHTML).toContain('aria-expanded="false"');
+    // The chip/inbox detail is inside the (hidden) body, unchanged.
+    expect(glance.innerHTML).toContain("#11 alpha");
+    expect(glance.innerHTML).toContain("a.md");
+
+    // Live SSE update while collapsed: counts change, the body markup stays
+    // hidden, and the collapse state is untouched (still collapsed).
+    const TWO_RUNNING = payload(
+      [
+        { id: 11, slug: "alpha", stage: "build", status: "running" },
+        { id: 14, slug: "delta", stage: "build", status: "running" },
+        { id: 12, slug: "beta", stage: "claim", status: "queued" },
+        { id: 13, slug: "gamma", status: "done" },
+      ],
+      null,
+      { claimable: ["a.md", "b.md"] },
+    );
+    ctx.fire("status", TWO_RUNNING);
+    expect(ctx.el("glance").innerHTML).toContain("2 running · 1 queued · 1 landed");
+    expect(ctx.el("glance").innerHTML).toContain('id="glance-body" class="mt-3 hidden"');
+  });
+
+  it("toggles the glance between collapsed and expanded on click (and keyboard, via the shared click path)", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire(
+      "status",
+      payload([{ id: 11, slug: "alpha", stage: "build", status: "running" }], null, { claimable: ["a.md"] }),
+    );
+    // Collapsed render: the hidden class rides on the body's markup.
+    expect(ctx.el("glance").innerHTML).toContain('id="glance-body" class="mt-3 hidden"');
+
+    // Delegated click on the summary button expands the body.
+    ctx.click("glance", SUMMARY_TARGET);
+    expect(ctx.el("glance-body").classList.contains("hidden")).toBe(false);
+
+    // A payload re-render while expanded keeps the body open (state survives
+    // the innerHTML replacement — the class is derived from glanceCollapsed).
+    ctx.fire(
+      "status",
+      payload([{ id: 11, slug: "alpha", stage: "build", status: "running" }], null, { claimable: ["a.md"] }),
+    );
+    expect(ctx.el("glance").innerHTML).toContain('aria-expanded="true"');
+    expect(ctx.el("glance").innerHTML).toContain('id="glance-body" class="mt-3"');
+    expect(ctx.el("glance").innerHTML).not.toContain('class="mt-3 hidden"');
+
+    // Second click collapses again (the single writer re-adds the class).
+    ctx.click("glance", SUMMARY_TARGET);
+    expect(ctx.el("glance-body").classList.contains("hidden")).toBe(true);
+
+    // A click that does not originate on the summary button is ignored.
+    ctx.click("glance", NOT_SUMMARY_TARGET);
+    expect(ctx.el("glance-body").classList.contains("hidden")).toBe(true);
+  });
+
+  it("auto-expands the collapsed glance when the RUNNING pill is clicked, and keeps the empty state toggle-free", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    // Empty state: plain line, no toggle, and a container click is a no-op.
+    expect(ctx.el("glance").innerHTML).toContain("no items in flight");
+    expect(ctx.el("glance").innerHTML).not.toContain("data-glance-summary");
+    ctx.click("glance", NOT_SUMMARY_TARGET); // no summary button exists → closest misses, handler is a no-op
+    expect(ctx.el("glance").innerHTML).toContain("no items in flight");
+
+    // RUNNING pill while the glance is collapsed: the body must expand before
+    // the scroll-and-flash affordance runs (the chip querySelector returns
+    // null on the stub, so the flash itself is safely skipped here).
+    ctx.fire("status", RUNNING_PAYLOAD);
+    expect(ctx.el("glance").innerHTML).toContain('id="glance-body" class="mt-3 hidden"');
+    ctx.click("run-state");
+    expect(ctx.el("glance-body").classList.contains("hidden")).toBe(false);
+
+    // Back to empty: the toggle never appears, the plain line returns.
+    ctx.fire("status", IDLE_PAYLOAD);
+    expect(ctx.el("glance").innerHTML).toContain("no items in flight");
+    expect(ctx.el("glance").innerHTML).not.toContain("data-glance-summary");
   });
 });

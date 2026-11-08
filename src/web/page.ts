@@ -21,7 +21,9 @@
  * names, repo paths, slugs from the stream) goes through `esc()` at the
  * interpolation site or is assigned via `textContent`; `innerHTML` receives
  * only escaped/structural markup. All actions are same-origin fetch POSTs
- * with `Content-Type: application/json`; no CORS headers are emitted.
+ * with `Content-Type: application/json`; no CORS headers are emitted. The
+ * glance section's collapse state is client-side only (one module-level var,
+ * always collapsed on load) — never persisted, no localStorage.
  */
 
 export const PAGE_HTML = `<!DOCTYPE html>
@@ -449,6 +451,10 @@ var FLOW_TEXT = { inbox: 'text-ink-700', queue: 'text-white', parked: 'text-ambe
 
 var CURRENT = null;
 
+/* Factory-at-a-glance collapse: per page load only — starts collapsed,
+ * never persisted (no localStorage/session storage; the item's non-goal). */
+var glanceCollapsed = true;
+
 /* ================= helpers ================= */
 
 function esc(s) {
@@ -833,12 +839,59 @@ function renderGlance(p) {
     return '<div class="text-[11px] text-ink-400">⚠ ' + esc(s.file) + ' will be skipped — slug already claimed (#' + s.item.id + ', ' + esc(s.item.status) + ')</div>';
   }).join('');
   if (p.inbox.error) skipped += '<div class="text-[11px] text-red-600">inbox unreadable: ' + esc(p.inbox.error) + '</div>';
+  /* Collapsed-by-default section (spec §Page): a single clickable summary row
+   * hides the chip/inbox detail behind #glance-body until toggled. The empty
+   * state (no chips AND no inbox/skipped/error rows) keeps the plain line and
+   * no toggle. Counts come from the same glance filter the chips use — only
+   * static words + numbers enter the summary (no untrusted data, no esc gap). */
+  var runningCount = 0, queuedCount = 0, doneCount = 0;
+  glance.forEach(function (it) {
+    if (it.status === 'running') runningCount++;
+    else if (it.status === 'queued') queuedCount++;
+    else doneCount++;
+  });
+  var segments = [];
+  if (runningCount > 0) segments.push(runningCount + ' running');
+  if (queuedCount > 0) segments.push(queuedCount + ' queued');
+  if (doneCount > 0) segments.push(doneCount + ' landed');
+  if ((p.inbox.claimable || []).length > 0) segments.push((p.inbox.claimable || []).length + ' in inbox');
+  if (glance.length === 0 && !inbox && !skipped) {
+    $('glance').innerHTML =
+      '<div class="border-t border-ink-200 pt-6">' +
+      '<div class="text-[11px] font-semibold uppercase tracking-widest text-ink-400 mb-3">Factory at a glance</div>' +
+      '<div class="text-xs text-ink-400">no items in flight</div>' +
+      '</div>';
+    return;
+  }
   $('glance').innerHTML =
     '<div class="border-t border-ink-200 pt-6">' +
-    '<div class="text-[11px] font-semibold uppercase tracking-widest text-ink-400 mb-3">Factory at a glance</div>' +
-    (chips ? '<div class="flex flex-wrap gap-2">' + chips + '</div>' : '<div class="text-xs text-ink-400">no items in flight</div>') +
+    // A <button type="button">: keyboard users Tab to it and press Enter/Space,
+    // which the browser synthesizes into the same click the toggle handles.
+    '<button type="button" data-glance-summary aria-expanded="' + (glanceCollapsed ? 'false' : 'true') + '" title="expand/collapse the factory overview" class="inline-flex items-center gap-2 rounded-full border border-ink-200 bg-white px-3 py-1.5 text-xs shadow-sm cursor-pointer hover:bg-indigo-50/50 transition-colors">' +
+    '<span data-glance-glyph class="text-ink-400 font-mono">' + (glanceCollapsed ? '▸' : '▾') + '</span>' +
+    '<span class="font-semibold">Factory at a glance</span>' +
+    (segments.length ? '<span class="text-ink-500">· ' + segments.join(' · ') + '</span>' : '') +
+    '</button>' +
+    '<div id="glance-body" class="mt-3' + (glanceCollapsed ? ' hidden' : '') + '">' +
+    '<div class="flex flex-wrap gap-2">' + chips + '</div>' +
     ((inbox || skipped) ? '<div class="mt-4 flex flex-wrap gap-2">' + inbox + '</div><div class="mt-2 space-y-0.5">' + skipped + '</div>' : '') +
+    '</div>' +
     '</div>';
+}
+
+/* The single writer of glance collapse state — surgical DOM updates, never a
+ * re-render (a full repaint would destroy the just-clicked button and drop
+ * keyboard focus to <body>). Body absent means the empty render: nothing to
+ * toggle. classList add/remove only — the runtime-test stub has no toggle. */
+function applyGlanceCollapsed(collapsed) {
+  glanceCollapsed = collapsed;
+  var body = $('glance-body');
+  if (!body) return;
+  if (collapsed) body.classList.add('hidden'); else body.classList.remove('hidden');
+  var glyph = $('glance').querySelector('[data-glance-glyph]');
+  if (glyph) glyph.textContent = collapsed ? '▸' : '▾';
+  var btn = $('glance').querySelector('[data-glance-summary]');
+  if (btn && btn.setAttribute) btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
 }
 
 /* Header run-state pill. Three states (spec §Page): IDLE (calm stone chip,
@@ -934,6 +987,17 @@ function appendFeed(row) {
 }
 
 /* ================= parking-lot actions (event delegation) ================= */
+
+/* Glance collapse toggle — delegated to the permanent #glance container for
+ * the same reason the parking lot delegates: renderGlance replaces the
+ * container's innerHTML on every changed payload, so a listener on the
+ * generated summary button would not survive the next status event. The
+ * summary is a <button type="button">, so Enter/Space synthesize the same
+ * click — no separate keydown path. */
+$('glance').addEventListener('click', function (ev) {
+  if (!ev.target.closest('button[data-glance-summary]')) return;
+  applyGlanceCollapsed(!glanceCollapsed);
+});
 
 $('parking-lot').addEventListener('click', function (ev) {
   var btn = ev.target.closest('button[data-action]');
@@ -1133,11 +1197,14 @@ setInterval(function () {
   if (clock) clock.textContent = fmtMMSS(runAnchor.ageMs + (Date.now() - runAnchor.at));
 }, 1000);
 
-/* Bonus affordance: clicking the RUNNING pill scrolls to the glance row and
- * one-shot-flashes the running item's chip (wb-flash, removed on
- * animationend so a later click can re-fire it). */
+/* Bonus affordance: clicking the RUNNING pill scrolls to the glance row,
+ * auto-expanding it first if it is collapsed (a display:none chip can neither
+ * be scrolled to nor produce a visible wb-flash), then one-shot-flashes the
+ * running item's chip (wb-flash, removed on animationend so a later click can
+ * re-fire it). */
 $('run-state').addEventListener('click', function () {
   if (!runAnchor.running) return;
+  applyGlanceCollapsed(false); // expand before scroll/flash — order matters
   var glance = $('glance');
   if (glance.scrollIntoView) glance.scrollIntoView({ behavior: 'smooth', block: 'start' });
   (runAnchor.itemIds || []).forEach(function (id) {

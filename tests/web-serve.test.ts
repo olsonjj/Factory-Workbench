@@ -233,6 +233,11 @@ describe("wb serve: page, template, snapshot (CLI status contract)", () => {
     expect(PAGE_HTML).toContain('id="run-state"');
     expect(PAGE_HTML).toMatch(/setInterval\([\s\S]*?1000\)/);
     expect(PAGE_HTML).toContain("wb-flash");
+    // Glance collapse: the collapsed-by-default section ships the body
+    // container and the summary-button hook (behavior covered in
+    // tests/web-page-runtime.test.ts).
+    expect(PAGE_HTML).toContain('id="glance-body"');
+    expect(PAGE_HTML).toContain("data-glance-summary");
     // Combobox: the known-repos datalist options carry a per-repo item-count
     // label (escaped), and the repo input advertises the accepted forms.
     expect(PAGE_HTML).toContain("repos-dl");

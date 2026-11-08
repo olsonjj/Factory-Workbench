@@ -71,6 +71,7 @@ functional and the two never disagree about state.
 33. As a CLI user, I want `wb status` and the web UI to render from one shared status layer, so that the two surfaces can never disagree.
 34. As an operator who trusts their muscle memory, I want the CLI to remain unchanged and fully functional alongside the UI, so that the web server is additive, not a cutover.
 35. As an operator, I want the header to show a live RUNNING state with the running item, stage, and a ticking clock, so that liveness is visible at a glance.
+36. As a scanning operator, I want the "Factory at a glance" section collapsed by default into a single clickable summary (running/queued/landed + inbox counts) that expands to the chips and inbox detail on click, so the page stays short and fresh inbox contents still surface via the count hint, and I want the header RUNNING pill to auto-expand the row so its scroll-and-flash affordance keeps working while collapsed.
 
 ## Implementation Decisions
 
@@ -329,14 +330,26 @@ map (amber/red/orange/violet/fuchsia), stage-progress dots (stages before
 `item.stage` emerald, current dot in the status color, future stone),
 artifact links, note/reason inputs, per-question answer inputs, verbatim gate
 feedback, retry with inline 409/422 reasons, stale-base hint on the glance
-chips, PR links on done chips, human-rejected hint (Resume; no per-item
+chips, PR links on done chips — the glance section is collapsed by default on
+every page load behind a single clickable summary row (`<button
+type="button" data-glance-summary>` with `aria-expanded`, styled with the
+existing chip utilities, reading `▸ Factory at a glance · N running · N
+queued · N landed · N in inbox` — non-zero segments only; counts
+recomputed on every status event so the collapsed row updates live over
+SSE), with the chips (stale-base hints, PR links) and inbox detail
+(claimable/skipped/error rows) wrapped in `#glance-body`, hidden while
+collapsed; toggling is a delegated click handler on the permanent `#glance`
+container through `applyGlanceCollapsed` (per-load state, never persisted;
+the empty state keeps the plain "no items in flight" line with no toggle);
+human-rejected hint (Resume; no per-item
 button); Run/Resume buttons and the run-state pill in the header — IDLE (a
 calm stone chip, visibly inert: no pulse, no accent) when no lock is held,
 RUNNING while a live lock exists (pulsing blue dot, `#id slug · stage` per
 running item — or the holder pid when no item is running — and a `mm:ss`
 elapsed clock that ticks client-side every second and re-anchors from
 `lock.ageMs` on each status event; clicking the pill scrolls to the glance
-row and one-shot-flashes the running item's chip), the verbatim stale-lock
+row, auto-expanding it first if it is collapsed, and one-shot-flashes the
+running item's chip), the verbatim stale-lock
 text for a dead holder, and back to IDLE once the lock clears; an
 append-only live feed colored by event. EventSource auto-reconnect with
 `Last-Event-ID` provides gapless resume. Every untrusted string is rendered
@@ -375,3 +388,12 @@ JSON, artifact, error, SSE) and the page's self-containment (no CDN script,
 no remote URLs); CLI entry (spawned): fresh-root refusal
 (exit 0), invalid `--port` (friendly message, exit 1), EADDRINUSE (friendly
 message, exit 1).
+
+`tests/web-page-runtime.test.ts` — runs the page's inline script in a fresh
+V8 context with a minimal DOM stub and drives it exactly the way the browser
+does (`status` events on the EventSource): IDLE → RUNNING → stale-lock pill
+transitions with the ticking client-side clock, the glance's default-
+collapsed render with accurate per-status counts that update live over SSE,
+the click/keyboard toggle through the delegated summary handler, the
+RUNNING-pill auto-expand of a collapsed glance, and the toggle-free empty
+state.
