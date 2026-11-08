@@ -322,7 +322,6 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   <div class="ml-auto flex items-center gap-2">
     <span id="feed-status" class="text-xs text-ink-400"></span>
     <button id="btn-run" class="btn btn-dark">▶ Run</button>
-    <button id="btn-resume" class="btn btn-out">⟳ Resume</button>
   </div>
 </header>
 
@@ -370,7 +369,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
         </label>
         <label class="flex items-center gap-2 text-sm">
           <input id="f-runnow" type="checkbox" class="accent-indigo-600">
-          <span>run now — claim and advance the factory immediately after writing</span>
+          <span>run now — claim and drive the factory until it parks (approval gates still stop it)</span>
         </label>
         <div class="flex items-center gap-2">
           <button id="btn-submit" class="btn btn-dark bg-indigo-600 hover:bg-indigo-700">Write to inbox</button>
@@ -674,7 +673,7 @@ function cardHtml(it) {
   }
   if (it.status === 'human-rejected') {
     html += '<div class="text-xs text-ink-600 bg-white/70 border border-ink-200 rounded-md p-2.5">' +
-      'Rejected — the reason rides as feedback into the next agent run. Re-queue with <span class="font-mono">Resume</span> (it recovers every rejected item).</div>';
+      'Rejected — the reason rides as feedback into the next agent run. Re-queue with <span class="font-mono">Run</span> (it recovers every rejected item).</div>';
   }
   html += feedbackBox(it.feedback);
 
@@ -969,18 +968,11 @@ $('parking-lot').addEventListener('click', function (ev) {
   }
 });
 
-/* ================= header: Run / Resume ================= */
+/* ================= header: Run ================= */
 
 $('btn-run').addEventListener('click', function () {
   postJSON('/api/run', {}).then(function (r) {
-    if (r.status === 202) toast('run started — progress lands in the feed');
-    else if (r.status === 409) { renderLock(r.data && r.data.lock); toast('factory is busy — a run is already in progress'); }
-    else toast((r.data && r.data.error) || ('HTTP ' + r.status));
-  });
-});
-$('btn-resume').addEventListener('click', function () {
-  postJSON('/api/resume', {}).then(function (r) {
-    if (r.status === 202) toast('resume started — progress lands in the feed' + (r.data && r.data.capped ? ' (hit its safety cap — press Resume again)' : ''));
+    if (r.status === 202) toast('run started — progress lands in the feed' + (r.data && r.data.capped ? ' (hit its safety cap — press Run again)' : ''));
     else if (r.status === 409) { renderLock(r.data && r.data.lock); toast('factory is busy — a run is already in progress'); }
     else toast((r.data && r.data.error) || ('HTTP ' + r.status));
   });

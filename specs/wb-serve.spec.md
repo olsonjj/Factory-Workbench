@@ -62,7 +62,7 @@ functional and the two never disagree about state.
 24. As an operator with several tabs open, I want each tab to receive updates without multiplying load on the factory, so that leaving tabs open is cheap.
 25. As an operator holding a terminal, I want every UI action to go through the same factory lock as CLI commands, so that the web UI and CLI can never interleave destructively on the same item.
 26. As an operator, I want a "command in progress" indication (holder pid, age) surfaced from the factory lock, so that I know why an action can't start right now.
-27. As an operator, I want to trigger `run` and `resume` from the UI, so that I don't need a terminal open to keep the line moving.
+27. As an operator, I want one Run button that drives the factory on demand until every actionable item is parked or done, so that I don't need a terminal open to keep the line moving.
 28. As an operator, I want run/resume to execute in the background with the page reporting progress via the live feed, so that a multi-minute run doesn't hold or block the browser request.
 29. As an operator, I want finished items (PR URLs) linked from their landing card, so that post-factory review is one click.
 30. As a security-conscious operator, I want the server bound to localhost only by default, so that the factory isn't accidentally exposed to my network.
@@ -79,7 +79,7 @@ functional and the two never disagree about state.
 - **Share the status layer with the CLI.** Extract the inbox-classification and item-listing logic from the CLI's status command into a shared internal module that both the CLI renderer and the `/api/status` serializer call. The two surfaces render from one source; no divergence drift.
 - **Snapshot-then-delta streaming (SSE).** Updates stream over server-sent events. On connect, the server opens the DB readonly (exactly as `wb status` does — no factory lock) and sends a full snapshot: items, inbox classification, lock info, and the current max history id. Thereafter it polls via the existing watch snapshot feed (same source `wb watch` uses) at the watch interval and writes only new history rows, tagging each SSE event with the history id so the browser's `Last-Event-ID` recovery maps directly onto the `afterId` parameter.
 - **One poller, fanned out.** The server polls the DB once per tick regardless of connected SSE client count. Reconnect or second tab triggers a fresh snapshot; no client-side merge logic. Every write to an SSE client goes through one backpressure gate: chunks are written in slices; when the socket reports backpressure, the in-flight slice is left with Node (delivered exactly once) and the remaining queue pauses until `drain`. A client's queued-plus-undrained backlog is capped, and a client whose backlog exceeds the cap is cut — its reconnect replay (bounded) is the recovery path — so a stalled reader can never grow server memory without bound, while a healthy, actively-draining reader is never cut for receiving even a multi-megabyte snapshot.
-- **Actions are POSTs; run/resume are backgrounded.** Mutating endpoints (approve with optional note, reject with reason, retry, answer with ordered answers or freeform feedback, item authoring) each map to the corresponding orchestrator/authoring call exactly as the CLI command does. Run and resume are accepted as POSTs started in the background (single-flight enforced by the factory lock itself), and their progress is observed by the client purely through the SSE stream. A request arriving while the lock is held answers immediately with "in progress" plus lock-holder info rather than blocking or double-running.
+- **Actions are POSTs; run/resume are backgrounded.** Mutating endpoints (approve with optional note, reject with reason, retry, answer with ordered answers or freeform feedback, item authoring) each map to the corresponding orchestrator/authoring call exactly as the CLI command does. Run and resume are accepted as POSTs started in the background (single-flight enforced by the factory lock itself), and their progress is observed by the client purely through the SSE stream. A request arriving while the lock is held answers immediately with "in progress" plus lock-holder info rather than blocking or double-running. Both Run and Resume map to the same drive in the server — the claim pass plus `Orchestrator.resume()` looping `tickAll()` until no item changes state or the safety tick cap (`maxResumeTicks`, 500) — and the composer's `runNow` performs that same backgrounded drive after the write.
 - **Authoring goes through `authorItem`.** The composer posts title, repo, base, approval stages, and description body; the server validates repo and draft with the same validation functions the CLI's authoring path uses, then writes the front-matter'd markdown into the inbox. The composer-and-CLI-shared repo input accepts and expands `~` / `~/sub` (against the operator's home directory, read lazily per call), a bare name matching a known repo (first match in `knownReposNewestFirst` order — i.e. newest-first tie-break), and paths relative to the **factory root** (never the serve process's CWD); the expanded **absolute** path is what `authorItem` validates and persists (the stored front-matter format is unchanged — no relative paths persisted). Explicit-field mode only (no interactive prompts). File-drop posts write the uploaded markdown into the inbox as-is, matching claim/malformed semantics of the inbox scanner (their `repo:` is stored verbatim per claim rules — expansion applies only to composition).
 - **Artifact serving with containment.** Parked artifacts are served from paths under the factory root only; the endpoint resolves and rejects anything escaping the root. This single guard is what makes "read the spec before approving" safe in-browser.
 - **Localhost-only default.** The server binds to loopback by default with an explicit override for the rare non-default case. No authentication layer in scope — the binding is the boundary.
@@ -230,7 +230,7 @@ method) is therefore guarded before routing:
 | `POST /api/items/:id/reject` `{reason}` | 200 `{item}` / 400 missing reason / 404 / 409 |
 | `POST /api/items/:id/answer` `{answers: [{question, answer}]} | {feedback}` | 200 `{item}` / 400 / 404 / 409 |
 | `POST /api/items/:id/retry` | 200 `{item}` / 404 / 409 / 422 `still malformed: …` |
-| `POST /api/run`, `POST /api/resume` | 202 `{started: true, capped?}` / 409 `{busy: true, error, lock}` |
+| `POST /api/run`, `POST /api/resume` | 202 `{started: true, capped?}` / 409 `{busy: true, error, lock}` — both verbs now perform the identical backgrounded resume drive; the web server's `/api/run` deliberately diverges from CLI `wb run`'s one-stage semantics |
 
 Fixed error mapping: unknown item id → 404 (numeric ids only; id-or-slug
 prefix matching stays CLI-only). `requireStatus`/`retry`-guard and other
@@ -260,13 +260,18 @@ the `item`-field backstop).
   reason as 422 `still malformed: …`.
 - `run`/`resume`: the lock is acquired synchronously (busy → 409 + lock info);
   on success the response is 202 immediately (awaited in test mode) and the
-  task does the claim pass (`scanInbox`) then `tickAll()`/`resume()` (`capped`
-  reported; a capped resume logs the CLI's safety-cap line server-side).
-  Progress reaches clients only via SSE. Single-flight is enforced by the
-  lock itself (a second POST during a run → 409).
+  task does the claim pass (`scanInbox`) then `resume()` (the
+  drive-until-parked loop) for both endpoints — the web Run button and CLI
+  `wb run` intentionally diverge: CLI `wb run` stays one-stage
+  (`orch.tickAll()`), `wb resume` is unchanged (`capped` reported; a capped
+  drive logs the CLI's safety-cap line server-side). Resume also unparks
+  `human-rejected` items, feeding the rejection reason as feedback into the
+  next run — the UI Run button inherits that behavior. Progress reaches
+  clients only via SSE. Single-flight is enforced by the lock itself (a
+  second POST during a run → 409).
 - Composer writes go through `authorItem` (explicit-field mode,
   non-interactive `AuthoringIO`); `runNow: true` performs the identical
-  background-run procedure after the write and reports `runStarted` /
+  background-resume procedure after the write and reports `runStarted` /
   `runBusy`.
 - File drop: `filename` must be a plain `path.basename` (path-shaped input →
   400 — KB 2026-11-02 22:31 path-injection guard) matching
@@ -329,8 +334,9 @@ map (amber/red/orange/violet/fuchsia), stage-progress dots (stages before
 `item.stage` emerald, current dot in the status color, future stone),
 artifact links, note/reason inputs, per-question answer inputs, verbatim gate
 feedback, retry with inline 409/422 reasons, stale-base hint on the glance
-chips, PR links on done chips, human-rejected hint (Resume; no per-item
-button); Run/Resume buttons and the run-state pill in the header — IDLE (a
+chips, PR links on done chips, human-rejected hint (Run; no per-item
+button); the single Run button (backgrounded resume drive) and the run-state
+pill in the header — IDLE (a
 calm stone chip, visibly inert: no pulse, no accent) when no lock is held,
 RUNNING while a live lock exists (pulsing blue dot, `#id slug · stage` per
 running item — or the holder pid when no item is running — and a `mm:ss`
@@ -360,10 +366,13 @@ counts, questions, artifacts, prUrl, lock holder); approve (±note) /
 reject (400 vs 200) / retry (infra budget untouched, malformed 422→fixed 200,
 wrong status 409) / answer (subset, full set with merge, unknown question,
 free-form) driving real transitions; composer front-matter round-trip,
-field-shaped 422s, duplicate slug, `runNow`; drop byte-exactness, bad names,
-oversize, collision, malformed JSON; lock single-flight across every mutating
-endpoint plus a concurrent run during a slow-stage execution; resume to
-completion with `capped: false`; SSE snapshot-then-delta with ids,
+field-shaped 422s, duplicate slug, `runNow` (drives until parked — e.g.
+approval-gated composer items end `awaiting-approval`); drop byte-exactness,
+bad names, oversize, collision, malformed JSON; lock single-flight across
+every mutating endpoint plus a concurrent run during a slow-stage execution;
+resume to completion with `capped: false`; Run → resume mapping (`/api/run`
+on a human-rejected item revives and lands it, and an approval-parked item
+is not unparked); SSE snapshot-then-delta with ids,
 no-change quiet, `afterId`/`Last-Event-ID` resumption without gaps or
 duplicates, fan-out of one poll to two clients; artifact containment
 (200/400/403/404 matrix) plus symlink rejection (a symlink artifact → 404, a

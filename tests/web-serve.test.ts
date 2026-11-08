@@ -655,7 +655,7 @@ describe("wb serve: authoring (composer and file drop)", () => {
     expect(dup.body.errors![0]!.reason).toContain("already held");
   });
 
-  it("runNow claims and advances the item in the same request", async () => {
+  it("runNow claims and drives the item to its parking spot in the same request", async () => {
     const s = await makeServer();
     const repo = makeGitRepo();
     const r = await post(`${s.url}/api/items`, { ...composerBody(repo), runNow: true });
@@ -663,7 +663,9 @@ describe("wb serve: authoring (composer and file drop)", () => {
     expect(r.body.runStarted).toBe(true);
     const item = s.h.db.listItems()[0]!;
     expect(item.slug).toBe("add-retry-backoff");
-    expect(item.stage).toBe("spec"); // claimed, triage ran and passed
+    expect(item.status).toBe("awaiting-approval"); // the drive parked at the spec approval gate (composerBody asks for it)
+    expect(item.parkedDetail).toMatchObject({ stage: "spec" });
+    expect(item.stage).toBe("implement"); // stage already advanced to the parked stage's next step
     expect(s.h.db.getHistory(item.id).some((h) => h.event === "claimed")).toBe(true);
   });
 
@@ -721,11 +723,11 @@ describe("wb serve: lock single-flight and backgrounded run/resume", () => {
     } finally {
       release();
     }
-    // release → run proceeds: claims + one tick
+    // release → run proceeds: claims + drive until parked/done
     const run = await post(`${s.url}/api/run`, {});
     expect(run.status).toBe(202);
     expect(run.body.started).toBe(true);
-    expect(s.h.db.listItems()[0]!.stage).toBe("spec"); // triage ran
+    expect(s.h.db.listItems()[0]!.status).toBe("done"); // the drive ran the ungated item all the way to done
   });
 
   it("a concurrent run while one is executing gets 409 single-flight; the first run completes", async () => {
@@ -766,9 +768,10 @@ describe("wb serve: lock single-flight and backgrounded run/resume", () => {
       expect(second.body.lock!.pid).toBe(process.pid);
       const firstRes = await first;
       expect(firstRes.status).toBe(202);
-      expect(calls.length).toBe(1); // the second run executed nothing
+      expect(calls.map((c) => c.stage)).toEqual(STAGES.slice(0, -1)); // every runner stage ran once; the pr stage goes through the publisher — and the second run executed nothing
       const item = h.db.listItems()[0]!;
       expect(h.db.getHistory(item.id).some((ev) => ev.event === "claimed")).toBe(true);
+      expect(item.status).toBe("done");
     } finally {
       app.stop();
       server.closeAllConnections?.();
@@ -789,6 +792,48 @@ describe("wb serve: lock single-flight and backgrounded run/resume", () => {
     expect(r.body.started).toBe(true);
     expect(r.body.capped).toBe(false);
     expect(s.h.db.getItem(id)!.status).toBe("done"); // resumed through to the PR stage
+  });
+
+  it("POST /api/run has resume semantics: it revives a human-rejected item and lands it", async () => {
+    const s = await makeServer();
+    s.h.inboxFile("run-revive", { title: "Run revive", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    claim(s.h);
+    const id = s.h.db.listItems()[0]!.id;
+    parkAs(s.h, id, { status: "human-rejected", feedback: "fix it" });
+    const r = await post(`${s.url}/api/run`, {});
+    expect(r.status).toBe(202);
+    expect(r.body.started).toBe(true);
+    expect(r.body.capped).toBe(false);
+    expect(s.h.db.getItem(id)!.status).toBe("done"); // the Run button's drive revived and landed the item
+    const unparked = s.h.db.getHistory(id).find((h) => h.event === "unparked")!;
+    expect((unparked.detail as Record<string, unknown>).via).toBe("resume");
+    expect((unparked.detail as Record<string, unknown>).feedback).toBe("fix it");
+    // identical state → identical body from both verbs
+    const r2 = await post(`${s.url}/api/resume`, {});
+    expect(r2.status).toBe(202);
+    expect(r2.body).toEqual(r.body);
+  });
+
+  it("POST /api/run does not unpark an approval-gated item; the gate still stops the line", async () => {
+    const s = await makeServer();
+    s.h.inboxFile("gated", { title: "Gated item", repo: "/tmp/repo", base: "main", approvals: ["spec"] }, "Body.");
+    claim(s.h);
+    const id = s.h.db.listItems()[0]!.id;
+    const r = await post(`${s.url}/api/run`, {});
+    expect(r.status).toBe(202);
+    expect(r.body.started).toBe(true);
+    const item = s.h.db.getItem(id)!;
+    expect(item.status).toBe("awaiting-approval"); // parked at the spec approval gate
+    expect(item.parkedDetail).toMatchObject({ stage: "spec" });
+    expect(item.stage).toBe("implement"); // stage already advanced to the parked stage's next step
+    expect(s.h.db.getHistory(id).some((h) => h.event === "unparked")).toBe(false);
+    // no stage agent ran past the gate
+    expect((s.runner as ScriptedRunner).calls.every((c) => c.req.stage === "triage" || c.req.stage === "spec")).toBe(true);
+    // a further drive leaves it parked — the approval waits for a human
+    const again = await post(`${s.url}/api/run`, {});
+    expect(again.status).toBe(202);
+    expect(s.h.db.getItem(id)!.status).toBe("awaiting-approval");
+    expect(s.h.db.getHistory(id).some((h) => h.event === "unparked")).toBe(false);
   });
 });
 
