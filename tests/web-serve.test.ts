@@ -10,7 +10,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import * as http from "node:http";
 import * as path from "node:path";
 import * as os from "node:os";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as net from "node:net";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -248,6 +248,16 @@ describe("wb serve: page, template, snapshot (CLI status contract)", () => {
     expect(PAGE_HTML).toContain("repos-dl");
     expect(PAGE_HTML).toContain("k.count === 1 ? ' item' : ' items'");
     expect(PAGE_HTML).toContain("placeholder=\"repo name, Code/rel/path, ~/path, or /abs/path\"");
+    // Start Processing button: the renamed label, the renamed composer
+    // checkbox wording, and the spinner/disabled CSS are the static pieces a
+    // refactor could silently drop (the label/disable lifecycle is covered in
+    // tests/web-page-runtime.test.ts).
+    expect(PAGE_HTML).toContain("▶ Start Processing");
+    expect(PAGE_HTML).toContain("start processing now");
+    expect(PAGE_HTML).toContain("wb-spin");
+    expect(PAGE_HTML).toContain(".btn:disabled");
+    expect(PAGE_HTML).not.toContain(">Run</button>");
+    expect(PAGE_HTML).not.toContain("run now — claim");
     const s = await makeServer();
     for (const p of ["/", "/api/status", "/api/template", "/api/nope"]) {
       const res = await fetch(s.url + p);
@@ -884,6 +894,45 @@ describe("wb serve: SSE stream (snapshot-then-delta, one poller fanned out)", ()
     await new Promise((r) => setTimeout(r, 120));
     expect(stream.events.length).toBe(before);
     stream.abort();
+  });
+
+  it("emits a status event when the same lock holder dies without items or inbox changing", async () => {
+    const s = await makeServer();
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    if (holder.pid === undefined) throw new Error("failed to start lock holder");
+    const ts = Date.now();
+    writeFileSync(path.join(s.h.root, "factory.lock"), JSON.stringify({ pid: holder.pid, ts, id: "dead-holder-test" }));
+    const stream = connectEvents(s);
+    try {
+      await stream.waitUntil((n) => n >= 1);
+      const initial = JSON.parse(stream.events[0]!.data) as {
+        lock: { pid: number; ts: number; alive: boolean } | null;
+        items: unknown[];
+        inbox: { claimable: string[] };
+      };
+      expect(initial.lock).toMatchObject({ pid: holder.pid, ts, alive: true });
+      expect(initial.items).toEqual([]);
+      expect(initial.inbox.claimable).toEqual([]);
+
+      // Keep pid and ts identical: lock.alive is the ONLY fingerprinted field
+      // that changes, and this flush travels through the real SSE poller.
+      holder.kill();
+      await new Promise<void>((resolve) => holder.once("exit", () => resolve()));
+      s.app.flush();
+      await stream.waitUntil((n) => n >= 2);
+      expect(stream.events).toHaveLength(2);
+      expect(stream.events[1]!.event).toBe("status");
+      const dead = JSON.parse(stream.events[1]!.data) as typeof initial;
+      expect(dead.lock).toMatchObject({ pid: holder.pid, ts, alive: false });
+      expect(dead.items).toEqual(initial.items);
+      expect(dead.inbox.claimable).toEqual(initial.inbox.claimable);
+    } finally {
+      stream.abort();
+      if (holder.exitCode === null && holder.signalCode === null) {
+        holder.kill();
+        await new Promise<void>((resolve) => holder.once("exit", () => resolve()));
+      }
+    }
   });
 
   it("resumes from a last-event-id without gaps or duplicates (query param and header)", async () => {

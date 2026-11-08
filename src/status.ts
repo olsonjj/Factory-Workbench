@@ -199,7 +199,7 @@ export function statusFingerprint(payload: StatusPayload): string {
   const itemPart = payload.items
     .map((i) => [i.id, i.status, i.stage, i.parkedReason, JSON.stringify(i.parkedDetail), i.feedback, i.updatedAt].join("|"))
     .join(";");
-  return [itemPart, payload.inbox.claimable.join(","), payload.lock ? `${payload.lock.pid}@${payload.lock.ts}` : "-"].join("§");
+  return [itemPart, payload.inbox.claimable.join(","), payload.lock ? `${payload.lock.pid}@${payload.lock.ts}:${payload.lock.alive ? "alive" : "dead"}` : "-"].join("§");
 }
 
 /**

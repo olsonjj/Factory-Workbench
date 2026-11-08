@@ -20,15 +20,17 @@ function pageScript(html: string): string {
 
 interface StubElement {
   innerHTML: string;
+  readonly innerHTMLWrites: number;
   textContent: string;
   className: string;
   value: string;
   checked: boolean;
   disabled: boolean;
+  title: string;
   attributes: Record<string, string>;
-  setAttribute: (k: string, v: string) => void;
-  getAttribute: (k: string) => string | null;
-  removeAttribute: (k: string) => void;
+  setAttribute: (name: string, value: string) => void;
+  getAttribute: (name: string) => string | null;
+  removeAttribute: (name: string) => void;
   classList: { add: (c: string) => void; remove: (c: string) => void; contains: (c: string) => boolean };
   listeners: Map<string, Array<() => void>>;
   addEventListener: (t: string, fn: () => void) => void;
@@ -41,20 +43,25 @@ function makeStubElement(): StubElement {
   const listeners: Map<string, Array<() => void>> = new Map();
   const classes = new Set<string>();
   const attributes: Record<string, string> = {};
+  let html = "";
+  let innerHTMLWrites = 0;
   return {
-    innerHTML: "",
+    get innerHTML() { return html; },
+    set innerHTML(value) { html = value; innerHTMLWrites += 1; },
+    get innerHTMLWrites() { return innerHTMLWrites; },
     textContent: "",
     className: "",
     value: "",
     checked: false,
     disabled: false,
+    title: "",
     attributes,
-    setAttribute: (k, v) => {
-      attributes[k] = v;
+    setAttribute: (name, value) => {
+      attributes[name] = value;
     },
-    getAttribute: (k) => (k in attributes ? attributes[k] : null),
-    removeAttribute: (k) => {
-      delete attributes[k];
+    getAttribute: (name) => (name in attributes ? attributes[name] : null),
+    removeAttribute: (name) => {
+      delete attributes[name];
     },
     classList: {
       add: (c) => classes.add(c),
@@ -126,6 +133,8 @@ function makeContext() {
     sandbox,
     run: (script: string) => vm.runInContext(script, sandbox, { filename: "page-inline.js" }),
     el: (id: string) => document.getElementById(id),
+    /** Pending fetch queue — a click while disabled must add nothing. */
+    fetches,
     fire: (t: string, payload: unknown) => {
       if (!lastES) throw new Error("page never constructed an EventSource");
       lastES._fire(t, { data: JSON.stringify(payload) });
@@ -265,6 +274,137 @@ describe("wb serve page script (runtime behavior)", () => {
     expect(runState.innerHTML).toContain("IDLE");
     expect(runState.innerHTML).not.toContain("RUNNING");
     expect(runState.innerHTML).not.toContain("wb-spin");
+  });
+
+  it("labels the button ▶ Start Processing when idle and disables it as Processing… while a live lock runs", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle(); // the script's initial refreshStatus paints first
+
+    const btn = ctx.el("btn-run");
+    // Initial idle paint: static label, enabled, no tooltip, not busy.
+    expect(btn.innerHTML).toContain("▶ Start Processing");
+    expect(btn.innerHTML).not.toContain("Processing…");
+    expect(btn.disabled).toBe(false);
+    expect(btn.title).toBe("");
+    expect(btn.getAttribute("aria-busy")).toBe("false");
+
+    // Live lock: disabled, Processing… with the spinner, stop tooltip.
+    ctx.fire("status", RUNNING_PAYLOAD);
+    expect(btn.disabled).toBe(true);
+    expect(btn.innerHTML).toContain("Processing…");
+    expect(btn.innerHTML).toContain("wb-spin");
+    expect(btn.innerHTML).not.toContain("▶ Start Processing");
+    expect(btn.title).toContain("lock holder pid 7");
+    expect(btn.title).toContain("wb serve or wb run/wb resume");
+    expect(ctx.el("run-state").title).toBe(btn.title);
+    expect(btn.getAttribute("aria-busy")).toBe("true");
+
+    // Stale (dead) holder is not a drive in progress: re-enabled, tooltip
+    // cleared so it can never linger.
+    ctx.fire("status", DEAD_PAYLOAD);
+    expect(btn.disabled).toBe(false);
+    expect(btn.innerHTML).toContain("▶ Start Processing");
+    expect(btn.title).toBe("");
+    expect(ctx.el("run-state").title).toBe("");
+
+    // Lock cleared: fully reverted.
+    ctx.fire("status", IDLE_PAYLOAD);
+    expect(btn.disabled).toBe(false);
+    expect(btn.innerHTML).toContain("▶ Start Processing");
+    expect(btn.title).toBe("");
+    expect(btn.getAttribute("aria-busy")).toBe("false");
+  });
+
+  it("fires no POST /api/run while the button is disabled (no double-fire)", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    // Positive control: an idle click enqueues exactly one POST /api/run.
+    ctx.click("btn-run");
+    expect(ctx.fetches).toHaveLength(1);
+    expect(ctx.fetches[0].url).toBe("/api/run");
+    ctx.fetches.splice(0); // drop the control entry (left pending — harmless)
+
+    // Live lock: the button is disabled. The stub dispatches click listeners
+    // regardless of the disabled flag (browsers suppress the event), so this
+    // click proves the handler's early return: zero new fetch entries.
+    ctx.fire("status", RUNNING_PAYLOAD);
+    expect(ctx.el("btn-run").disabled).toBe(true);
+    ctx.click("btn-run");
+    expect(ctx.fetches).toHaveLength(0);
+  });
+
+  it("toasts 'processing started …' on 202 (plain and capped) and keeps the 409 busy wording verbatim", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    const flush = () => new Promise((r) => setTimeout(r, 10));
+
+    // 202, uncapped: the renamed verb only.
+    ctx.click("btn-run");
+    ctx.fetches[0].resolve({ status: 202, ok: true, json: async () => ({ started: true }) });
+    await flush();
+    expect(ctx.el("toast").textContent).toBe("processing started — progress lands in the feed");
+
+    // The 202 flight stays open until a status snapshot retires it; an idle
+    // snapshot (lock already cleared) re-enables the button for the next press.
+    ctx.fire("status", IDLE_PAYLOAD);
+
+    // 202, capped: the suffix survives but names the renamed control.
+    ctx.fetches.splice(0);
+    ctx.click("btn-run");
+    ctx.fetches[0].resolve({ status: 202, ok: true, json: async () => ({ started: true, capped: true }) });
+    await flush();
+    expect(ctx.el("toast").textContent).toBe(
+      "processing started — progress lands in the feed (hit its safety cap — press Start Processing again)",
+    );
+
+    // 409: busy wording unchanged, and the fresh lock the response carries
+    // disables the button through the same render path (renderLock shim).
+    // Retire the previous 202 flight first so the press is admitted.
+    ctx.fire("status", IDLE_PAYLOAD);
+    ctx.fetches.splice(0);
+    ctx.click("btn-run");
+    ctx.fetches[0].resolve({
+      status: 409,
+      ok: false,
+      json: async () => ({ busy: true, error: "factory is busy", lock: { alive: true, pid: 7, ageMs: 1000 } }),
+    });
+    await flush();
+    expect(ctx.el("toast").textContent).toBe("factory is busy — a run is already in progress");
+    expect(ctx.el("btn-run").disabled).toBe(true);
+
+    // A short-lived holder can disappear before this response arrives. The
+    // immediate status refresh is the re-enable path even when no later SSE
+    // fingerprint change occurs.
+    expect(ctx.fetches).toHaveLength(2);
+    expect(ctx.fetches[1].url).toBe("/api/status");
+    ctx.fetches[1].resolve({ status: 200, ok: true, json: async () => IDLE_PAYLOAD });
+    await flush();
+    expect(ctx.el("btn-run").disabled).toBe(false);
+  });
+
+  it("does not repaint the Start Processing spinner for repeated busy snapshots", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    const btn = ctx.el("btn-run");
+    ctx.fire("status", RUNNING_PAYLOAD);
+    const writesAfterFirstBusyPaint = btn.innerHTMLWrites;
+    ctx.fire("status", payload(
+      [{ id: 22, slug: "make-the-running-state-unmissable-in-the-web-ui-header", stage: "pr", status: "running" }],
+      { alive: true, pid: 7, ageMs: 70_000 },
+    ));
+    expect(btn.innerHTMLWrites).toBe(writesAfterFirstBusyPaint);
+    expect(btn.innerHTML).toContain("wb-spin");
+
+    ctx.fire("status", DEAD_PAYLOAD);
+    expect(btn.innerHTMLWrites).toBe(writesAfterFirstBusyPaint + 1);
+    expect(btn.disabled).toBe(false);
   });
 
   it("renders the glance collapsed by default with accurate counts, updating live over SSE without expanding", async () => {
@@ -522,12 +662,12 @@ describe("wb serve page script (runtime behavior)", () => {
 
     ctx.fire("status", payload([{ id: 23, slug: "queued-item", stage: "spec", status: "queued" }], null));
     const runState = ctx.el("run-state");
-    // Stone pill, static stone dot, blue "press Run" accent — non-error.
+    // Stone pill, static stone dot, blue "press Start Processing" accent — non-error.
     expect(runState.innerHTML).toContain("bg-ink-100");
     expect(runState.innerHTML).toContain("text-ink-700");
     expect(runState.innerHTML).toContain("bg-stone-400");
     expect(runState.innerHTML).toContain("PAUSED");
-    expect(runState.innerHTML).toContain('· <span class="text-blue-700">press Run</span> — #23 at spec');
+    expect(runState.innerHTML).toContain('· <span class="text-blue-700">press Start Processing</span> — #23 at spec');
     expect(runState.innerHTML).toContain('<button type="button"');
     expect(runState.innerHTML).not.toContain("wb-spin");
 
@@ -556,13 +696,14 @@ describe("wb serve page script (runtime behavior)", () => {
     );
     expect(btn.disabled).toBe(true);
 
-    // The next status snapshot with the live lock re-enables the button and
-    // repaints the pill as RUNNING (with its spinner).
+    // The next status snapshot retires the flight, then the LIVE lock takes
+    // over the button: Processing… + disabled while the drive runs (the
+    // lock-driven writer), and the pill repaints as RUNNING with its spinner.
     ctx.fire("status", RUNNING_PAYLOAD);
-    expect(btn.disabled).toBe(false);
-    expect(btn.innerHTML).not.toContain("wb-spin");
-    expect(btn.innerHTML).toContain("▶ Run");
-    expect(btn.getAttribute("aria-busy")).toBe(null);
+    expect(btn.disabled).toBe(true);
+    expect(btn.innerHTML).toContain("wb-spin");
+    expect(btn.innerHTML).toContain("Processing…");
+    expect(btn.getAttribute("aria-busy")).toBe("true");
     expect(runState.innerHTML).toContain("RUNNING");
     expect(runState.innerHTML).toContain("wb-spin");
   });
@@ -635,11 +776,13 @@ describe("wb serve page script (runtime behavior)", () => {
     expect(runState.innerHTML).toContain("RUNNING");
     expect(runState.innerHTML).toContain("(pid 7)");
     expect(ctx.el("toast").textContent).toContain("factory is busy");
-    // And its error handling re-enables the Run button immediately.
+    // The flight retires immediately; with a LIVE lock in the response the
+    // lock-driven writer owns the button: Processing… + disabled while that
+    // drive runs (the immediate status refresh re-enables it if the holder
+    // already exited).
     const btn = ctx.el("btn-run");
-    expect(btn.disabled).toBe(false);
-    expect(btn.innerHTML).not.toContain("wb-spin");
-    expect(btn.innerHTML).toContain("▶ Run");
+    expect(btn.disabled).toBe(true);
+    expect(btn.innerHTML).toContain("Processing…");
   });
 
   it("never stacks a second POST while a Run flight is open (button + PAUSED pill)", async () => {
@@ -655,15 +798,20 @@ describe("wb serve page script (runtime behavior)", () => {
     expect(ctx.totalRequests("/api/run")).toBe(1);
     expect(ctx.el("btn-run").disabled).toBe(true);
 
-    // 202, then the next status snapshot retires the flight and re-enables.
+    // 202, then the next status snapshot retires the flight; the LIVE lock
+    // then owns the button (Processing… + disabled) while the drive runs.
     const respond = (url: string) =>
       url === "/api/run" ? { ok: true, status: 202, json: async () => ({ started: true }) } : undefined;
     await ctx.settle(respond);
     expect(ctx.el("btn-run").disabled).toBe(true); // still awaiting the snapshot
     ctx.fire("status", RUNNING_PAYLOAD);
-    expect(ctx.el("btn-run").disabled).toBe(false);
+    expect(ctx.el("btn-run").disabled).toBe(true); // live lock: Processing…, not clickable
+    expect(ctx.el("btn-run").innerHTML).toContain("Processing…");
 
-    // Re-enabled: a fresh press opens a NEW flight (exactly one more POST).
+    // Lock cleared: re-enabled, and a fresh press opens a NEW flight
+    // (exactly one more POST).
+    ctx.fire("status", IDLE_PAYLOAD);
+    expect(ctx.el("btn-run").disabled).toBe(false);
     ctx.click("btn-run");
     expect(ctx.totalRequests("/api/run")).toBe(2);
     ctx.click("btn-run");
@@ -711,7 +859,7 @@ describe("wb serve page script (runtime behavior)", () => {
 
     expect(btn.disabled).toBe(false);
     expect(btn.innerHTML).not.toContain("wb-spin");
-    expect(btn.innerHTML).toContain("▶ Run");
+    expect(btn.innerHTML).toContain("▶ Start Processing");
     expect(btn.getAttribute("aria-busy")).toBe(null);
 
     // The retired flight is consistent: a fresh press opens a NEW one.
@@ -763,8 +911,8 @@ describe("wb serve page script (runtime behavior)", () => {
             }
           : undefined,
     );
-    expect(ctx.el("btn-run").disabled).toBe(false);
-    expect(ctx.el("btn-run").innerHTML).toContain("▶ Run");
+    expect(ctx.el("btn-run").disabled).toBe(true); // live lock in the 409: Processing… until the refresh reconciles
+    expect(ctx.el("btn-run").innerHTML).toContain("Processing…");
     expect(ctx.el("run-state").innerHTML).toContain("RUNNING");
     expect(ctx.totalRequests("/api/run")).toBe(1);
   });

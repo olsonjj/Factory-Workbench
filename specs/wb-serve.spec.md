@@ -62,7 +62,7 @@ functional and the two never disagree about state.
 24. As an operator with several tabs open, I want each tab to receive updates without multiplying load on the factory, so that leaving tabs open is cheap.
 25. As an operator holding a terminal, I want every UI action to go through the same factory lock as CLI commands, so that the web UI and CLI can never interleave destructively on the same item.
 26. As an operator, I want a "command in progress" indication (holder pid, age) surfaced from the factory lock, so that I know why an action can't start right now.
-27. As an operator, I want one Run button that drives the factory on demand until every actionable item is parked or done, so that I don't need a terminal open to keep the line moving.
+27. As an operator, I want one Start Processing button that drives the factory on demand until every actionable item is parked or done, so that I don't need a terminal open to keep the line moving.
 28. As an operator, I want run/resume to execute in the background with the page reporting progress via the live feed, so that a multi-minute run doesn't hold or block the browser request.
 29. As an operator, I want finished items (PR URLs) linked from their landing card, so that post-factory review is one click.
 30. As a security-conscious operator, I want the server bound to localhost only by default, so that the factory isn't accidentally exposed to my network.
@@ -262,12 +262,12 @@ the `item`-field backstop).
 - `run`/`resume`: the lock is acquired synchronously (busy → 409 + lock info);
   on success the response is 202 immediately (awaited in test mode) and the
   task does the claim pass (`scanInbox`) then `resume()` (the
-  drive-until-parked loop) for both endpoints — the web Run button and CLI
+  drive-until-parked loop) for both endpoints — the web Start Processing button and CLI
   `wb run` intentionally diverge: CLI `wb run` stays one-stage
   (`orch.tickAll()`), `wb resume` is unchanged (`capped` reported; a capped
   drive logs the CLI's safety-cap line server-side). Resume also unparks
   `human-rejected` items, feeding the rejection reason as feedback into the
-  next run — the UI Run button inherits that behavior. Progress reaches
+  next run — the UI Start Processing button inherits that behavior. Progress reaches
   clients only via SSE. Single-flight is enforced by the lock itself (a
   second POST during a run → 409).
 - Composer writes go through `authorItem` (explicit-field mode,
@@ -327,7 +327,7 @@ in flight / inbox / landed) + proportional flow bar (sub-9% segments demoted
 to a legend); the collapsible composer (title, repo combobox — free-form
 input plus a known-repos datalist whose option labels carry per-repo item
 counts, newest-first — base default "main", five approval-gate checkboxes, markdown
-description, "Start from template" prefill from `/api/template`, "run now",
+description, "Start from template" prefill from `/api/template`, "start processing now",
 and a file drop zone); the parking lot — one card per parked item (decision
 order: awaiting-approval, needs-human, exhausted-rework,
 infrastructure-failure, malformed, human-rejected, then id) with the color
@@ -335,7 +335,7 @@ map (amber/red/orange/violet/fuchsia), stage-progress dots (stages before
 `item.stage` emerald, current dot in the status color, future stone),
 artifact links, note/reason inputs, per-question answer inputs, verbatim gate
 feedback, retry with inline 409/422 reasons, stale-base hint on the glance
-chips, PR links on done chips, human-rejected hint (Run; no per-item
+chips, PR links on done chips, human-rejected hint (Start Processing; no per-item
 button); the glance section is collapsed by default on
 every page load behind a single clickable summary row (`<button
 type="button" data-glance-summary>` with `aria-expanded`, styled with the
@@ -347,14 +347,26 @@ SSE), with the chips (stale-base hints, PR links) and inbox detail
 collapsed; toggling is a delegated click handler on the permanent `#glance`
 container through `applyGlanceCollapsed` (per-load state, never persisted;
 the empty state keeps the plain "no items in flight" line with no toggle);
-the single Run button (backgrounded resume drive; it shows a spinner and
-is disabled while the backgrounded run is in flight — from press until
-the next status snapshot confirms the run's live lock (backed by a
-bounded watchdog deadline: a no-op drive can acquire and release the lock
-between poll ticks without changing the status fingerprint, so no status
-event follows and the 202-accepted flight must still retire on its own),
-or the busy-409 handling completes — and repeated clicks never stack a
-second POST; under `prefers-reduced-motion` no animation (spinner,
+the single Start Processing button (backgrounded resume drive; idle label
+`▶ Start Processing`; it shows a `wb-spin` spinner and is `disabled` while
+a flight is open — from press until the next status snapshot confirms the
+run's live lock (backed by a bounded watchdog deadline: a no-op drive can
+acquire and release the lock between poll ticks without changing the
+status fingerprint, so no status event follows and the 202-accepted flight
+must still retire on its own), or the busy-409 handling completes (with an
+immediate status refresh, since the holder may already have exited and an
+unchanged fingerprint can suppress the event) — and repeated clicks never
+stack a second POST. While a live factory lock exists the button reads
+`Processing…` with `aria-busy` and a stop-hint tooltip naming the
+lock-holder pid and the command holding it (`wb serve` or `wb run`/`wb
+resume` in its terminal), mirrored on the never-disabled run-state pill,
+re-enabling and reverting on the status event that shows the lock cleared
+(a dead holder is not a drive in progress — enabled, hints cleared; the
+lock fingerprint includes `alive`, so a dead-holder transition always
+emits). The lock-driven state derives from the same SSE status payload as
+the run-state pill — no new endpoint, no polling; no stop toggle, since a
+real stop would need a cancellation seam through the stage runner and is
+out of scope; under `prefers-reduced-motion` no animation (spinner,
 pulse, flash) runs) and the run-state pill in the header — a four-state machine derived
 on every status payload with the priority RUNNING > NEEDS REVIEW >
 PAUSED > IDLE: IDLE (a calm stone chip, visibly inert: no pulse, no
@@ -371,12 +383,13 @@ and `counts.decisions > 0` (an amber pill reading `NEEDS REVIEW · N
 parked — #<first parked id> at <its stage>`, first in parking-lot order;
 clicking it scrolls to the parking lot); PAUSED when no live lock, zero
 decisions, and at least one actionable item (queued/running; a stone pill
-reading `PAUSED · press Run — #<first id> at <its stage>`, non-error
-blue/stone accent; clicking it calls the same shared pressRun path as
-the Run button, including the busy-409 handling); the pill states that
-carry actions (RUNNING, NEEDS REVIEW, PAUSED) are plain `<button
-type="button">` elements so Tab/Enter/Space reach them (focus restored
-across re-renders like the glance summary), IDLE is a span; an
+reading `PAUSED · press Start Processing — #<first id> at <its stage>`,
+non-error blue/stone accent; clicking it calls the same shared pressRun
+path as the Start Processing button, including the busy-409 handling);
+the pill states that carry actions (RUNNING, NEEDS REVIEW, PAUSED) are
+plain `<button type="button">` elements so Tab/Enter/Space reach them
+(focus restored across re-renders like the glance summary), IDLE is a
+span; an
 append-only live feed colored by event. EventSource auto-reconnect with
 `Last-Event-ID` provides gapless resume. Every untrusted string is rendered
 through `esc()`/`textContent` (no raw `innerHTML` interpolation of data); all
@@ -414,7 +427,9 @@ hardening: non-JSON content types → 415 (charset suffix allowed), foreign /
 wrong-port / absent Host and mismatched Origin on `/api/*` → 403 while the
 static page is served regardless; the strict CSP on every response (page,
 JSON, artifact, error, SSE) and the page's self-containment (no CDN script,
-no remote URLs); CLI entry (spawned): fresh-root refusal
+no remote URLs) plus the Start Processing button's static markers (idle
+label, composer checkbox wording, spinner/disabled CSS, old-string absence);
+CLI entry (spawned): fresh-root refusal
 (exit 0), invalid `--port` (friendly message, exit 1), EADDRINUSE (friendly
 message, exit 1).
 
@@ -425,14 +440,19 @@ derivation and its priority (IDLE → RUNNING → stale-lock transitions with
 the ticking client-side clock and spinner; a live lock beats NEEDS REVIEW,
 and the verbatim stale text beats it too), the NEEDS REVIEW click scrolling
 to the parking lot (no POST fired), the PAUSED click firing exactly one
-`POST /api/run` (202 → the Run button stays disabled with its spinner until
-the next status snapshot re-enables it — or, when a no-op drive leaves the
-fingerprint untouched and no snapshot follows, a watchdog deadline
-re-enables it; busy-409 → lock re-render + busy toast + immediate
-re-enable), the no-double-fire guard across repeated Run-button/pill
-clicks — including an SSE drop while a POST is still pending, which must
-not defeat the guard — the reduced-motion stylesheet block present in the
-page source, the glance's default-collapsed render with accurate per-status
-counts that update live over SSE, the click/keyboard toggle through the
-delegated summary handler, the RUNNING-pill auto-expand of a collapsed
-glance, and the toggle-free empty state.
+`POST /api/run` (202 → the Start Processing button stays disabled with its
+spinner until the next status snapshot re-enables it — or, when a no-op
+drive leaves the fingerprint untouched and no snapshot follows, a watchdog
+deadline re-enables it; busy-409 → lock re-render + busy toast + immediate
+re-enable + an immediate status refresh), the no-double-fire guard across
+repeated button/pill clicks — including an SSE drop while a POST is still
+pending, which must not defeat the guard — the reduced-motion stylesheet
+block present in the page source, the glance's default-collapsed render
+with accurate per-status counts that update live over SSE, the
+click/keyboard toggle through the delegated summary handler, the
+RUNNING-pill auto-expand of a collapsed glance, the toggle-free empty
+state, and the Start Processing button's label/disabled/tooltip lifecycle
+(idle → live-lock `Processing…` with spinner and the stop tooltip → stale
+and idle re-enable), its no-double-fire guard while disabled (zero
+`POST /api/run` entries), and the 202 toast copy (plain and capped
+suffix).

@@ -63,6 +63,13 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .btn-out:hover { background: #f5f5f4; }
   .btn-ok { background: #059669; color: #fff; }
   .btn-ok:hover { background: #047857; }
+  /* Disabled buttons (Start Processing while a live drive runs): no pointer
+   * affordance, no hover darken. The wb-spin spinner class + keyframes live
+   * with the other component rules below (single definition), so
+   * prefers-reduced-motion retires every animation in one place. */
+  .btn:disabled { cursor: default; }
+  .btn-dark:disabled { background: #1c1917; }
+  .btn-dark:disabled:hover { background: #1c1917; } /* suppress the hover darken */
 
 /* ---- utilities: display / flex / grid / gaps ---- */
   .hidden { display: none; }
@@ -336,7 +343,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   <div id="run-state" class="hidden"></div>
   <div class="ml-auto flex items-center gap-2">
     <span id="feed-status" class="text-xs text-ink-400"></span>
-    <button id="btn-run" class="btn btn-dark">▶ Run</button>
+    <button id="btn-run" class="btn btn-dark">▶ Start Processing</button>
   </div>
 </header>
 
@@ -384,7 +391,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
         </label>
         <label class="flex items-center gap-2 text-sm">
           <input id="f-runnow" type="checkbox" class="accent-indigo-600">
-          <span>run now — claim and drive the factory until it parks (approval gates still stop it)</span>
+          <span>start processing now — claim and drive the factory until it parks (approval gates still stop it)</span>
         </label>
         <div class="flex items-center gap-2">
           <button id="btn-submit" class="btn btn-dark bg-indigo-600 hover:bg-indigo-700">Write to inbox</button>
@@ -699,7 +706,7 @@ function cardHtml(it) {
   }
   if (it.status === 'human-rejected') {
     html += '<div class="text-xs text-ink-600 bg-white/70 border border-ink-200 rounded-md p-2.5">' +
-      'Rejected — the reason rides as feedback into the next agent run. Re-queue with <span class="font-mono">Run</span> (it recovers every rejected item).</div>';
+      'Rejected — the reason rides as feedback into the next agent run. Re-queue with <span class="font-mono">Start Processing</span> (it recovers every rejected item).</div>';
   }
   html += feedbackBox(it.feedback);
 
@@ -944,6 +951,33 @@ function applyGlanceCollapsed(collapsed) {
 var runStateKind = 'idle'; // set on every render — read by the delegated click handler
 var runAnchor = { ageMs: 0, at: 0, running: false, itemIds: [] };
 
+/* Header Start Processing button (spec §Page): idle reads "▶ Start
+ * Processing"; while a LIVE factory lock exists (a drive in flight) it is
+ * disabled and reads "Processing…" with a wb-spin spinner. The button and
+ * never-disabled run-state pill share the same stop hint, including the
+ * actual holder pid. A stale (dead) holder is not a drive in progress —
+ * enabled, hints cleared. Repeated paints in the same busy/idle state leave
+ * innerHTML untouched so the spinner animation does not restart. */
+var lastRunButtonBusy = null;
+function renderRunButton(p) {
+  var btn = $('btn-run');
+  var lock = (p && p.lock) || null;
+  var busy = !!(lock && lock.alive);
+  var hint = busy
+    ? 'Processing — a drive is in progress (lock holder pid ' + lock.pid + '). To stop, end the command holding the lock (wb serve or wb run/wb resume in its terminal).'
+    : '';
+  btn.title = hint;
+  $('run-state').title = hint;
+  if (runInFlight) return; // the flight writer owns the button until the next snapshot retires it
+  if (lastRunButtonBusy === busy) return;
+  lastRunButtonBusy = busy;
+  btn.disabled = busy;
+  btn.setAttribute('aria-busy', busy ? 'true' : 'false');
+  btn.innerHTML = busy
+    ? '<span class="wb-spin" aria-hidden="true"></span>Processing…'
+    : '▶ Start Processing';
+}
+
 function deriveRunState(lock, decisions, actionable) {
   if (lock && lock.alive) return 'running';
   if (lock) return 'stale';              // dead holder — verbatim stale text, unchanged
@@ -954,6 +988,7 @@ function deriveRunState(lock, decisions, actionable) {
 
 function renderRunState(p) {
   var el = $('run-state');
+  renderRunButton(p);
   var lock = (p && p.lock) || null;
   var counts = (p && p.counts) || null;
   var decisions = counts ? (counts.decisions || 0) : 0;
@@ -1019,10 +1054,10 @@ function renderRunState(p) {
     var next = (p.items || []).filter(function (it) { return it.status === 'queued' || it.status === 'running'; })
       .sort(function (a, b) { return a.id - b.id; })[0];
     html =
-      '<button type="button" class="rounded-full ring-1 ' + STATUS_PILL.queued + ' text-xs px-3 py-1 inline-flex items-center gap-1.5 cursor-pointer" title="press Run — clicking here does the same">' +
+      '<button type="button" class="rounded-full ring-1 ' + STATUS_PILL.queued + ' text-xs px-3 py-1 inline-flex items-center gap-1.5 cursor-pointer" title="press Start Processing — clicking here does the same">' +
       '<span class="h-1.5 w-1.5 rounded-full ' + STATUS_DOT.queued + '"></span>' +
       '<span class="text-[10px] font-semibold tracking-widest">PAUSED</span>' +
-      '<span>· <span class="text-blue-700">press Run</span> — #' + (next ? next.id : 0) + ' at ' + esc((next && next.stage) || 'parked') + '</span>' +
+      '<span>· <span class="text-blue-700">press Start Processing</span> — #' + (next ? next.id : 0) + ' at ' + esc((next && next.stage) || 'parked') + '</span>' +
       '</button>';
   }
   el.innerHTML = html;
@@ -1118,22 +1153,22 @@ $('parking-lot').addEventListener('click', function (ev) {
   }
 });
 
-/* ================= header: Run ================= */
+/* ================= header: Start Processing ================= */
 
-/* Single-flight Run. Both the Run button and the PAUSED pill funnel through
- * pressRun() — clicking the PAUSED pill is indistinguishable from pressing
- * Run (identical POST path, toasts, and busy-409 handling). While a flight
- * is open the Run button shows a spinner and is disabled; repeated clicks
- * (button or pill) never stack a second POST. Retirement rules: the busy-409
- * and error paths re-enable immediately; a 202 keeps the button busy until
- * the NEXT status snapshot (render() retires the flight — the server
- * acquires the lock synchronously before responding and the status
- * fingerprint embeds the lock, so that snapshot always reflects the new
- * lock truth, acquired or already released by a fast-finished drive).
- * runInFlight guards the whole flight; flightPending marks the pre-response
- * window (inert, so an unrelated lockless status event racing the POST
- * cannot retire the flight early); flightAwaited marks "202 seen, retire on
- * the next snapshot".
+/* Single-flight Start Processing. Both the Start Processing button and the
+ * PAUSED pill funnel through pressRun() — clicking the PAUSED pill is
+ * indistinguishable from pressing Start Processing (identical POST path,
+ * toasts, and busy-409 handling). While a flight is open the button shows a
+ * spinner and is disabled; repeated clicks (button or pill) never stack a
+ * second POST. Retirement rules: the busy-409 and error paths re-enable
+ * immediately; a 202 keeps the button busy until the NEXT status snapshot
+ * (render() retires the flight — the server acquires the lock synchronously
+ * before responding and the status fingerprint embeds the lock, so that
+ * snapshot always reflects the new lock truth, acquired or already released
+ * by a fast-finished drive). runInFlight guards the whole flight;
+ * flightPending marks the pre-response window (inert, so an unrelated
+ * lockless status event racing the POST cannot retire the flight early);
+ * flightAwaited marks "202 seen, retire on the next snapshot".
  *
  * Watchdog: a 202's "next snapshot" does not always exist. A no-op drive
  * can acquire AND release the lock between two SSE poll ticks while changing
@@ -1171,11 +1206,14 @@ function pressRun() {
     if (r.status === 202) {
       flightAwaited = true;
       armRunFlightWatchdog();
-      toast('run started — progress lands in the feed' + (r.data && r.data.capped ? ' (hit its safety cap — press Run again)' : ''));
+      toast('processing started — progress lands in the feed' + (r.data && r.data.capped ? ' (hit its safety cap — press Start Processing again)' : ''));
     } else if (r.status === 409) {
+      clearRunFlight(); // retire first so the lock-driven writer can apply the fresh lock
       renderLock(r.data && r.data.lock);
       toast('factory is busy — a run is already in progress');
-      clearRunFlight();
+      // The holder may already have exited; reconcile immediately rather than
+      // waiting for an SSE event that an unchanged fingerprint can suppress.
+      refreshStatus();
     } else {
       toast((r.data && r.data.error) || ('HTTP ' + r.status));
       clearRunFlight();
@@ -1186,7 +1224,12 @@ function pressRun() {
   });
 }
 
-$('btn-run').addEventListener('click', pressRun);
+$('btn-run').addEventListener('click', function () {
+  // Browsers never dispatch click on a native-disabled button; the DOM-stub
+  // harness does regardless — the guard keeps that path assertable there.
+  if ($('btn-run').disabled) return;
+  pressRun();
+});
 
 function clearRunFlight() {
   if (flightWatchdog) { clearTimeout(flightWatchdog); flightWatchdog = null; }
@@ -1196,18 +1239,21 @@ function clearRunFlight() {
   setRunButtonBusy(false);
 }
 
-/* The only writer of #btn-run's dynamic state: spinner + disabled while a
- * Run flight is open, the static ▶ Run label otherwise. */
+/* The flight-window writer of #btn-run's dynamic state: spinner + disabled
+ * while a Run flight is open (before the lock shows in a snapshot), the
+ * static ▶ Start Processing label otherwise. Lock-driven paints belong to
+ * renderRunButton — the two never fight because renderRunButton defers
+ * while runInFlight. */
 function setRunButtonBusy(busy) {
   var btn = $('btn-run');
   if (busy) {
     btn.disabled = true;
     if (btn.setAttribute) btn.setAttribute('aria-busy', 'true');
-    btn.innerHTML = '<span class="wb-spin shrink-0"></span> Run';
+    btn.innerHTML = '<span class="wb-spin shrink-0" aria-hidden="true"></span> Processing…';
   } else {
     btn.disabled = false;
     if (btn.removeAttribute) btn.removeAttribute('aria-busy');
-    btn.innerHTML = '▶ Run';
+    btn.innerHTML = '▶ Start Processing';
   }
 }
 
@@ -1257,7 +1303,7 @@ $('btn-submit').addEventListener('click', function () {
   };
   postJSON('/api/items', body).then(function (r) {
     if (r.status === 201) {
-      toast('wrote ' + r.data.file + (r.data.runStarted ? ' — run started' : ' — the factory claims it on Run'));
+      toast('wrote ' + r.data.file + (r.data.runStarted ? ' — processing started' : ' — the factory claims it on Start Processing'));
       $('f-title').value = ''; $('f-desc').value = ''; $('f-runnow').checked = false;
       document.querySelectorAll('.approval-cb:checked').forEach(function (cb) { cb.checked = false; });
       refreshStatus();
