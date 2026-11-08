@@ -838,12 +838,14 @@ function renderGlance(p) {
   var skipped = (p.inbox.alreadyClaimed || []).map(function (s) {
     return '<div class="text-[11px] text-ink-400">⚠ ' + esc(s.file) + ' will be skipped — slug already claimed (#' + s.item.id + ', ' + esc(s.item.status) + ')</div>';
   }).join('');
-  if (p.inbox.error) skipped += '<div class="text-[11px] text-red-600">inbox unreadable: ' + esc(p.inbox.error) + '</div>';
-  /* Collapsed-by-default section (spec §Page): a single clickable summary row
-   * hides the chip/inbox detail behind #glance-body until toggled. The empty
-   * state (no chips AND no inbox/skipped/error rows) keeps the plain line and
-   * no toggle. Counts come from the same glance filter the chips use — only
-   * static words + numbers enter the summary (no untrusted data, no esc gap). */
+  /* The inbox-unreadable row renders OUTSIDE the collapsible body (and in the
+   * empty state) — a failure that was always visible pre-collapse must not
+   * hide behind display:none when the section is collapsed. */
+  var errorRow = p.inbox.error ? '<div class="text-[11px] text-red-600">inbox unreadable: ' + esc(p.inbox.error) + '</div>' : '';
+  /* Keyboard focus carried across the innerHTML replacement: if the summary
+   * button itself was focused when a payload re-render replaced it, restore
+   * focus to the new button (Enter/Space keep toggling without re-navigation). */
+  var hadFocus = !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('button[data-glance-summary]'));
   var runningCount = 0, queuedCount = 0, doneCount = 0;
   glance.forEach(function (it) {
     if (it.status === 'running') runningCount++;
@@ -855,11 +857,17 @@ function renderGlance(p) {
   if (queuedCount > 0) segments.push(queuedCount + ' queued');
   if (doneCount > 0) segments.push(doneCount + ' landed');
   if ((p.inbox.claimable || []).length > 0) segments.push((p.inbox.claimable || []).length + ' in inbox');
-  if (glance.length === 0 && !inbox && !skipped) {
+  /* Collapsed-by-default section (spec §Page): a single clickable summary row
+   * hides the chip/inbox detail behind #glance-body until toggled. The empty
+   * state (no chips AND no inbox/skipped/error rows) keeps the plain line and
+   * no toggle. Counts come from the same glance filter the chips use — only
+   * static words + numbers enter the summary (no untrusted data, no esc gap). */
+  if (glance.length === 0 && !inbox && !skipped && !errorRow) {
     $('glance').innerHTML =
       '<div class="border-t border-ink-200 pt-6">' +
       '<div class="text-[11px] font-semibold uppercase tracking-widest text-ink-400 mb-3">Factory at a glance</div>' +
       '<div class="text-xs text-ink-400">no items in flight</div>' +
+      errorRow +
       '</div>';
     return;
   }
@@ -876,7 +884,12 @@ function renderGlance(p) {
     '<div class="flex flex-wrap gap-2">' + chips + '</div>' +
     ((inbox || skipped) ? '<div class="mt-4 flex flex-wrap gap-2">' + inbox + '</div><div class="mt-2 space-y-0.5">' + skipped + '</div>' : '') +
     '</div>' +
+    errorRow +
     '</div>';
+  if (hadFocus) {
+    var summary = $('glance').querySelector('button[data-glance-summary]');
+    if (summary && summary.focus) summary.focus();
+  }
 }
 
 /* The single writer of glance collapse state — surgical DOM updates, never a

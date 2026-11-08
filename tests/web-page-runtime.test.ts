@@ -28,6 +28,7 @@ interface StubElement {
   listeners: Map<string, Array<() => void>>;
   addEventListener: (t: string, fn: () => void) => void;
   querySelector: () => null;
+  focus?: () => void;
   scrollIntoView?: () => void;
 }
 
@@ -112,6 +113,19 @@ function makeContext() {
       if (!lastES) throw new Error("page never constructed an EventSource");
       lastES._fire(t, { data: JSON.stringify(payload) });
     },
+    /** Mirror the rendered markup's `hidden` state onto the glance-body stub's
+     * classList so class assertions can't pass vacuously: the writer toggles
+     * the stub's classes, but the stub never parsed the rendered HTML — an
+     * unseeded stub starts WITHOUT `hidden`, so `expect(remove)` checks would
+     * pass even if the writer stopped removing it (greptile P2 27). The
+     * marker matches the container itself: `id="glance-body" class="mt-3
+     * hidden"` (collapsed) vs `id="glance-body" class="mt-3"` (open). */
+    syncGlanceBodyFromMarkup: () => {
+      const markup = document.getElementById("glance").innerHTML;
+      const body = document.getElementById("glance-body");
+      if (/id="glance-body"[^>]*\bhidden\b/.test(markup)) body.classList.add("hidden");
+      else body.classList.remove("hidden");
+    },
     /** Dispatch a click on an element's registered click listeners, exactly
      * like a browser click: handlers receive `{ target }` (the element
      * itself unless the test passes a fake inner target, e.g. for delegated
@@ -136,7 +150,11 @@ function makeContext() {
 /** Full status payload — every render*() field the script reads off a snapshot.
  * Items may be running/queued/done (counts derive from them); `opts.claimable`
  * feeds both `inbox.claimable` and the inbox count. */
-function payload(items: unknown[], lock: unknown, opts?: { claimable?: string[] }) {
+function payload(
+  items: unknown[],
+  lock: unknown,
+  opts?: { claimable?: string[]; error?: string | null },
+) {
   const claimable = opts?.claimable ?? [];
   const count = (s: string) => items.filter((i: any) => i.status === s).length;
   return {
@@ -150,7 +168,7 @@ function payload(items: unknown[], lock: unknown, opts?: { claimable?: string[] 
       done: count("done"),
     },
     flow: [],
-    inbox: { claimable, alreadyClaimed: [], error: null },
+    inbox: { claimable, alreadyClaimed: [], error: opts?.error ?? null },
     lock,
   };
 }
@@ -271,7 +289,12 @@ describe("wb serve page script (runtime behavior)", () => {
     // Collapsed render: the hidden class rides on the body's markup.
     expect(ctx.el("glance").innerHTML).toContain('id="glance-body" class="mt-3 hidden"');
 
-    // Delegated click on the summary button expands the body.
+    // Delegated click on the summary button expands the body. The stub's
+    // classList is synced from the rendered markup first, so this assertion
+    // is only satisfiable if the writer actually REMOVES the hidden class
+    // (an unseeded stub would make the check vacuously true).
+    ctx.syncGlanceBodyFromMarkup();
+    expect(ctx.el("glance-body").classList.contains("hidden")).toBe(true);
     ctx.click("glance", SUMMARY_TARGET);
     expect(ctx.el("glance-body").classList.contains("hidden")).toBe(false);
 
@@ -286,6 +309,10 @@ describe("wb serve page script (runtime behavior)", () => {
     expect(ctx.el("glance").innerHTML).not.toContain('class="mt-3 hidden"');
 
     // Second click collapses again (the single writer re-adds the class).
+    // Sync from the (now open) markup first so the add must come from the
+    // click, not from the initial stub state.
+    ctx.syncGlanceBodyFromMarkup();
+    expect(ctx.el("glance-body").classList.contains("hidden")).toBe(false);
     ctx.click("glance", SUMMARY_TARGET);
     expect(ctx.el("glance-body").classList.contains("hidden")).toBe(true);
 
@@ -310,6 +337,8 @@ describe("wb serve page script (runtime behavior)", () => {
     // null on the stub, so the flash itself is safely skipped here).
     ctx.fire("status", RUNNING_PAYLOAD);
     expect(ctx.el("glance").innerHTML).toContain('id="glance-body" class="mt-3 hidden"');
+    ctx.syncGlanceBodyFromMarkup();
+    expect(ctx.el("glance-body").classList.contains("hidden")).toBe(true);
     ctx.click("run-state");
     expect(ctx.el("glance-body").classList.contains("hidden")).toBe(false);
 
@@ -317,5 +346,63 @@ describe("wb serve page script (runtime behavior)", () => {
     ctx.fire("status", IDLE_PAYLOAD);
     expect(ctx.el("glance").innerHTML).toContain("no items in flight");
     expect(ctx.el("glance").innerHTML).not.toContain("data-glance-summary");
+  });
+
+  it("keeps the inbox-unreadable error row visible outside the collapsible body", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    const BROKEN = payload(
+      [{ id: 31, slug: "epsilon", status: "done" }],
+      null,
+      { error: "EACCES: permission denied, scandir" },
+    );
+    ctx.fire("status", BROKEN);
+    const glance = ctx.el("glance").innerHTML;
+    // The error row renders, and OUTSIDE #glance-body: the collapsed body is
+    // display:none, so a row inside it would be invisible by default. Assert
+    // the row sits after the body's closing markup (the render ends
+    // `…</div>' + errorRow + '</div>`), not inside the hidden container.
+    expect(glance).toContain("inbox unreadable: EACCES: permission denied, scandir");
+    expect(glance).toMatch(/inbox unreadable:[^]*<\/div><\/div>$/);
+    expect(glance).toContain("1 landed");
+
+    // Error-only (no items at all): not the empty state — the summary row
+    // still appears so the failure can't hide behind 'no items in flight'.
+    const EMPTY_BROKEN = payload([], null, { error: "unreadable inbox" });
+    ctx.fire("status", EMPTY_BROKEN);
+    expect(ctx.el("glance").innerHTML).toContain("data-glance-summary");
+    expect(ctx.el("glance").innerHTML).toContain("inbox unreadable: unreadable inbox");
+  });
+
+  it("restores keyboard focus to the summary button after a payload re-render", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    // A keyboard user has focused the summary button; an SSE status event
+    // re-renders the section (innerHTML replacement). The new button must
+    // receive focus() again, so Enter/Space keep toggling without a manual
+    // Tab-back. The stub exposes a fake focused node (activeElement.closest
+    // hits the summary selector) and a glance.querySelector returning an
+    // instrumented replacement button; the page must call its focus().
+    let focusCalls = 0;
+    const fakeBtn = { focus: () => {
+      focusCalls++;
+    } };
+    (ctx.el("glance") as unknown as { querySelector: (sel: string) => unknown }).querySelector =
+      (sel: string) => (sel === "button[data-glance-summary]" ? fakeBtn : null);
+    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = {
+      closest: (sel: string) => (sel === "button[data-glance-summary]" ? { attributes: {} } : null),
+    };
+
+    ctx.fire("status", payload([{ id: 12, slug: "beta", status: "queued" }], null, { claimable: ["a.md"] }));
+    expect(focusCalls).toBe(1);
+
+    // Re-render with focus elsewhere: no refocus attempt, no crash.
+    (ctx.el("glance") as unknown as { querySelector: (sel: string) => unknown }).querySelector = () => null;
+    ctx.fire("status", payload([{ id: 12, slug: "beta", status: "done" }], null, { claimable: [] }));
+    expect(focusCalls).toBe(1);
   });
 });
