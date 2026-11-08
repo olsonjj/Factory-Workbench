@@ -226,12 +226,18 @@ describe("wb serve: page, template, snapshot (CLI status contract)", () => {
     expect(PAGE_HTML).not.toContain("https://");
     expect(PAGE_HTML).not.toContain("http://");
     expect(PAGE_HTML).toContain("<style>");
-    // The header run-state pill: the SSE render path writes into #run-state,
-    // and the per-second client-side clock tick and the glance-chip flash
-    // class are the pieces a refactor could silently drop.
+    // Header run-state pill: the SSE render path writes into #run-state, and
+    // the per-second clock tick and glance-chip flash class are the pieces a
+    // refactor could silently drop (full behavior covered in
+    // tests/web-page-runtime.test.ts).
     expect(PAGE_HTML).toContain('id="run-state"');
-    expect(PAGE_HTML).toMatch(/setInterval\([\s\S]*?1000\)/);
+    expect(PAGE_HTML).toMatch(/setInterval\([\s\S]*?1000\))/);
     expect(PAGE_HTML).toContain("wb-flash");
+    // Combobox: the known-repos datalist options carry a per-repo item-count
+    // label (escaped), and the repo input advertises the accepted forms.
+    expect(PAGE_HTML).toContain("repos-dl");
+    expect(PAGE_HTML).toContain("k.count === 1 ? ' item' : ' items'");
+    expect(PAGE_HTML).toContain("placeholder=\"repo name, Code/rel/path, ~/path, or /abs/path\"");
     const s = await makeServer();
     for (const p of ["/", "/api/status", "/api/template", "/api/nope"]) {
       const res = await fetch(s.url + p);
@@ -535,6 +541,91 @@ describe("wb serve: authoring (composer and file drop)", () => {
       expect(parsed.item.base).toBe("main");
       expect(parsed.item.approvals).toEqual(["spec"]);
       expect(parsed.item.body).toContain("Backoff for webhook delivery.");
+    }
+  });
+
+  it("accepts a ~/-prefixed repo, expanded against the operator's home", async () => {
+    const s = await makeServer();
+    const fakeHome = mkdtempSync(path.join(os.tmpdir(), "wb-serve-home-"));
+    extraDirs.push(fakeHome);
+    mkdirSync(path.join(fakeHome, "dev", "x", ".git"), { recursive: true });
+    const prevHome = process.env.HOME;
+    const prevProfile = process.env.USERPROFILE;
+    try {
+      process.env.HOME = fakeHome;
+      process.env.USERPROFILE = fakeHome;
+      const r = await post(`${s.url}/api/items`, composerBody("~/dev/x"));
+      expect(r.status).toBe(201);
+      const file = path.join(s.h.paths.inbox, "add-retry-backoff.md");
+      const parsed = parseItemMarkdown(s.h.readFile(file));
+      expect(parsed.ok).toBe(true);
+      if (parsed.ok) expect(parsed.item.repo).toBe(path.join(fakeHome, "dev", "x"));
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+      if (prevProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevProfile;
+    }
+  });
+
+  it("resolves a relative repo against the factory root, not the serve process CWD", async () => {
+    const s = await makeServer();
+    // A git repo INSIDE the factory root; the test process CWD is a different
+    // temp dir, so a 201 here proves resolution used deps.root.
+    const repo = path.join(s.h.root, "Code", "x");
+    mkdirSync(path.join(repo, ".git"), { recursive: true });
+    const r = await post(`${s.url}/api/items`, composerBody("Code/x"));
+    expect(r.status).toBe(201);
+    const file = path.join(s.h.paths.inbox, "add-retry-backoff.md");
+    const parsed = parseItemMarkdown(s.h.readFile(file));
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.item.repo).toBe(repo);
+  });
+
+  it("accepts a bare known-repo name from the dropdown, identical to the absolute path", async () => {
+    const repo = makeGitRepo();
+    // Seed the known-repos list (what the dropdown is built from) on server A.
+    const sa = await makeServer();
+    sa.h.db.insertItem({
+      slug: "seed", title: "Seed", repo, base: "main",
+      approvals: [], stage: "triage", status: "queued",
+    });
+    const byName = await post(`${sa.url}/api/items`, composerBody(path.basename(repo)));
+    expect(byName.status).toBe(201);
+    // Server B posts the absolute path with otherwise identical fields.
+    const sb = await makeServer();
+    const byPath = await post(`${sb.url}/api/items`, composerBody(repo));
+    expect(byPath.status).toBe(201);
+
+    const fileA = path.join(sa.h.paths.inbox, "add-retry-backoff.md");
+    const fileB = path.join(sb.h.paths.inbox, "add-retry-backoff.md");
+    expect(sa.h.readFile(fileA)).toBe(sb.h.readFile(fileB));
+    const parsed = parseItemMarkdown(sa.h.readFile(fileA));
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.item.repo).toBe(repo);
+  });
+
+  it("returns a field-shaped repo error naming the expanded path, in the fixed order", async () => {
+    const s = await makeServer();
+    const fakeHome = mkdtempSync(path.join(os.tmpdir(), "wb-serve-home-"));
+    extraDirs.push(fakeHome);
+    const prevHome = process.env.HOME;
+    const prevProfile = process.env.USERPROFILE;
+    try {
+      process.env.HOME = fakeHome;
+      process.env.USERPROFILE = fakeHome;
+      const r = await post(`${s.url}/api/items`, {
+        title: "  ",
+        repo: "~/definitely/not/there",
+        base: "",
+        approvals: ["bogus-stage"],
+        description: "",
+      });
+      expect(r.status).toBe(422);
+      expect(r.body.errors!.map((e) => e.field)).toEqual(["title", "repo", "base", "approvals", "description"]);
+      const repoErr = r.body.errors!.find((e) => e.field === "repo")!;
+      expect(repoErr.reason).toContain(path.join(fakeHome, "definitely", "not", "there"));
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+      if (prevProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevProfile;
     }
   });
 

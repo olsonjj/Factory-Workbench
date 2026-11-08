@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import * as path from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import nodeProcess from "node:process";
 
 import { loadConfig, ensureConfigFile } from "../config.js";
@@ -22,6 +23,19 @@ import { runGc, GitGcScanner, GitGcReaper, renderGcHuman, renderGcJson, type GcF
 import { sleep } from "../util.js";
 
 const program = new Command("wb");
+
+// Version source of truth is the root package.json "version" field. Guarded:
+// an unreadable/malformed file must not crash every wb invocation (even
+// --help), only --version's output degrades.
+function readPackageVersion(): string {
+  try {
+    const raw = readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8");
+    return (JSON.parse(raw) as { version?: string }).version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+const packageVersion = readPackageVersion();
 
 interface StatusFlags { all?: boolean }
 
@@ -132,7 +146,8 @@ function logClaimReport(report: ReturnType<typeof scanInbox>): void {
 
 program
   .name("wb")
-  .description("A small, sequentially-processing software factory: markdown inbox in, reviewed pull request out.");
+  .description("A small, sequentially-processing software factory: markdown inbox in, reviewed pull request out.")
+  .version(packageVersion);
 
 program
   .command("init")

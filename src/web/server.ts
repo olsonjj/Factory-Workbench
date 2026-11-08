@@ -35,7 +35,7 @@ import { Orchestrator } from "../pipeline.js";
 import type { CuratorRunner, ItemRecord, StageRunner } from "../types.js";
 import type { PrPublisher } from "../pipeline.js";
 import { ITEM_TEMPLATE, parseApprovalsInput } from "../frontmatter.js";
-import { authorItem, validateRepoPath, type AuthoringIO } from "../new.js";
+import { authorItem, expandRepoInput, validateRepoPath, type AuthoringIO } from "../new.js";
 import { scanInbox } from "../inbox.js";
 import { GitBaseFreshnessChecker, type BaseFreshnessChecker } from "../baseFreshness.js";
 import { parseIntervalSeconds } from "../watch.js";
@@ -666,7 +666,10 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     if (repoRaw.trim().length === 0) {
       errors.push({ field: "repo", reason: "repo is required" });
     } else {
-      repo = path.resolve(repoRaw);
+      // Same expansion the CLI's authoring path uses: `~`/`~/sub` against the
+      // operator's home, a bare known-repo name (newest-first tie-break), and
+      // relative paths against the factory root — never the serve process CWD.
+      repo = expandRepoInput(repoRaw, { baseDir: deps.root, knownRepos: deps.db.knownReposNewestFirst() });
       const v = validateRepoPath(repo);
       if (!v.ok) errors.push({ field: "repo", reason: v.reason });
     }

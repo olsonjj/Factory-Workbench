@@ -1,4 +1,5 @@
 import { existsSync, statSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
   parseApprovalsInput, slugForTitle, validateItemDraft,
@@ -29,6 +30,47 @@ export interface NewOptions {
 export type NewResult =
   | { ok: true; file: string; slug: string; markdown: string }
   | { ok: false; reason: string; aborted?: boolean };
+
+export interface KnownRepo { repo: string; count: number }
+
+/** Expand a raw repo input (CLI `--repo`, interactive answer, or composer
+ *  field) into the absolute candidate path that `validateRepoPath` checks.
+ *  Rules, applied in order:
+ *  1. trim;
+ *  2. `~` / `~/sub` expand against the operator's home directory
+ *     (`os.homedir()` read lazily on every call, so env overrides work);
+ *  3. a bare name equal to a known repo's basename resolves to that repo's
+ *     stored path, resolved to ABSOLUTE (hand-written items can persist a
+ *     relative `repo:`) — the FIRST match wins, and `knownRepos` arrive in
+ *     `knownReposNewestFirst` order, so an ambiguous basename deterministically
+ *     resolves to the newest repo;
+ *  4. anything else resolves against `baseDir` (the factory root, never the
+ *     process CWD); absolute inputs pass through unchanged. `~otheruser/x` is
+ *  deliberately NOT tilde-expanded: it falls through to rules 3–4 and fails
+ *  validation with a clear reason.
+ *  The result is only ever fed to path validation — it is never persisted raw. */
+export function expandRepoInput(
+  raw: string,
+  opts: { baseDir: string; knownRepos?: KnownRepo[] },
+): string {
+  const trimmed = raw.trim();
+  if (trimmed === "~") return path.resolve(os.homedir());
+  if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+    return path.resolve(os.homedir(), trimmed.slice(2));
+  }
+  const known = opts.knownRepos;
+  if (known) {
+    for (const k of known) {
+      if (path.basename(k.repo) === trimmed) {
+        // Hand-written items persist `repo:` verbatim, so a stored entry can be
+        // relative — resolve it (absolute entries are untouched) so expansion
+        // never returns a CWD-dependent path.
+        return path.resolve(k.repo);
+      }
+    }
+  }
+  return path.resolve(opts.baseDir, trimmed);
+}
 
 export function validateRepoPath(repo: string): { ok: true } | { ok: false; reason: string } {
   if (!existsSync(repo)) return { ok: false, reason: `repo path does not exist: ${repo}` };
@@ -91,9 +133,9 @@ export async function authorItem(opts: NewOptions, db: FactoryDb, paths: Factory
   let repo = (opts.repo ?? "").trim();
   if (!repo) {
     if (!canPrompt) return fail("--repo is required when stdin is not a TTY");
-    repo = await promptRepo(io, known);
+    repo = await promptRepo(io, known, paths.root);
   } else {
-    repo = path.resolve(repo);
+    repo = expandRepoInput(repo, { baseDir: paths.root, knownRepos: known });
     const v = validateRepoPath(repo);
     if (!v.ok) return fail(`--repo ${repo}: ${v.reason}`);
   }
@@ -161,7 +203,7 @@ function fail(reason: string): { ok: false; reason: string } {
   return { ok: false, reason };
 }
 
-async function promptRepo(io: AuthoringIO, known: { repo: string; count: number }[]): Promise<string> {
+async function promptRepo(io: AuthoringIO, known: KnownRepo[], root: string): Promise<string> {
   for (;;) {
     if (known.length > 0) {
       io.out("Known repos (newest first):");
@@ -180,9 +222,10 @@ async function promptRepo(io: AuthoringIO, known: { repo: string; count: number 
       io.err("No known repo to default to — enter a repository path.");
       continue;
     }
-    const v = validateRepoPath(path.resolve(candidate));
+    const expanded = expandRepoInput(candidate, { baseDir: root, knownRepos: known });
+    const v = validateRepoPath(expanded);
     if (!v.ok) { io.err(`${v.reason} — try again.`); continue; }
-    return path.resolve(candidate);
+    return expanded;
   }
 }
 

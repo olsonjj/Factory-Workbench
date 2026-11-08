@@ -106,6 +106,18 @@ wb new "Implement the thing" \
 # the description on stdin. Omit --approvals for a fully autonomous item.
 ```
 
+The `--repo` value (and the interactive prompt, and the composer's repo field
+in `wb serve`) accepts the forms people actually have in their heads — all of
+them are expanded to an absolute path before validation, and that absolute
+path is what gets stored:
+
+- an absolute path: `/Users/me/Code/some-repo`
+- `~` or a `~/`-prefixed path, expanded against your home directory: `~/dev/x`
+- a bare repo name matching a repo an existing item already targets (a bare
+  name matching several resolves to the most recently used one)
+- a path relative to the **factory root** (not your current directory):
+  `Code/factory-1`
+
 You can also write the file yourself (see `wb template`):
 
 ```markdown
@@ -119,7 +131,9 @@ approvals: []          # allowed: triage, spec, implement, test, review
 Describe the task. This file is the item's source of truth.
 ```
 
-Drop it into `factory/inbox/`, then run `wb run`.
+Drop it into `factory/inbox/`, then run `wb run`. Hand-written files store
+`repo:` verbatim (claim rules do not expand it) — use an absolute path here;
+the expansion forms above apply to `wb new` and the composer.
 
 ### Command reference
 
@@ -133,7 +147,7 @@ read `FACTORY_ROOT` or an existing config's `root` value.
 |---|---|
 | `wb init [--root <dir>]` | Create the factory layout and default config. |
 | `wb template` | Print a work-item markdown template. |
-| `wb new [description]` | Author an item interactively or with `--title`, `--repo`, `--base`, `--approvals`, and `--description-file`. |
+| `wb new [description]` | Author an item interactively or with `--title`, `--repo`, `--base`, `--approvals`, and `--description-file`. `--repo` accepts `~/…`, a bare known-repo name, or a path relative to the factory root. |
 | `wb run` | Claim inbox items and advance every actionable item by one stage. |
 | `wb resume` | Recover interrupted/rejected items and continue until they park or finish. |
 | `wb status [--all]` | Show items other than completed ones and their parked reasons; `--all` includes done items. |
@@ -150,6 +164,8 @@ read `FACTORY_ROOT` or an existing config's `root` value.
 `--force-dirty`, and `--force-orphans`. The mutating flags require `--apply`;
 `--force-branches` is meaningful only with `--delete-branches`. See the safety
 rules below or `wb gc --help`.
+
+`wb --version` (or `wb -V`) prints the CLI version and exits.
 
 `wb status`, `wb watch`, and report-mode `wb gc` are read-only: they take no
 factory lock, claim nothing, and do not create or write `factory.db`, so they
