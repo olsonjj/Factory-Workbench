@@ -63,6 +63,15 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .btn-out:hover { background: #f5f5f4; }
   .btn-ok { background: #059669; color: #fff; }
   .btn-ok:hover { background: #047857; }
+  /* Disabled buttons (Start Processing while a live drive runs): no pointer
+   * affordance, no hover darken, and the spinner is a class — never an
+   * inline style — so prefers-reduced-motion can retire it. */
+  .btn:disabled { cursor: default; }
+  .btn-dark:disabled { background: #1c1917; }
+  .btn-dark:disabled:hover { background: #1c1917; } /* suppress the hover darken */
+  .wb-spin { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 9999px; animation: wb-spin 1s linear infinite; }
+  @keyframes wb-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .wb-spin { animation: none; } }
 
 /* ---- utilities: display / flex / grid / gaps ---- */
   .hidden { display: none; }
@@ -323,7 +332,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   <div id="run-state" class="hidden"></div>
   <div class="ml-auto flex items-center gap-2">
     <span id="feed-status" class="text-xs text-ink-400"></span>
-    <button id="btn-run" class="btn btn-dark">▶ Run</button>
+    <button id="btn-run" class="btn btn-dark">▶ Start Processing</button>
   </div>
 </header>
 
@@ -371,7 +380,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
         </label>
         <label class="flex items-center gap-2 text-sm">
           <input id="f-runnow" type="checkbox" class="accent-indigo-600">
-          <span>run now — claim and drive the factory until it parks (approval gates still stop it)</span>
+          <span>start processing now — claim and drive the factory until it parks (approval gates still stop it)</span>
         </label>
         <div class="flex items-center gap-2">
           <button id="btn-submit" class="btn btn-dark bg-indigo-600 hover:bg-indigo-700">Write to inbox</button>
@@ -679,7 +688,7 @@ function cardHtml(it) {
   }
   if (it.status === 'human-rejected') {
     html += '<div class="text-xs text-ink-600 bg-white/70 border border-ink-200 rounded-md p-2.5">' +
-      'Rejected — the reason rides as feedback into the next agent run. Re-queue with <span class="font-mono">Run</span> (it recovers every rejected item).</div>';
+      'Rejected — the reason rides as feedback into the next agent run. Re-queue with <span class="font-mono">Start Processing</span> (it recovers every rejected item).</div>';
   }
   html += feedbackBox(it.feedback);
 
@@ -917,8 +926,40 @@ function applyGlanceCollapsed(collapsed) {
  * fragment (409 handlers, via the renderLock shim); items defaults to []. */
 var runAnchor = { ageMs: 0, at: 0, running: false, itemIds: [] };
 
+/* Header Start Processing button (spec §Page): idle reads "▶ Start
+ * Processing"; while a LIVE factory lock exists (a drive in flight) it is
+ * disabled and reads "Processing…" with a wb-spin spinner, carrying a tooltip
+ * that says how to actually stop today. Derived purely from each status
+ * payload — the same lock signal the run-state pill uses — so every paint is
+ * correct by construction: a lock acquire or release always changes the tick
+ * fingerprint (lock pid@ts vs '-') and emits a status event within one poll.
+ * There is deliberately NO client-side pending-flight flag and no watchdog:
+ * the only transient is the ≤2s window between a 202 and the next SSE tick,
+ * where a second click hits the server's existing 409 single-flight, whose
+ * renderLock shim disables the button through this same path. A stale
+ * (dead) holder is not a drive in progress — enabled, tooltip cleared. The
+ * element is mutated in place, never replaced, so the permanent click
+ * listener survives and a disabled button is natively unfocusable (no
+ * double-fire possible). */
+function renderRunButton(p) {
+  var btn = $('btn-run');
+  var lock = (p && p.lock) || null;
+  if (lock && lock.alive) {
+    btn.disabled = true;
+    btn.title = 'Processing — a drive is in progress. To stop, end wb serve in its terminal (Ctrl+C).';
+    btn.setAttribute('aria-busy', 'true');
+    btn.innerHTML = '<span class="wb-spin" aria-hidden="true"></span>Processing…';
+  } else {
+    btn.disabled = false;
+    btn.title = '';
+    btn.setAttribute('aria-busy', 'false');
+    btn.innerHTML = '▶ Start Processing';
+  }
+}
+
 function renderRunState(p) {
   var el = $('run-state');
+  renderRunButton(p);
   var lock = (p && p.lock) || null;
   if (!lock) {
     runAnchor.running = false;
@@ -1045,11 +1086,15 @@ $('parking-lot').addEventListener('click', function (ev) {
   }
 });
 
-/* ================= header: Run ================= */
+/* ================= header: Start Processing ================= */
 
 $('btn-run').addEventListener('click', function () {
+  var btn = $('btn-run');
+  // Browsers never dispatch click on a native-disabled button; the DOM-stub
+  // harness does regardless — the guard keeps that path assertable there.
+  if (btn.disabled) return;
   postJSON('/api/run', {}).then(function (r) {
-    if (r.status === 202) toast('run started — progress lands in the feed' + (r.data && r.data.capped ? ' (hit its safety cap — press Run again)' : ''));
+    if (r.status === 202) toast('processing started — progress lands in the feed' + (r.data && r.data.capped ? ' (hit its safety cap — press Start Processing again)' : ''));
     else if (r.status === 409) { renderLock(r.data && r.data.lock); toast('factory is busy — a run is already in progress'); }
     else toast((r.data && r.data.error) || ('HTTP ' + r.status));
   });
@@ -1101,7 +1146,7 @@ $('btn-submit').addEventListener('click', function () {
   };
   postJSON('/api/items', body).then(function (r) {
     if (r.status === 201) {
-      toast('wrote ' + r.data.file + (r.data.runStarted ? ' — run started' : ' — the factory claims it on Run'));
+      toast('wrote ' + r.data.file + (r.data.runStarted ? ' — processing started' : ' — the factory claims it on Start Processing'));
       $('f-title').value = ''; $('f-desc').value = ''; $('f-runnow').checked = false;
       document.querySelectorAll('.approval-cb:checked').forEach(function (cb) { cb.checked = false; });
       refreshStatus();

@@ -243,6 +243,16 @@ describe("wb serve: page, template, snapshot (CLI status contract)", () => {
     expect(PAGE_HTML).toContain("repos-dl");
     expect(PAGE_HTML).toContain("k.count === 1 ? ' item' : ' items'");
     expect(PAGE_HTML).toContain("placeholder=\"repo name, Code/rel/path, ~/path, or /abs/path\"");
+    // Start Processing button: the renamed label, the renamed composer
+    // checkbox wording, and the spinner/disabled CSS are the static pieces a
+    // refactor could silently drop (the label/disable lifecycle is covered in
+    // tests/web-page-runtime.test.ts).
+    expect(PAGE_HTML).toContain("▶ Start Processing");
+    expect(PAGE_HTML).toContain("start processing now");
+    expect(PAGE_HTML).toContain("wb-spin");
+    expect(PAGE_HTML).toContain(".btn:disabled");
+    expect(PAGE_HTML).not.toContain(">Run</button>");
+    expect(PAGE_HTML).not.toContain("run now — claim");
     const s = await makeServer();
     for (const p of ["/", "/api/status", "/api/template", "/api/nope"]) {
       const res = await fetch(s.url + p);
