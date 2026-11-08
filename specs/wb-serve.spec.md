@@ -349,10 +349,13 @@ container through `applyGlanceCollapsed` (per-load state, never persisted;
 the empty state keeps the plain "no items in flight" line with no toggle);
 the single Run button (backgrounded resume drive; it shows a spinner and
 is disabled while the backgrounded run is in flight — from press until
-the next status snapshot confirms the run's live lock, or the busy-409
-handling completes — and repeated clicks never stack a second POST;
-under `prefers-reduced-motion` no animation (spinner, pulse, flash)
-runs) and the run-state pill in the header — a four-state machine derived
+the next status snapshot confirms the run's live lock (backed by a
+bounded watchdog deadline: a no-op drive can acquire and release the lock
+between poll ticks without changing the status fingerprint, so no status
+event follows and the 202-accepted flight must still retire on its own),
+or the busy-409 handling completes — and repeated clicks never stack a
+second POST; under `prefers-reduced-motion` no animation (spinner,
+pulse, flash) runs) and the run-state pill in the header — a four-state machine derived
 on every status payload with the priority RUNNING > NEEDS REVIEW >
 PAUSED > IDLE: IDLE (a calm stone chip, visibly inert: no pulse, no
 accent) when no lock is held and nothing is actionable; RUNNING while a
@@ -423,9 +426,12 @@ the ticking client-side clock and spinner; a live lock beats NEEDS REVIEW,
 and the verbatim stale text beats it too), the NEEDS REVIEW click scrolling
 to the parking lot (no POST fired), the PAUSED click firing exactly one
 `POST /api/run` (202 → the Run button stays disabled with its spinner until
-the next status snapshot re-enables it; busy-409 → lock re-render + busy
-toast + immediate re-enable), the no-double-fire guard across repeated
-Run-button/pill clicks, the reduced-motion stylesheet block present in the
+the next status snapshot re-enables it — or, when a no-op drive leaves the
+fingerprint untouched and no snapshot follows, a watchdog deadline
+re-enables it; busy-409 → lock re-render + busy toast + immediate
+re-enable), the no-double-fire guard across repeated Run-button/pill
+clicks — including an SSE drop while a POST is still pending, which must
+not defeat the guard — the reduced-motion stylesheet block present in the
 page source, the glance's default-collapsed render with accurate per-status
 counts that update live over SSE, the click/keyboard toggle through the
 delegated summary handler, the RUNNING-pill auto-expand of a collapsed

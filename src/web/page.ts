@@ -1133,10 +1133,33 @@ $('parking-lot').addEventListener('click', function (ev) {
  * runInFlight guards the whole flight; flightPending marks the pre-response
  * window (inert, so an unrelated lockless status event racing the POST
  * cannot retire the flight early); flightAwaited marks "202 seen, retire on
- * the next snapshot". */
+ * the next snapshot".
+ *
+ * Watchdog: a 202's "next snapshot" does not always exist. A no-op drive
+ * can acquire AND release the lock between two SSE poll ticks while changing
+ * nothing observable — no fingerprint change, so the poller emits no status
+ * event and the awaited-202 state would wedge the button forever. The
+ * watchdog backs that state with a deadline (RUN_FLIGHT_WATCHDOG_MS,
+ * comfortably above 2x the default 2s serve poll interval): if no snapshot
+ * retires the flight within the grace period, the timer does — and only
+ * when the flight is still awaited-and-not-pending. clearRunFlight() always
+ * clears the timer, so it can never fire late over a retired flight. */
 var runInFlight = false;
 var flightAwaited = false;
 var flightPending = false;
+var flightWatchdog = null;
+var RUN_FLIGHT_WATCHDOG_MS = 6000;
+
+/* Arms the re-enable deadline for the awaited-202 state. Called only from
+ * the 202 branch; the timer retires the flight itself if no status snapshot
+ * arrives first (render()'s pre-clear normally wins the race). */
+function armRunFlightWatchdog() {
+  if (flightWatchdog) clearTimeout(flightWatchdog);
+  flightWatchdog = setTimeout(function () {
+    flightWatchdog = null;
+    if (runInFlight && flightAwaited && !flightPending) clearRunFlight();
+  }, RUN_FLIGHT_WATCHDOG_MS);
+}
 
 function pressRun() {
   if (runInFlight) return; // no double-fire
@@ -1147,6 +1170,7 @@ function pressRun() {
     flightPending = false;
     if (r.status === 202) {
       flightAwaited = true;
+      armRunFlightWatchdog();
       toast('run started — progress lands in the feed' + (r.data && r.data.capped ? ' (hit its safety cap — press Run again)' : ''));
     } else if (r.status === 409) {
       renderLock(r.data && r.data.lock);
@@ -1165,8 +1189,10 @@ function pressRun() {
 $('btn-run').addEventListener('click', pressRun);
 
 function clearRunFlight() {
+  if (flightWatchdog) { clearTimeout(flightWatchdog); flightWatchdog = null; }
   runInFlight = false;
   flightAwaited = false;
+  flightPending = false; // every exit path leaves the flags consistent
   setRunButtonBusy(false);
 }
 
@@ -1324,9 +1350,13 @@ es.onerror = function () {
   $('feed-status').textContent = 'reconnecting…';
   $('feed-status').className = 'text-xs text-amber-600';
   // SSE died mid-run: never leave the operator with a permanently disabled
-  // Run button. A later press while the old drive still holds the lock lands
-  // in the (unchanged) busy-409 path, which is correct.
-  clearRunFlight();
+  // Run button — but only the awaited-202 state is cleared here. A drop
+  // while a POST is still pending must not defeat the no-double-fire guard
+  // (that POST's own handlers re-enable on 409/error, and the watchdog
+  // covers a 202 whose snapshot never arrives). A later press while the
+  // old drive still holds the lock lands in the (unchanged) busy-409 path,
+  // which is correct.
+  if (runInFlight && flightAwaited && !flightPending) clearRunFlight();
 };
 
 /* Header RUNNING clock: one interval, created once at init. Each status

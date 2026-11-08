@@ -671,6 +671,104 @@ describe("wb serve page script (runtime behavior)", () => {
     await ctx.settle(respond);
   });
 
+  it("re-enables the Run button via the watchdog deadline when a no-op run produces no status snapshot", async () => {
+    // Rework scenario: a 202's "re-enable on the next status snapshot" rule
+    // wedges forever when the drive was a no-op — the lock came and went
+    // between poll ticks, the fingerprint never changed, no SSE event
+    // follows. The awaited-202 state must be backed by a deadline. The
+    // page's setTimeout is replaced with a recorder so the test fires the
+    // watchdog deterministically (the toast's 2.6s hide timer also lands in
+    // the recorder; the watchdog is the one with the multi-second delay).
+    const ctx = makeContext();
+    const recorded: Array<{ fn: () => void; ms: number }> = [];
+    ctx.sandbox.setTimeout = (fn: () => void, ms?: number) => {
+      recorded.push({ fn, ms: ms ?? 0 });
+    };
+    ctx.sandbox.clearTimeout = () => {};
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", payload([{ id: 23, slug: "queued-item", stage: "spec", status: "queued" }], null));
+    ctx.click("btn-run");
+    expect(ctx.countRequests("/api/run")).toBe(1);
+
+    // 202 accepted — and NO status snapshot ever follows.
+    await ctx.settle(
+      (url) =>
+        url === "/api/run"
+          ? { ok: true, status: 202, json: async () => ({ started: true }) }
+          : undefined,
+    );
+    const btn = ctx.el("btn-run");
+    expect(btn.disabled).toBe(true); // still busy: nothing has retired the flight yet
+    expect(btn.innerHTML).toContain("wb-spin");
+
+    // The watchdog the 202 armed is a real multi-second deadline (≥ 2x the
+    // default 2s serve poll interval) — fire it with no snapshot in sight.
+    const watchdog = recorded.reduce((a, b) => (b.ms > a.ms ? b : a));
+    expect(watchdog.ms).toBeGreaterThanOrEqual(4000);
+    watchdog.fn();
+
+    expect(btn.disabled).toBe(false);
+    expect(btn.innerHTML).not.toContain("wb-spin");
+    expect(btn.innerHTML).toContain("▶ Run");
+    expect(btn.getAttribute("aria-busy")).toBe(null);
+
+    // The retired flight is consistent: a fresh press opens a NEW one.
+    ctx.click("btn-run");
+    expect(ctx.totalRequests("/api/run")).toBe(2);
+    await ctx.settle(
+      (url) =>
+        url === "/api/run"
+          ? { ok: true, status: 202, json: async () => ({ started: true }) }
+          : undefined,
+    );
+  });
+
+  it("an SSE drop while a POST is still pending does not defeat the no-double-fire guard", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", payload([{ id: 23, slug: "queued-item", stage: "spec", status: "queued" }], null));
+    ctx.click("btn-run"); // flight opens, POST pending (unsettled)
+    expect(ctx.countRequests("/api/run")).toBe(1);
+    expect(ctx.el("btn-run").disabled).toBe(true);
+
+    // SSE dies while the POST is pending. The guarded es.onerror clears only
+    // the awaited-202 state, so the flight stays open — the POST's own
+    // handlers remain responsible for re-enabling.
+    const es = ctx.sandbox.es as unknown as { onerror: () => void };
+    expect(typeof es.onerror).toBe("function");
+    es.onerror();
+    expect(ctx.el("btn-run").disabled).toBe(true);
+
+    // Repeated clicks (button + PAUSED pill) still cannot stack a POST.
+    ctx.click("btn-run");
+    ctx.click("run-state");
+    expect(ctx.totalRequests("/api/run")).toBe(1);
+
+    // The pending POST's own 409 handling re-enables and renders the lock.
+    await ctx.settle(
+      (url) =>
+        url === "/api/run"
+          ? {
+              ok: false,
+              status: 409,
+              json: async () => ({
+                busy: true,
+                error: "factory is busy — a run is already in progress",
+                lock: { alive: true, pid: 7, ageMs: 100 },
+              }),
+            }
+          : undefined,
+    );
+    expect(ctx.el("btn-run").disabled).toBe(false);
+    expect(ctx.el("btn-run").innerHTML).toContain("▶ Run");
+    expect(ctx.el("run-state").innerHTML).toContain("RUNNING");
+    expect(ctx.totalRequests("/api/run")).toBe(1);
+  });
+
   it("restores keyboard focus to the run-state pill after a payload re-render", async () => {
     const ctx = makeContext();
     ctx.run(pageScript(PAGE_HTML));
