@@ -24,13 +24,18 @@ import { sleep } from "../util.js";
 
 const program = new Command("wb");
 
-// Version source of truth is the root package.json "version" field; never
-// hard-code it here.
-const packageVersion = (
-  JSON.parse(readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8")) as {
-    version: string;
+// Version source of truth is the root package.json "version" field. Guarded:
+// an unreadable/malformed file must not crash every wb invocation (even
+// --help), only --version's output degrades.
+function readPackageVersion(): string {
+  try {
+    const raw = readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8");
+    return (JSON.parse(raw) as { version?: string }).version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
   }
-).version;
+}
+const packageVersion = readPackageVersion();
 
 interface StatusFlags { all?: boolean }
 

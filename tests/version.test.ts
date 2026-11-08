@@ -14,6 +14,9 @@ function runWb(args: string[]): { stdout: string; stderr: string; status: number
   const res = spawnSync("node", ["--import", "tsx", cliPath, ...args], {
     encoding: "utf8",
     timeout: 120_000,
+    // Pin to the repo root so the bare "tsx" specifier resolves even if the
+    // suite is ever launched from outside the repo tree.
+    cwd: path.dirname(packageJsonPath),
   });
   return { stdout: res.stdout ?? "", stderr: res.stderr ?? "", status: res.status ?? -1 };
 }
