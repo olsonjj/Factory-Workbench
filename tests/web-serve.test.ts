@@ -233,6 +233,11 @@ describe("wb serve: page, template, snapshot (CLI status contract)", () => {
     expect(PAGE_HTML).toContain('id="run-state"');
     expect(PAGE_HTML).toMatch(/setInterval\([\s\S]*?1000\)/);
     expect(PAGE_HTML).toContain("wb-flash");
+    // Run-state machine: the shared single-flight Run path and the
+    // reduced-motion degradation are the pieces a refactor could silently
+    // drop (full behavior covered in tests/web-page-runtime.test.ts).
+    expect(PAGE_HTML).toContain("pressRun");
+    expect(PAGE_HTML).toContain("prefers-reduced-motion");
     // Glance collapse: the collapsed-by-default section ships the body
     // container and the summary-button hook (behavior covered in
     // tests/web-page-runtime.test.ts).
