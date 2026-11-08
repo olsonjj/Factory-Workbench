@@ -800,59 +800,50 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     });
   }
 
-  /** Read one root-relative file's text; any failure (ENOENT, EACCES, a GC'd
-   *  tree, a mid-rewrite) is a visible `null` in a 200 payload — never an
-   *  error status. Async like handleArtifact's read (rework-5 discipline). */
+  /** Read one root-relative file's text WITHOUT bypassing the artifact
+   *  route's containment (Greptile PR-32 finding 2: a bare readFile follows a
+   *  planted symlink far outside the root). Same checks, same order, same
+   *  verdict helper — any rejection is a visible `null` in a 200 payload
+   *  (never an error status), so callers degrade to the `file unreadable`
+   *  marker. Async read (rework-5 discipline). */
   async function readContentOrNull(rel: string): Promise<string | null> {
+    const verdict = await artifactFileVerdict(rel);
+    if ("reason" in verdict) return null;
     try {
-      return await readFile(path.join(deps.root, rel), "utf8");
+      return await readFile(verdict.realAbs, "utf8");
     } catch {
       return null;
     }
   }
 
-  /** Artifact serving with containment (spec §6.4): reject absolute inputs
-   *  and `..` segments before resolving, resolve+prefix-check against the
-   *  root, allowlist the served prefixes to items/ and inbox/ (unclaimed
-   *  inbox item files ride the same hardened path — no second file-serving
-   *  route), reject symlinks via lstat, re-verify containment AND the prefix
-   *  allowlist on the realpath'd pair (root, file) so symlinked intermediate
-   *  directories can neither escape the root nor smuggle a non-allowed file
-   *  under an allowed path, then serve as markdown. The containment checks
-   *  stay synchronous; the file read itself is async so a large artifact
-   *  never blocks the tick loop (rework finding 5). */
-  async function handleArtifact(url: URL, res: ServerResponse): Promise<void> {
-    const requested = url.searchParams.get("path");
-    if (requested === null || requested.length === 0) {
-      sendJson(res, 400, { error: "path query parameter is required" });
-      return;
+  /** The ONE file-verification gate, shared by the artifact route and the
+   *  detail endpoint's content reads: reject absolute inputs and `..`
+   *  segments, resolve+containment-check against the root, allowlist the
+   *  prefixes to items/ and inbox/, reject symlinks via lstat, then re-verify
+   *  containment AND the allowlist on the realpath'd pair (root, file) so
+   *  symlinked intermediate directories can neither escape the root nor
+   *  smuggle a non-allowed file under an allowed path. Returns the realpath
+   *  to read, or a reason — the artifact route maps reasons to its exact
+   *  403/404 statuses (tests assert those messages); readers treat any reason
+   *  as "file unreadable" (content null in a 200). The checks stay
+   *  synchronous; the actual file read stays async (rework finding 5). */
+  function artifactFileVerdict(rel: string): { realAbs: string } | { reason: "not-allowed" | "escapes-root" | "not-servable" | "no-file" } {
+    if (path.isAbsolute(rel) || rel.split(/[\\/]/).includes("..")) return { reason: "not-allowed" };
+    const abs = path.resolve(deps.root, rel);
+    const relToRoot = path.relative(deps.root, abs);
+    if (relToRoot === "" || relToRoot.startsWith("..") || path.isAbsolute(relToRoot)) {
+      return { reason: "escapes-root" };
     }
-    if (path.isAbsolute(requested) || requested.split(/[\\/]/).includes("..")) {
-      sendJson(res, 403, { error: "path is not allowed" });
-      return;
-    }
-    const abs = path.resolve(deps.root, requested);
-    const rel = path.relative(deps.root, abs);
-    if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) {
-      sendJson(res, 403, { error: "path escapes the factory root" });
-      return;
-    }
-    if (!ALLOWED_PREFIXES.some((p) => rel.startsWith(p))) {
-      sendJson(res, 403, { error: "only artifact files under items/ and inbox/ are served" });
-      return;
-    }
+    if (!ALLOWED_PREFIXES.some((p) => relToRoot.startsWith(p))) return { reason: "not-servable" };
     // lstat (not stat): a symlink is not a regular file here — symlinks are
-    // rejected outright rather than followed.
+    // rejected outright rather than followed (same rule as the artifact route).
     let st: ReturnType<typeof lstatSync> | null = null;
     try {
       st = lstatSync(abs);
     } catch {
       st = null;
     }
-    if (st === null || !st.isFile()) {
-      sendJson(res, 404, { error: "no such artifact file" });
-      return;
-    }
+    if (st === null || !st.isFile()) return { reason: "no-file" };
     // realpath hardening: intermediate directories may still be symlinks
     // (lstat follows them). Resolve both sides and repeat the containment
     // check on the real paths before reading.
@@ -862,26 +853,47 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
       realAbs = realpathSync(abs);
       realRoot = realpathSync(deps.root);
     } catch {
-      sendJson(res, 404, { error: "no such artifact file" });
-      return;
+      return { reason: "no-file" };
     }
     const realRel = path.relative(realRoot, realAbs);
     if (realRel === "" || realRel.startsWith("..") || path.isAbsolute(realRel)) {
-      sendJson(res, 403, { error: "path escapes the factory root" });
-      return;
+      return { reason: "escapes-root" };
     }
     // Repeat the prefix allowlist on the real path too (KB 2026-11-07 08:23
     // observation (a), closed here): a symlinked intermediate directory
     // pointing INSIDE the root would otherwise expose e.g. factory.db or
     // config.json under an allowed-looking requested path. Containment first,
     // allowlist second — mirroring the original pair.
-    if (!ALLOWED_PREFIXES.some((p) => realRel.startsWith(p))) {
-      sendJson(res, 403, { error: "only artifact files under items/ and inbox/ are served" });
+    if (!ALLOWED_PREFIXES.some((p) => realRel.startsWith(p))) return { reason: "not-servable" };
+    return { realAbs };
+  }
+
+  /** Artifact serving through the shared containment gate (spec §6.4, and
+   *  the detail endpoint's reads — no second file-serving path). The verdict
+   *  helper carries each check's reason; this route maps it to the exact
+   *  status/error the API contract promised, and the file read itself is
+   *  async so a large artifact never blocks the tick loop (rework finding 5). */
+  async function handleArtifact(url: URL, res: ServerResponse): Promise<void> {
+    const requested = url.searchParams.get("path");
+    if (requested === null || requested.length === 0) {
+      sendJson(res, 400, { error: "path query parameter is required" });
+      return;
+    }
+    const verdict = artifactFileVerdict(requested);
+    if ("reason" in verdict) {
+      const verdictResponses: Record<string, [number, string]> = {
+        "not-allowed": [403, "path is not allowed"],
+        "escapes-root": [403, "path escapes the factory root"],
+        "not-servable": [403, "only artifact files under items/ and inbox/ are served"],
+        "no-file": [404, "no such artifact file"],
+      };
+      const [status, message] = verdictResponses[verdict.reason]!;
+      sendJson(res, status, { error: message });
       return;
     }
     let bytes: Buffer;
     try {
-      bytes = await readFile(realAbs);
+      bytes = await readFile(verdict.realAbs);
     } catch {
       // Verified regular file a moment ago; it vanished (or became unreadable)
       // between the check and the read.

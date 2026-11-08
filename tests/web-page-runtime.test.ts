@@ -35,6 +35,9 @@ interface StubElement {
   listeners: Map<string, Array<() => void>>;
   addEventListener: (t: string, fn: () => void) => void;
   querySelector: () => null;
+  /** Default empty: the stub has no focusable DOM. A Tab-trap test installs
+   *  its own list. */
+  querySelectorAll: (q: string) => unknown[];
   focus?: () => void;
   scrollIntoView?: (opts?: unknown) => void;
 }
@@ -75,6 +78,7 @@ function makeStubElement(): StubElement {
       listeners.set(t, fns);
     },
     querySelector: () => null,
+    querySelectorAll: () => [],
   };
 }
 
@@ -1400,7 +1404,7 @@ describe("wb serve page script (runtime behavior)", () => {
    * itself (the established pattern) and answers only the selector(s) the
    * handler under test probes. */
   const FLIGHT_ROW_TARGET = {
-    closest: (sel: string) => (sel === "div[data-flight-row]" ? { getAttribute: () => "11" } : null),
+    closest: (sel: string) => (sel === "[data-flight-row]" ? { getAttribute: () => "11" } : null),
   };
   const CARD_TARGET = {
     closest: (sel: string) => (sel === "[data-id]" ? { getAttribute: () => "20" } : null),
@@ -1441,6 +1445,15 @@ describe("wb serve page script (runtime behavior)", () => {
   };
   const INTERACTIVE_CONTROL_TARGET = {
     closest: (sel: string) => (sel === "button, input, textarea, label, a" ? {} : null),
+  };
+  /** A card click that originates on the new Details affordance button:
+   *  handled by the action branch, opens the overlay for the card's item. */
+  const DETAIL_BTN_TARGET = {
+    closest: (sel: string) => (sel === "button[data-action]" ? { getAttribute: () => "detail", closest: () => ({ getAttribute: () => "20" }) } : null),
+  };
+  /** A click that originates on the PR anchor inside the glance chip. */
+  const PR_ANCHOR_TARGET = {
+    closest: (sel: string) => (sel === "a" ? {} : null),
   };
 
   const RUNNING_ALPHA = payload(
@@ -1579,16 +1592,24 @@ describe("wb serve page script (runtime behavior)", () => {
   it("dismisses on Esc, backdrop click, and the close button — focus returns to the opener each time", async () => {
     const ctx = await makeOverlayContext();
     const focusLog: string[] = [];
-    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = {
-      focus: () => {
-        focusLog.push("opener");
-      },
-      closest: () => null,
+    // The opener is the row element the delegated handler hands to
+    // openItemOverlay (openerHint wins over activeElement — finding 4); the
+    // fake row carries a focus spy the way a real <button> row would.
+    const FOCUSABLE_ROW_TARGET = {
+      closest: (sel: string) =>
+        sel === "[data-flight-row]"
+          ? {
+              getAttribute: () => "11",
+              focus: () => {
+                focusLog.push("opener");
+              },
+            }
+          : null,
     };
     ctx.fire("status", RUNNING_ALPHA);
 
     // Esc
-    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    ctx.click("pulse", FOCUSABLE_ROW_TARGET);
     expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);
     ctx.dispatchDocument("keydown", { key: "Escape" });
     expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(true);
@@ -1596,7 +1617,7 @@ describe("wb serve page script (runtime behavior)", () => {
     expect(focusLog).toHaveLength(1);
 
     // a non-Escape key never closes it
-    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    ctx.click("pulse", FOCUSABLE_ROW_TARGET);
     ctx.dispatchDocument("keydown", { key: "Enter" });
     expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);
 
@@ -1606,13 +1627,13 @@ describe("wb serve page script (runtime behavior)", () => {
     expect(focusLog).toHaveLength(2);
 
     // the close button
-    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    ctx.click("pulse", FOCUSABLE_ROW_TARGET);
     ctx.click("item-overlay", OVERLAY_CLOSE_TARGET);
     expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(true);
     expect(focusLog).toHaveLength(3);
 
     // a click inside the panel body (an anchor, an artifact button, …) keeps it open
-    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    ctx.click("pulse", FOCUSABLE_ROW_TARGET);
     ctx.click("item-overlay", PANEL_INSIDE_TARGET);
     expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);
     expect(focusLog).toHaveLength(3);
@@ -1756,5 +1777,134 @@ describe("wb serve page script (runtime behavior)", () => {
     expect(html).toContain("(file unreadable)");
     expect(html).not.toContain("<h1"); // the renderer never ran on null content
     expect(html).toContain("no source file recorded");
+  });
+
+  it("entry points are real buttons: chips, inbox rows, flight rows, and a card Details affordance are keyboard-reachable", async () => {
+    const ctx = await makeOverlayContext();
+    ctx.fire("status", RUNNING_ALPHA);
+    // the running item's chip and flight row are buttons (bare divs had no
+    // focus target and no Enter/Space path — finding 5)
+    expect(ctx.el("pulse").innerHTML).toContain('<button type="button" data-flight-row="11"');
+    expect(ctx.el("glance").innerHTML).toContain('<button type="button" data-item-id="11"');
+    // an unclaimed inbox row is a button too
+    ctx.fire("status", payload([], null, { claimable: ["a.md"] }));
+    expect(ctx.el("glance").innerHTML).toContain('<button type="button" data-inbox-file="a.md"');
+    // a parked card carries a Details button (the card itself must stay a
+    // div — it nests the note/reject inputs)
+    const PARKED = payload(
+      [{ id: 20, slug: "approve-me", title: "Approve me", stage: "spec", status: "awaiting-approval" }],
+      null,
+    );
+    PARKED.counts.decisions = 1;
+    ctx.fire("status", PARKED);
+    expect(ctx.el("parking-lot").innerHTML).toContain('data-action="detail"');
+    // and it opens the overlay through the shared action path
+    ctx.click("parking-lot", DETAIL_BTN_TARGET);
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);
+    expect(ctx.countRequests("/api/items/20")).toBe(1);
+    await ctx.settle((url) => (url === "/api/items/20" ? DETAIL_RESPONSE : undefined));
+    expect(ctx.el("item-overlay").innerHTML).toContain("#11 Alpha spec title");
+    ctx.dispatchDocument("keydown", { key: "Escape" });
+  });
+
+  it("a PR link inside a glance chip keeps its own behavior — no overlay opens behind the new tab", async () => {
+    const ctx = await makeOverlayContext();
+    ctx.fire("status", payload([{ id: 13, slug: "gamma", status: "done", prUrl: "https://github.com/x/y/pull/9" }], null));
+    // clicking the PR anchor (a control inside the chip region) never opens
+    // the overlay: the glance handler skips links like the parking-lot
+    // handler skips interactive controls (finding 7)
+    ctx.click("glance", PR_ANCHOR_TARGET);
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(true);
+    expect(ctx.fetches).toHaveLength(0);
+    // the chip itself still opens
+    ctx.click("glance", GLANCE_CHIP_TARGET);
+    expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);
+    ctx.dispatchDocument("keydown", { key: "Escape" });
+  });
+
+  it("the last artifact selection always renders: a slow in-flight response never overwrites a newer one", async () => {
+    const ctx = await makeOverlayContext();
+    ctx.fire("status", RUNNING_ALPHA);
+    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    await ctx.settle((url) => (url === "/api/items/11" ? DETAIL_RESPONSE : undefined));
+    const artifactUrl = "/api/artifact?path=" + encodeURIComponent("items/alpha/artifacts/20261108-090500-001-implement.md");
+    const tick = () => new Promise((r) => setTimeout(r, 10));
+    // two selections in flight: A first, B second
+    ctx.click("item-overlay", OVERLAY_ARTIFACT_TARGET);
+    ctx.click("item-overlay", OVERLAY_ARTIFACT_TARGET);
+    expect(ctx.countRequests("/api/artifact?path=items%2Falpha%2Fartifacts%2F20261108-090500-001-implement.md")).toBe(2);
+    const [a, b] = ctx.fetches;
+    // B resolves first and renders…
+    b.resolve({ ok: true, status: 200, text: async () => "## Selection B" });
+    await tick();
+    expect(ctx.el("overlay-artifact-body").innerHTML).toContain("Selection B");
+    // …and the slow A response is ignored — both its content and its errors
+    a.resolve({ ok: true, status: 200, text: async () => "## Selection A" });
+    await tick();
+    expect(ctx.el("overlay-artifact-body").innerHTML).toContain("Selection B");
+    expect(ctx.el("overlay-artifact-body").innerHTML).not.toContain("Selection A");
+  });
+
+  it("retry preserves the ORIGINAL opener: an in-overlay focused control never becomes the focus-restore target", async () => {
+    const ctx = await makeOverlayContext();
+    const focusLog: string[] = [];
+    const FOCUSABLE_ROW = {
+      closest: (sel: string) =>
+        sel === "[data-flight-row]"
+          ? {
+              getAttribute: () => "11",
+              focus: () => {
+                focusLog.push("original-row");
+              },
+            }
+          : null,
+    };
+    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = {
+      focus: () => {
+        focusLog.push("in-overlay");
+      },
+    };
+    ctx.fire("status", RUNNING_ALPHA);
+    ctx.click("pulse", FOCUSABLE_ROW);
+    await ctx.settle((url) => (url === "/api/items/11" ? { ok: false, status: 500, json: async () => ({}), text: async () => "" } : undefined));
+    // retry re-opens with the ORIGINAL opener as the hint (the loading render
+    // then removes the in-overlay control — an activeElement-first capture
+    // would target detached state; finding 4)
+    ctx.click("item-overlay", OVERLAY_RETRY_TARGET);
+    await ctx.settle((url) => (url === "/api/items/11" ? DETAIL_RESPONSE : undefined));
+    ctx.dispatchDocument("keydown", { key: "Escape" });
+    expect(focusLog).toEqual(["original-row"]);
+  });
+
+  it("wraps Tab among the panel's tabbables while the overlay is open (aria-modal honesty)", async () => {
+    const ctx = await makeOverlayContext();
+    ctx.fire("status", RUNNING_ALPHA);
+    ctx.click("pulse", FLIGHT_ROW_TARGET);
+    await ctx.settle((url) => (url === "/api/items/11" ? DETAIL_RESPONSE : undefined));
+    const wrapped: string[] = [];
+    let prevented = 0;
+    const first = { focus: () => {
+      wrapped.push("first");
+    } };
+    const last = { focus: () => {
+      wrapped.push("last");
+    } };
+    ctx.el("item-overlay").querySelectorAll = () => [first, last];
+    // Tab from the LAST tabbable wraps to the first…
+    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = last;
+    ctx.dispatchDocument("keydown", { key: "Tab", shiftKey: false, preventDefault: () => { prevented++; } });
+    expect(wrapped).toEqual(["first"]);
+    expect(prevented).toBe(1);
+    // …and Shift+Tab from the first wraps back to the last
+    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = first;
+    ctx.dispatchDocument("keydown", { key: "Tab", shiftKey: true, preventDefault: () => { prevented++; } });
+    expect(wrapped).toEqual(["first", "last"]);
+    expect(prevented).toBe(2);
+    // Tab in the middle of the tabbables is left to the browser's traversal
+    const middle = { focus: () => {} };
+    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = middle;
+    ctx.dispatchDocument("keydown", { key: "Tab", shiftKey: false, preventDefault: () => { prevented++; } });
+    expect(wrapped).toEqual(["first", "last"]);
+    expect(prevented).toBe(2);
   });
 });

@@ -348,6 +348,12 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
    * long specs stay readable. The panel reuses the shadow-lg stack and the
    * max-w-3xl width vocabulary. */
   .wb-overlay { position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 60; background: rgba(28, 25, 23, .45); backdrop-filter: blur(8px); display: flex; align-items: flex-start; justify-content: center; overflow-y: auto; padding: 2.5rem 1rem; }
+  /* Same-specificity source order must NOT let the open-state flex beat the
+   * closed-state .hidden (Greptile PR-32 #1): as written below, the overlay
+   * rendered a full-screen backdrop from page load, and close()'s re-added
+   * .hidden could never re-hide it. The combined rule makes the closed state
+   * win whenever both classes are present. */
+  .wb-overlay.hidden { display: none; }
   .wb-overlay-panel { background: #fff; border-radius: 16px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, .1), 0 4px 6px -4px rgba(0, 0, 0, .1); width: 100%; max-width: 48rem; }
 
 /* ---- important / hover variants ---- */
@@ -714,12 +720,12 @@ function flightPanelHtml(p) {
     body = '<div class="space-y-2">' + inFlight.map(function (it) {
       var label = it.status === 'running' ? esc(it.stage || 'starting') : 'queued';
       var pill = STATUS_PILL[it.status] || 'bg-ink-100 text-ink-700 ring-ink-300';
-      return '<div class="rounded-lg border border-ink-200 bg-white/70 p-2.5" data-flight-row="' + it.id + '">' +
+      return '<button type="button" data-flight-row="' + it.id + '" class="w-full text-left rounded-lg border border-ink-200 bg-white/70 p-2.5 cursor-pointer" title="view detail">' +
         '<div class="flex items-start justify-between gap-2">' +
         '<div class="min-w-0"><div class="text-sm font-medium">' + esc(it.title) + '</div>' +
         '<div class="text-[11px] font-mono text-ink-500 mt-0.5">' + esc(it.repo) + '</div></div>' +
         '<span class="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 ' + pill + '">' + label + '</span>' +
-        '</div>' + stageDots(it) + '</div>';
+        '</div>' + stageDots(it) + '</button>';
     }).join('') + '</div>';
   }
   return '<div class="mt-3 rounded-2xl border border-ink-200 bg-white shadow-sm">' +
@@ -858,6 +864,11 @@ function cardHtml(it) {
 
   // actions
   html += '<div class="mt-4 flex items-center gap-2 flex-wrap">';
+  // Detail affordance on every card (Greptile PR-32 finding 5): the card
+  // itself must stay a div (a button cannot legally contain the note/reject
+  // inputs the actions below render), so the keyboard path to the detail
+  // overlay is this real <button> — mouse users keep the whole-card click.
+  html += '<button type="button" data-action="detail" class="btn btn-out" title="view the full detail: spec, artifacts, source">Details</button>';
   if (it.status === 'awaiting-approval') {
     html += '<input class="note-input finput !w-52" placeholder="optional note">' +
       '<button data-action="approve" class="btn btn-ok">Approve</button>' +
@@ -997,13 +1008,16 @@ function renderGlance(p) {
       pr = '<a href="' + esc(it.prUrl) + '" target="_blank" rel="noopener" class="text-emerald-700 underline underline-offset-2">PR' +
         (it.prDraft ? ' (draft)' : '') + '</a>';
     }
-    return '<div data-item-id="' + it.id + '" class="inline-flex items-center gap-2 rounded-full border border-ink-200 bg-white px-3 py-1.5 text-xs shadow-sm">' +
+    return '<button type="button" data-item-id="' + it.id + '" class="inline-flex items-center gap-2 rounded-full border border-ink-200 bg-white px-3 py-1.5 text-xs shadow-sm cursor-pointer" title="view detail">' +
       '<span class="h-1.5 w-1.5 rounded-full ' + (STATUS_DOT[it.status] || 'bg-ink-300') + (it.status === 'running' ? ' animate-pulse' : '') + '"></span>' +
       '<span class="font-medium">#' + it.id + ' ' + esc(it.slug) + '</span>' +
-      '<span class="text-ink-400">' + esc(it.stage || '') + '</span>' + hint + pr + '</div>';
+      '<span class="text-ink-400">' + esc(it.stage || '') + '</span>' + hint + '</button>' + pr;
   }).join('');
   var inbox = (p.inbox.claimable || []).map(function (f) {
-    return '<div data-inbox-file="' + esc(f) + '" class="rounded-md border border-dashed border-ink-300 bg-white/50 px-2.5 py-1 text-xs font-mono text-ink-500 cursor-pointer" title="view this inbox file">📄 ' + esc(f) + '</div>';
+    /* A real <button>: the detail overlay's inbox entry point must be
+     * reachable by keyboard (Greptile PR-32 finding 5) — a bare div with a
+     * hover cursor had no focus target and no Enter/Space path. */
+    return '<button type="button" data-inbox-file="' + esc(f) + '" class="rounded-md border border-dashed border-ink-300 bg-white/50 px-2.5 py-1 text-xs font-mono text-ink-500 cursor-pointer" title="view this inbox file">📄 ' + esc(f) + '</button>';
   }).join('');
   var skipped = (p.inbox.alreadyClaimed || []).map(function (s) {
     return '<div class="text-[11px] text-ink-400">⚠ ' + esc(s.file) + ' will be skipped — slug already claimed (#' + s.item.id + ', ' + esc(s.item.status) + ')</div>';
@@ -1265,14 +1279,21 @@ $('glance').addEventListener('click', function (ev) {
     applyGlanceCollapsed(!glanceCollapsed);
     return;
   }
+  // Links keep their own behavior (Greptile PR-32 finding 7 — the rule the
+  // parking-lot handler already applies): a chip's PR anchor opens the PR in
+  // its tab; it must not also open the detail overlay behind it.
+  if (ev.target.closest && ev.target.closest('a')) return;
   var chip = ev.target.closest && ev.target.closest('[data-item-id]');
   if (chip) {
-    openItemOverlay('item', Number(chip.getAttribute('data-item-id')), ev.target);
+    // The stable chip element is the opener (not ev.target): focus restore on
+    // close lands on a real element, and the retry path re-uses the ORIGINAL
+    // opener (finding 4).
+    openItemOverlay('item', Number(chip.getAttribute('data-item-id')), chip);
     return;
   }
   var inb = ev.target.closest && ev.target.closest('[data-inbox-file]');
   if (inb) {
-    openItemOverlay('inbox', inb.getAttribute('data-inbox-file'), ev.target);
+    openItemOverlay('inbox', inb.getAttribute('data-inbox-file'), inb);
   }
 });
 
@@ -1294,9 +1315,13 @@ $('pulse').addEventListener('click', function (ev) {
     applyFlightCollapsed(collapsed);
     return;
   }
-  // Item-detail overlay entry: clicking an in-flight row opens its detail.
-  var row = ev.target.closest && ev.target.closest('div[data-flight-row]');
-  if (row) openItemOverlay('item', Number(row.getAttribute('data-flight-row')), ev.target);
+  // Item-detail overlay entry: clicking an in-flight row opens its detail the
+  // row is a real <button> (keyboard entry — finding 5). Links keep their own
+  // behavior (finding 7 — the parking-lot rule; today's rows hold no links,
+  // the skip is asserted by test so future rows cannot regress it).
+  if (ev.target.closest && ev.target.closest('a')) return;
+  var row = ev.target.closest && ev.target.closest('[data-flight-row]');
+  if (row) openItemOverlay('item', Number(row.getAttribute('data-flight-row')), row);
 });
 
 $('parking-lot').addEventListener('click', function (ev) {
@@ -1308,13 +1333,17 @@ $('parking-lot').addEventListener('click', function (ev) {
     var ctrl = ev.target.closest && ev.target.closest('button, input, textarea, label, a');
     if (ctrl) return;
     var card = ev.target.closest && ev.target.closest('[data-id]');
-    if (card) openItemOverlay('item', Number(card.getAttribute('data-id')), ev.target);
+    if (card) openItemOverlay('item', Number(card.getAttribute('data-id')), card);
     return;
   }
   var card = btn.closest('[data-id]');
   var id = card.getAttribute('data-id');
   var action = btn.getAttribute('data-action');
 
+  if (action === 'detail') {
+    openItemOverlay('item', Number(id), btn);
+    return;
+  }
   if (action === 'approve') {
     var note = card.querySelector('.note-input').value.trim();
     act('/api/items/' + id + '/approve', note ? { note: note } : {}, card);
@@ -1636,14 +1665,23 @@ function closeOverlay() {
   var el = $('item-overlay');
   el.classList.add('hidden');
   el.innerHTML = '';
-  if (st && st.opener && typeof st.opener.focus === 'function') st.opener.focus();
+  if (st && st.opener && st.opener.isConnected !== false && typeof st.opener.focus === 'function') st.opener.focus();
 }
 
 function openItemOverlay(mode, key, openerHint) {
-  var active = document.activeElement;
   var opener = null;
-  if (active && typeof active === 'object') opener = active;
-  else if (openerHint && typeof openerHint === 'object') opener = openerHint;
+  // The explicit hint wins over document.activeElement (Greptile PR-32
+  // finding 4): the hint is the delegated handler's OPEN-time target, while
+  // activeElement may already sit INSIDE the overlay — a retry re-open
+  // passes the original opener as the hint, and the loading render then
+  // removes the in-overlay control; without the precedence swap, close()
+  // would focus a detached node and restore nothing. Falls back to
+  // activeElement only when no hint exists.
+  if (openerHint && typeof openerHint === 'object') opener = openerHint;
+  else {
+    var active = document.activeElement;
+    if (active && typeof active === 'object') opener = active;
+  }
   var seq = ++overlaySeq;
   overlayState = { mode: mode, key: key, seq: seq, opener: opener, phase: 'loading' };
   var el = $('item-overlay');
@@ -1692,22 +1730,33 @@ function openItemOverlay(mode, key, openerHint) {
 
 /* Inline artifact view: one fetch through the hardened artifact route,
  * rendered through the same markdown renderer (logs land in fenced/plain
- * text — everything the route serves is markdown). */
+ * text — everything the route serves is markdown).
+ * Stale-response guard (Greptile PR-32 finding 3): the LAST selection always
+ * wins — a generation counter like the overlay's own seq token, checked by
+ * every terminal callback (including error writes). Without it, a slow
+ * response for artifact A can overwrite a faster B. */
+var overlayArtifactSeq = 0;
 function loadOverlayArtifact(rel) {
   var body = $('overlay-artifact-body');
   if (!body) return;
+  var seq = ++overlayArtifactSeq;
+  var stale = function () { return !overlayState || seq !== overlayArtifactSeq; };
   body.innerHTML = '<div class="text-xs text-ink-400"><span class="wb-spin" aria-hidden="true"></span> loading…</div>';
   fetch('/api/artifact?path=' + encodeURIComponent(rel)).then(function (res) {
+    if (stale()) return;
     if (!res.ok) {
       body.innerHTML = '<div class="text-red-700 text-xs">' + esc('artifact unavailable (HTTP ' + res.status + ') — it may have been removed') + '</div>';
       return;
     }
     res.text().then(function (text) {
+      if (stale()) return;
       body.innerHTML = '<div class="mt-1">' + renderMarkdown(text) + '</div>';
     }, function () {
+      if (stale()) return;
       body.innerHTML = '<div class="text-red-700 text-xs">artifact unavailable — the file could not be read</div>';
     });
   }, function () {
+    if (stale()) return;
     body.innerHTML = '<div class="text-red-700 text-xs">artifact unavailable — the request failed</div>';
   });
 }
@@ -1731,8 +1780,35 @@ $('item-overlay').addEventListener('click', function (ev) {
   if (!panel) closeOverlay();
 });
 
+/* Esc closes; while the overlay is open, Tab is wrapped among the panel's
+ * tabbables — aria-modal="true" tells assistive tech the background is
+ * inert, so the trap makes that claim honest (Greptile PR-32 finding 6).
+ * The runtime-test stub cannot model focusable DOM traversal, so a stub
+ * without querySelectorAll skips the wrap (tests opt in by installing it). */
+function trapOverlayTab(ev) {
+  var scope = $('item-overlay');
+  if (!scope || typeof scope.querySelectorAll !== 'function') return;
+  var tabbables = scope.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select, [tabindex="0"]');
+  if (!tabbables || tabbables.length === 0) {
+    // Nothing focusable (loading/error shell): never let focus escape the modal.
+    ev.preventDefault();
+    return;
+  }
+  var first = tabbables[0];
+  var last = tabbables[tabbables.length - 1];
+  if (ev.shiftKey && document.activeElement === first) {
+    ev.preventDefault();
+    if (typeof last.focus === 'function') last.focus();
+  } else if (!ev.shiftKey && document.activeElement === last) {
+    ev.preventDefault();
+    if (typeof first.focus === 'function') first.focus();
+  }
+}
+
 document.addEventListener('keydown', function (ev) {
-  if (ev && ev.key === 'Escape' && overlayState) closeOverlay();
+  if (!overlayState) return;
+  if (ev && ev.key === 'Escape') { closeOverlay(); return; }
+  if (ev && ev.key === 'Tab') trapOverlayTab(ev);
 });
 
 /* ================= header: Start Processing ================= */

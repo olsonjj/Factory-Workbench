@@ -13,7 +13,7 @@ import * as os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as net from "node:net";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import {
   createHarness,
   claim,
@@ -1199,6 +1199,7 @@ describe("wb serve: artifact symlink hardening", () => {
     expect(await get(`items/${slug}/artifacts/inside.md`)).toBe(404);
     expect(await get(`items/${slug}/artifacts/escape-dir/secret.md`)).toBe(403);
   });
+
 });
 
 describe("wb serve: item detail endpoint (GET /api/items/:id)", () => {
@@ -1218,6 +1219,37 @@ describe("wb serve: item detail endpoint (GET /api/items/:id)", () => {
     spec: { stage: string | null; name: string; path: string; createdAt: string; content: string | null; error?: string } | null;
     source: { path: string; content: string | null; error?: string } | null;
   }
+
+  it("detail endpoint file reads ride the same containment gate (no symlink-following past the fence)", async () => {
+    const s = await makeServer();
+    const id = await seedSpecItem(s, "detail-symlink");
+    const itemFile = s.h.db.getItem(id)!.sourceFile!;
+    const detail = async () => (await (await fetch(`${s.url}/api/items/${id}`)).json()) as DetailBody;
+    // baseline: the real files read fine
+    expect((await detail()).source!.content).toContain("Do feature X.");
+    expect((await detail()).spec!.content).toContain("# spec output");
+    // the decoy outside the factory root
+    const outside = mkdtempSync(path.join(os.tmpdir(), "wb-serve-decoy-"));
+    extraDirs.push(outside);
+    writeFileSync(path.join(outside, "secret.md"), "# secret\n");
+    // a claimed item.md that is itself a symlink → source is the unreadable
+    // marker, never the symlink target's content (Greptile PR-32 finding 2)
+    rmSync(itemFile);
+    symlinkSync(path.join(outside, "secret.md"), itemFile);
+    const brokenSource = await detail();
+    expect(brokenSource.source!.content).toBeNull();
+    expect(brokenSource.source!.error).toBe("file unreadable");
+    // the same file is equally rejected by the artifact route it came from
+    expect((await fetch(s.url + "/api/artifact?path=" + encodeURIComponent("items/detail-symlink/item.md"))).status).toBe(404);
+    // a symlinked spec artifact: same gate, same marker
+    const specPath = path.join(s.h.paths.items, "detail-symlink", "artifacts");
+    const specFile = readdirSync(specPath).find((f) => f.includes("spec"))!;
+    rmSync(path.join(specPath, specFile));
+    symlinkSync(path.join(outside, "secret.md"), path.join(specPath, specFile));
+    const brokenSpec = await detail();
+    expect(brokenSpec.spec!.content).toBeNull();
+    expect(brokenSpec.spec!.error).toBe("file unreadable");
+  });
 
   it("returns the item envelope: status-serialized item, all artifacts, spec content, source", async () => {
     const s = await makeServer();
