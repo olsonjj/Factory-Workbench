@@ -739,6 +739,56 @@ describe("wb serve page script (runtime behavior)", () => {
     expect(ctx.el("glance").innerHTML).toContain("no items in flight");
   });
 
+  it("carries keyboard focus across a snapshot for the chip-window controls, not just the summary button", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    // Greptile PR-33 finding: once More/Less refocusing puts keyboard focus
+    // on the window control, the ~2s SSE snapshot that repainted the
+    // section used to drop focus to <body>. The focus-capture path must be
+    // selector-aware: whichever control was focused gets its new twin
+    // focused (the stub's focus spy records WHICH selector was restored).
+    const BACKLOG = payload(
+      Array.from({ length: 14 }, (_, i) => ({ id: i + 1, slug: "s" + (i + 1), stage: "pr", status: "done" })),
+      null,
+    );
+    ctx.fire("status", BACKLOG);
+    const focusLog: string[] = [];
+    (ctx.el("glance") as unknown as { querySelector: (sel: string) => unknown }).querySelector =
+      (sel: string) => (sel.indexOf("data-glance-more") >= 0 || sel.indexOf("data-glance-less") >= 0
+        ? { focus: () => focusLog.push(sel) }
+        : null);
+
+    // 1) SSE snapshot with the More… control focused → its twin restored.
+    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = {
+      closest: (sel: string) => (sel === "button[data-glance-more]" ? { attributes: {} } : null),
+    };
+    ctx.fire("status", BACKLOG);
+    expect(focusLog).toEqual(["button[data-glance-more]"]);
+
+    // 2) The More… click: the re-render's capture path first restores the
+    // (about-to-be-replaced) focused More — activeElement is still on it —
+    // then the handler refocuses the LESS counterpart; the FINAL focus is
+    // what matters (finding-3 fix), the intermediate entry is the
+    // capture-path restore of the node the click is destroying.
+    ctx.click("glance", { closest: (sel: string) => (sel === "button[data-glance-more]" ? { attributes: {} } : null) });
+    expect(focusLog).toHaveLength(3);
+    expect(focusLog[2]).toBe("button[data-glance-less]");
+    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = {
+      closest: (sel: string) => (sel === "button[data-glance-less]" ? { attributes: {} } : null),
+    };
+    ctx.fire("status", BACKLOG);
+    expect(focusLog).toHaveLength(4);
+    expect(focusLog[3]).toBe("button[data-glance-less]");
+
+    // 3) Focus elsewhere → no refocus attempt, no crash (prior discipline).
+    (ctx.sandbox.document as unknown as { activeElement: unknown }).activeElement = undefined;
+    (ctx.el("glance") as unknown as { querySelector: (sel: string) => unknown }).querySelector = () => null;
+    ctx.fire("status", BACKLOG);
+    expect(focusLog).toHaveLength(4);
+  });
+
   it("orders the glance chips newest-first so the recently-landed work leads", async () => {
     const ctx = makeContext();
     ctx.run(pageScript(PAGE_HTML));

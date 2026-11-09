@@ -1104,10 +1104,18 @@ function renderGlance(p) {
    * empty state) — a failure that was always visible pre-collapse must not
    * hide behind display:none when the section is collapsed. */
   var errorRow = p.inbox.error ? '<div class="text-[11px] text-red-600">inbox unreadable: ' + esc(p.inbox.error) + '</div>' : '';
-  /* Keyboard focus carried across the innerHTML replacement: if the summary
-   * button itself was focused when a payload re-render replaced it, restore
-   * focus to the new button (Enter/Space keep toggling without re-navigation). */
-  var hadFocus = !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('button[data-glance-summary]'));
+  /* Keyboard focus carried across the innerHTML replacement (Greptile PR-33
+   * finding): the summary button AND the chip-window controls are all
+   * focusables a payload re-render can destroy — capture which one was
+   * focused BEFORE the write, restore to the new twin after (Enter/Space
+   * keep working without a Tab-back from <body>). */
+  var focusSel = null;
+  var activeEl = document.activeElement;
+  if (activeEl && activeEl.closest) {
+    if (activeEl.closest('button[data-glance-summary]')) focusSel = 'button[data-glance-summary]';
+    else if (activeEl.closest('button[data-glance-more]')) focusSel = 'button[data-glance-more]';
+    else if (activeEl.closest('button[data-glance-less]')) focusSel = 'button[data-glance-less]';
+  }
   var runningCount = 0, queuedCount = 0, doneCount = 0;
   glance.forEach(function (it) {
     if (it.status === 'running') runningCount++;
@@ -1149,9 +1157,9 @@ function renderGlance(p) {
     '</div>' +
     errorRow +
     '</div>';
-  if (hadFocus) {
-    var summary = $('glance').querySelector('button[data-glance-summary]');
-    if (summary && summary.focus) summary.focus();
+  if (focusSel) {
+    var restore = $('glance').querySelector(focusSel);
+    if (restore && restore.focus) restore.focus();
   }
 }
 
