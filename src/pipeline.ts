@@ -56,6 +56,11 @@ export interface OrchestratorDeps {
   maxResumeTicks?: number;
   /** Stale-base freshness gate; null/undefined = no checking (tests). */
   baseCheck?: BaseFreshnessChecker | null;
+  /** Interrupted-drive evidence captured BEFORE this drive acquired the
+   *  factory lock: the previous (dead) holder's pid from the lock file it
+   *  left behind, or null when no lock file existed. Consumed by `resume()`
+   *  via `reconcileInterrupted` (specs/wb-interrupted-drives.spec.md). */
+  interruptedDrive?: { lastHolderPid: number | null };
 }
 
 export class Orchestrator {
@@ -68,6 +73,8 @@ export class Orchestrator {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly maxResumeTicks: number;
   private readonly baseCheck: BaseFreshnessChecker | null;
+  /** Pre-acquire lock evidence threaded in by the owning commands (§OrchestratorDeps). */
+  private readonly interruptedDrive: { lastHolderPid: number | null } | undefined;
   /** Per-invocation memo: one check per (repo, base); cache hits return the
    *  recorded action without re-warning. A `wb run`/`wb resume` invocation
    * constructs a fresh Orchestrator, so instance memory = invocation scope. */
@@ -83,6 +90,7 @@ export class Orchestrator {
     this.sleep = deps.sleep;
     this.maxResumeTicks = deps.maxResumeTicks ?? 500;
     this.baseCheck = deps.baseCheck ?? null;
+    this.interruptedDrive = deps.interruptedDrive;
   }
 
   // ------------------------------------------------------------------ tick
@@ -117,17 +125,58 @@ export class Orchestrator {
   }
 
   /**
-   * Crash/interruption recovery: restart human-rejected items (their reason
-   * rides as feedback into the next agent run), then keep ticking until no
-   * item changes state or the safety tick cap is reached.
+   * Dead-drive reconciliation (specs/wb-interrupted-drives.spec.md): requeue
+   * every item orphaned mid-stage by a drive that ended without a parking
+   * decision, and label the episode in history. Sound ONLY where the caller
+   * exclusively holds the factory lock (every call site is a drive entry):
+   * `running` is written solely by a lock-holding drive, so any running item
+   * seen here is provably orphaned. Stage unchanged — the stage re-runs with
+   * stage-level idempotency. The orphaned repo_locks row is read BEFORE it
+   * is deleted and rides as honest evidence the stage had begun.
+   *
+   * `lastHolder`: the dead drive's pid where knowable (the lock file a hard
+   * kill leaves behind carries it; a cleanly-released lock means unknown —
+   * null, never fabricated). Idempotent: a second call finds no running
+   * items and returns []. Never called from inside `tickAll()` — every
+   * legitimate running state a live drive creates would then be
+   * "reconciled" by the drive itself.
+   */
+  reconcileInterrupted(lastHolder: number | null): TickEntry[] {
+    const entries: TickEntry[] = [];
+    for (const item of this.db.itemsWithStatus(["running"])) {
+      const repoLock = this.db.clearRepoLockForItem(item.id);
+      this.db.updateItem(item.id, { status: "queued", parkedReason: null, parkedDetail: null });
+      this.db.appendHistory(item.id, "drive-interrupted", item.stage, {
+        lastHolder,
+        repoLock,
+        requeued: true,
+      });
+      entries.push({
+        id: item.id,
+        slug: item.slug,
+        fromStage: item.stage,
+        status: "queued",
+        detail: `drive interrupted (last holder: ${lastHolder !== null ? `pid ${lastHolder}` : "none"}); requeued for the next stage`,
+      });
+    }
+    return entries;
+  }
+
+  /**
+   * Crash/interruption recovery: label any drive-interrupted (orphaned
+   * `running`) item first — the audit trail records the gap, not just the
+   * resumption — then restart human-rejected items (their reason rides as
+   * feedback into the next agent run), then keep ticking until no item
+   * changes state or the safety tick cap is reached.
    */
   async resume(): Promise<TickReport> {
     const maxTicks = this.maxResumeTicks;
+    const reconcileEntries = this.reconcileInterrupted(this.interruptedDrive?.lastHolderPid ?? null);
     for (const item of this.db.itemsWithStatus(["human-rejected"])) {
       this.db.updateItem(item.id, { status: "queued", parkedReason: null, parkedDetail: null });
       this.db.appendHistory(item.id, "unparked", item.stage, { via: "resume", feedback: item.feedback });
     }
-    const combined: TickReport = { entries: [], changed: false };
+    const combined: TickReport = { entries: reconcileEntries, changed: false };
     let capped = false;
     for (let i = 0; i < maxTicks; i++) {
       const report = await this.tickAll();

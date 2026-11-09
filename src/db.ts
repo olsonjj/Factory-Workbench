@@ -432,6 +432,20 @@ export class FactoryDb {
     this.stmt("DELETE FROM repo_locks WHERE repo = ? AND item_id = ?").run(repo, itemId);
   }
 
+  /** Read-and-clear any orphaned repo_locks row for this item (a crashed
+   *  stage leaves one behind: rows are only ever written per-item, so an
+   *  item-keyed delete is exact). Returns the removed row as honest evidence
+   *  the stage had actually begun, or null when none existed. Used by the
+   *  interrupted-drive reconciler (specs/wb-interrupted-drives.spec.md). */
+  clearRepoLockForItem(itemId: number): { repo: string; acquiredAt: string } | null {
+    const row = this.stmt("SELECT repo, acquired_at FROM repo_locks WHERE item_id = ?").get(itemId) as
+      | { repo: string; acquired_at: string }
+      | undefined;
+    if (!row) return null;
+    this.stmt("DELETE FROM repo_locks WHERE item_id = ?").run(itemId);
+    return { repo: row.repo, acquiredAt: row.acquired_at };
+  }
+
   knownRepos(): { repo: string; count: number }[] {
     const rows = this.stmt("SELECT repo, COUNT(*) AS count FROM items GROUP BY repo ORDER BY repo")
       .all() as { repo: string; count: number }[];

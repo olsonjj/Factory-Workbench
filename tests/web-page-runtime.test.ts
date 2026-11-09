@@ -27,6 +27,14 @@ interface StubElement {
   checked: boolean;
   disabled: boolean;
   title: string;
+  /** Inline style sink (the feed's per-event color) — a plain object, like a
+   *  real element's .style would be for these tests' purposes. */
+  style: { color?: string };
+  /** Children appended by the page (appendFeed builds spans per row). */
+  children: StubElement[];
+  appendChild: (c: StubElement) => void;
+  removeChild: (c: StubElement) => void;
+  readonly firstChild: StubElement | null;
   attributes: Record<string, string>;
   setAttribute: (name: string, value: string) => void;
   getAttribute: (name: string) => string | null;
@@ -46,6 +54,7 @@ function makeStubElement(): StubElement {
   const listeners: Map<string, Array<() => void>> = new Map();
   const classes = new Set<string>();
   const attributes: Record<string, string> = {};
+  const children: StubElement[] = [];
   let html = "";
   let innerHTMLWrites = 0;
   return {
@@ -58,6 +67,14 @@ function makeStubElement(): StubElement {
     checked: false,
     disabled: false,
     title: "",
+    style: {},
+    children,
+    appendChild: (c) => { children.push(c); },
+    removeChild: (c) => {
+      const i = children.indexOf(c);
+      if (i >= 0) children.splice(i, 1);
+    },
+    get firstChild() { return children[0] ?? null; },
     attributes,
     setAttribute: (name, value) => {
       attributes[name] = value;
@@ -97,6 +114,8 @@ function makeContext() {
       }
       return el;
     },
+    // The live feed builds its rows with createElement (appendFeed).
+    createElement: () => makeStubElement(),
     querySelector: () => null,
     addEventListener: (t: string, fn: (ev: unknown) => void) => {
       const fns = documentListeners.get(t) ?? [];
@@ -239,7 +258,7 @@ function makeContext() {
 function payload(
   items: unknown[],
   lock: unknown,
-  opts?: { claimable?: string[]; error?: string | null },
+  opts?: { claimable?: string[]; error?: string | null; interrupted?: unknown },
 ) {
   const claimable = opts?.claimable ?? [];
   const count = (s: string) => items.filter((i: any) => i.status === s).length;
@@ -256,6 +275,9 @@ function payload(
     flow: [],
     inbox: { claimable, alreadyClaimed: [], error: opts?.error ?? null },
     lock,
+    // The interrupted-drive signal (null = healthy, exactly what the server
+    // sends when the tell-tale does not hold).
+    interrupted: opts?.interrupted ?? null,
   };
 }
 
@@ -2162,5 +2184,123 @@ describe("wb serve page script (runtime behavior)", () => {
     ctx.dispatchDocument("keydown", { key: "Tab", shiftKey: false, preventDefault: () => { prevented++; } });
     expect(wrapped).toEqual(["first", "last"]);
     expect(prevented).toBe(2);
+  });
+});
+
+describe("wb serve page script: interrupted drives (dead-drive observability)", () => {
+  const ORPHAN = { id: 27, slug: "item-27", stage: "spec", status: "running" };
+  const interruptedPayload = (lastHolder: number | null, lock: unknown = null) =>
+    payload([ORPHAN], lock, {
+      interrupted: { items: [{ id: 27, slug: "item-27", stage: "spec" }], lastHolder },
+    });
+
+  it("renders the INTERRUPTED pill: a real button, orange accent, item + holder clause, recovery title", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", interruptedPayload(4231));
+    const html = ctx.el("run-state").innerHTML;
+    expect(html).toContain("INTERRUPTED");
+    expect(html).toContain("drive did not end cleanly — #27 item-27 at spec (last holder pid 4231)");
+    expect(html).toContain("press Start Processing");
+    expect(html).toContain('<button type="button"');
+    expect(html).toContain("bg-orange-100"); // the infra/orange family, not amber review or stone paused
+    expect(html).toContain("bg-orange-500");
+    expect(html).toContain('title="the previous drive did not end cleanly — press Start Processing to recover"');
+
+    // holder unknown: the honest clause, never a fabricated pid
+    ctx.fire("status", interruptedPayload(null));
+    const unknown = ctx.el("run-state").innerHTML;
+    expect(unknown).toContain("(no live factory lock)");
+    expect(unknown).not.toContain("(last holder pid");
+  });
+
+  it("priority: live lock beats INTERRUPTED; INTERRUPTED beats stale; dead lock alone stays stale; cleared → PAUSED", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    const runState = ctx.el("run-state");
+
+    // A live lock outranks the signal (the holder owns the running state).
+    ctx.fire("status", interruptedPayload(7, { alive: true, pid: 7, ageMs: 5000 }));
+    expect(runState.innerHTML).toContain("RUNNING");
+    expect(runState.innerHTML).not.toContain("INTERRUPTED");
+
+    // A dead lock + an orphaned running item: INTERRUPTED is the strictly more
+    // informative message — it carries the dead holder pid itself.
+    ctx.fire("status", interruptedPayload(9, { alive: false, pid: 9, ageMs: 120000 }));
+    expect(runState.innerHTML).toContain("INTERRUPTED");
+    expect(runState.innerHTML).toContain("(last holder pid 9)");
+    expect(runState.innerHTML).not.toContain("stale factory lock");
+
+    // A dead lock WITHOUT running items renders the verbatim stale text, untouched.
+    ctx.fire("status", DEAD_PAYLOAD);
+    expect(runState.innerHTML).toContain("stale factory lock (pid 7, 1 min ago) — holder is not running");
+    expect(runState.innerHTML).not.toContain("INTERRUPTED");
+
+    // Recovery worked (interrupted cleared, item still queued): the pill loses
+    // its why and becomes the ordinary PAUSED shape.
+    ctx.fire("status", payload([{ id: 27, slug: "item-27", stage: "spec", status: "queued" }], null));
+    expect(runState.innerHTML).toContain("PAUSED");
+    expect(runState.innerHTML).not.toContain("INTERRUPTED");
+  });
+
+  it("clicking the INTERRUPTED pill presses Run — exactly one POST /api/run (the shared recovery action)", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", interruptedPayload(4231));
+    ctx.click("run-state");
+    expect(ctx.countRequests("/api/run")).toBe(1);
+    expect(ctx.el("btn-run").disabled).toBe(true); // the shared single-flight guard
+    ctx.click("run-state"); // in flight → guarded no-op
+    expect(ctx.countRequests("/api/run")).toBe(1);
+    await ctx.settle(
+      (url) =>
+        url === "/api/run"
+          ? { ok: true, status: 202, json: async () => ({ started: true }) }
+          : undefined,
+    );
+    expect(ctx.el("toast").textContent).toContain("processing started");
+  });
+
+  it("the live feed shows the drive-interrupted row with its detail clause and orange color", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("history", {
+      id: 1,
+      itemId: 27,
+      slug: "item-27",
+      ts: new Date(2026, 10, 8, 9, 30, 0).toISOString(),
+      event: "drive-interrupted",
+      stage: "spec",
+      detail: { lastHolder: 4231, requeued: true },
+    });
+    const feed = ctx.el("feed");
+    expect(feed.children).toHaveLength(1);
+    const line = feed.children[0]!;
+    expect(line.children).toHaveLength(3);
+    const [clock, event, body] = line.children as [StubElement, StubElement, StubElement];
+    expect(event.textContent).toBe("drive-interrupted");
+    expect(event.style.color).toBe("#ea580c"); // the FEED_COLOR entry, orange
+    expect(body.textContent).toContain("#27 item-27 · spec");
+    expect(body.textContent).toContain(" — item requeued (last holder pid 4231)");
+
+    // holder-unknown variant renders the honest clause
+    ctx.fire("history", {
+      id: 2,
+      itemId: 27,
+      slug: "item-27",
+      ts: new Date(2026, 10, 8, 9, 31, 0).toISOString(),
+      event: "drive-interrupted",
+      stage: "spec",
+      detail: { lastHolder: null, requeued: true },
+    });
+    expect(feed.children).toHaveLength(2);
+    expect(feed.children[1]!.children[2]!.textContent).toContain(" — item requeued (holder unknown)");
   });
 });

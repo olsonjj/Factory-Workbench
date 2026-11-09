@@ -12,6 +12,7 @@
 
 import { spawn } from "node:child_process";
 import type { FactoryDb, HistoryFeedRow } from "./db.js";
+import { lockHolderAlive, type LockInfo } from "./lock.js";
 import type { ItemRecord } from "./types.js";
 import { ACTIONABLE_STATUSES, TERMINAL_STATUSES } from "./types.js";
 
@@ -185,6 +186,15 @@ export function formatEventText(
       const feedback = typeof detail.reason === "string" ? detail.reason : "";
       return "rejected" + (row.stage ? ` at ${row.stage}` : "") + ` — ${ellipsize(feedback, 60)}`;
     }
+    case "drive-interrupted": {
+      // The dead-drive reconciliation row (specs/wb-interrupted-drives.spec.md):
+      // honest evidence, never a cause claim. Not a parked row — no ⚠/(!)/bell
+      // and no OS notification (only `parked` rows notify).
+      let text = `drive interrupted at ${stageLabel(row)} — item requeued`;
+      const holder = detail.lastHolder;
+      text += typeof holder === "number" ? ` (last holder pid ${holder})` : " (holder unknown)";
+      return text;
+    }
   }
   // Unknown/other events (stage-retry, approved, archived, anything new).
   let text = row.event + (row.stage ? ` ${row.stage}` : "");
@@ -223,8 +233,12 @@ function parkedNotificationText(row: WatchEventRow, item: WatchItem | undefined)
   return `#${row.itemId} ${slug} parked` + (row.stage ? ` at ${row.stage}` : "") + ` — ${reason}`;
 }
 
-/** The compact status card: two content lines between 50-char rules. */
-export function renderCard(items: WatchItem[]): string {
+/** The compact status card: two content lines between 50-char rules, plus an
+ *  optional counted INTERRUPTED line when a drive died mid-stage (running
+ *  items with no live factory lock — specs/wb-interrupted-drives.spec.md).
+ *  `interrupted` empty/omitted keeps the card byte-identical to the
+ *  pre-interruption-signal format. */
+export function renderCard(items: WatchItem[], interrupted: WatchItem[] = []): string {
   const run = items
     .filter((i) => (ACTIONABLE_STATUSES as readonly string[]).includes(i.status))
     .map((i) => `#${i.id} ${i.slug} ${i.stage}`);
@@ -241,7 +255,13 @@ export function renderCard(items: WatchItem[]): string {
   // total including the two-space indent.
   const runLine = run.length > 0 ? `RUN (${run.length}): ${run.join(" · ")}` : "RUN (0): none";
   const parkedLine = parked.length > 0 ? `PARKED (${parked.length}): ${parked.join(" · ")}` : "PARKED (0): none";
-  return [CARD_RULE, `  ${ellipsize(runLine, 78)}`, `  ${ellipsize(parkedLine, 78)}`, CARD_RULE].join("\n");
+  const lines = [CARD_RULE, `  ${ellipsize(runLine, 78)}`, `  ${ellipsize(parkedLine, 78)}`];
+  if (interrupted.length > 0) {
+    const ints = interrupted.map((i) => `#${i.id} ${i.slug} ${i.stage}`);
+    lines.push(`  ${ellipsize(`INTERRUPTED (${ints.length}): ${ints.join(" · ")}`, 78)}`);
+  }
+  lines.push(CARD_RULE);
+  return lines.join("\n");
 }
 
 /**
@@ -254,6 +274,7 @@ export function runWatchOnce(
   items: WatchItem[],
   state: WatchState,
   maxGateAttempts: number | null,
+  interrupted: WatchItem[] = [],
 ): WatchOutcome {
   const fresh = rows.filter((r) => r.id > state.lastEventId).sort((a, b) => a.id - b.id);
   const next: WatchState = { ...state };
@@ -261,7 +282,7 @@ export function runWatchOnce(
     next.first = false;
     next.lastEventId = fresh.length > 0 ? fresh[fresh.length - 1]!.id : state.lastEventId;
     // Prime the card silently — it is only compared against, never printed.
-    next.lastCard = renderCard(items);
+    next.lastCard = renderCard(items, interrupted);
     return { lines: [], notificationTexts: [], state: next };
   }
   const byId = new Map(items.map((i) => [i.id, i]));
@@ -273,7 +294,7 @@ export function runWatchOnce(
     if (row.event === "parked") notificationTexts.push(parkedNotificationText(row, item));
   }
   if (fresh.length > 0) next.lastEventId = fresh[fresh.length - 1]!.id;
-  const card = renderCard(items);
+  const card = renderCard(items, interrupted);
   if (card !== state.lastCard) {
     lines.push(card);
     next.lastCard = card;
@@ -294,22 +315,41 @@ function toWatchEventRow(r: HistoryFeedRow): WatchEventRow {
  * ("no data yet"): a failing poll prints nothing and bumps a consecutive-
  * failure counter; from the 5th consecutive failure a short notice is printed
  * to stderr once per failing poll. Never crashes, never takes the lock.
+ *
+ * `observeLock` (default: absent = no probe) is a read-only lock probe —
+ * one readFileSync of `factory.lock`, never an acquire. A PROVIDED probe
+ * that reports no live holder surfaces the snapshot's running items as the
+ * card's INTERRUPTED set (the interrupted-drive tell-tale: `running` is
+ * only ever written by a lock-holding drive, so a lockless running item was
+ * orphaned mid-stage by a dead drive). With NO probe the signal stays off —
+ * watch cannot claim an interruption it has no lock information about, so
+ * existing callers/tests are unaffected.
  */
-export function pollOnce(db: FactoryDb, state: WatchState, maxGateAttempts: number | null): WatchOutcome {
+export function pollOnce(
+  db: FactoryDb,
+  state: WatchState,
+  maxGateAttempts: number | null,
+  observeLock?: () => LockInfo | null,
+): WatchOutcome {
   try {
     // One consistent snapshot: items and history must match, otherwise an
     // event racing a concurrent `wb run` would render with stale item data
     // (e.g. a wrong parked fix hint that never gets corrected).
     const snap = db.getWatchSnapshot(state.first ? null : state.lastEventId);
     const items = snap.items.map(toWatchItem);
+    const lock = observeLock?.();
+    const interrupted =
+      observeLock === undefined || (lock != null && lockHolderAlive(lock))
+        ? []
+        : items.filter((i) => i.status === "running");
     if (state.first) {
       // Prime to the snapshot's max history id so nothing existing is printed.
       const maxId = snap.maxHistoryId ?? 0;
-      const outcome = runWatchOnce([], items, { ...state, lastEventId: maxId }, maxGateAttempts);
+      const outcome = runWatchOnce([], items, { ...state, lastEventId: maxId }, maxGateAttempts, interrupted);
       return { ...outcome, state: { ...outcome.state, consecutiveReadFailures: 0 } };
     }
     const rows = snap.historySince.map(toWatchEventRow);
-    const outcome = runWatchOnce(rows, items, state, maxGateAttempts);
+    const outcome = runWatchOnce(rows, items, state, maxGateAttempts, interrupted);
     return { ...outcome, state: { ...outcome.state, consecutiveReadFailures: 0 } };
   } catch {
     const failures = (state.consecutiveReadFailures ?? 0) + 1;
@@ -326,13 +366,17 @@ export type WatchTick = (next: () => void) => void;
 /**
  * The live loop: first poll immediately, then one chained (non-drifting)
  * `tick` per completed poll. Returns a stop function. `out` defaults to
- * stdout, `notify` to the OS notifier.
+ * stdout, `notify` to the OS notifier. `observeLock` (absent by default —
+ * the interrupted-drive signal stays off, behavior unchanged for existing
+ * callers) is the read-only lock probe `pollOnce` uses; the CLI passes
+ * `() => readLockInfo(root)`.
  */
 export function startWatch(
   db: FactoryDb,
   state: WatchState,
   maxGateAttempts: number | null,
   intervalSec: number,
+  observeLock?: () => LockInfo | null,
   out: (line: string) => void = console.log,
   notify: (text: string) => void = (text) => notifyParked(text),
   tick: WatchTick = (next) => {
@@ -343,7 +387,7 @@ export function startWatch(
   let stopped = false;
   const poll = () => {
     if (stopped) return;
-    const outcome = pollOnce(db, current, maxGateAttempts);
+    const outcome = pollOnce(db, current, maxGateAttempts, observeLock);
     current = outcome.state;
     for (const line of outcome.lines) out(line);
     for (const text of outcome.notificationTexts) notify(text);

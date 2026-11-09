@@ -38,7 +38,8 @@ The task text names some events differently from what the pipeline actually writ
 |-------------|----------------------------------|------------|
 | `claim` / `claim-resurrect` | `claimed` / `resurrected` (two separate events) | `src/inbox.ts` lines 70, 85 |
 | `stage-fail` | `stage-gate-fail` (only gate-fail event written; `stage-infra-fail` exists in `HistoryEvent` type but is never written — infra retries write `stage-retry`) | `src/pipeline.ts` ~526, ~425 |
-| —           | also written: `stage-start`, `stage-pass`, `parked`, `unparked`, `answered`, `approved`, `rejected-by-human`, `archived`, `pr-created` | `src/pipeline.ts` |
+| —           | also written: `stage-start`, `stage-pass`, `parked`, `unparked`, `answered`, `approved`, `rejected-by-human`, `archived`, `pr-created`, `drive-interrupted` | `src/pipeline.ts` |
+| `drive-interrupted` | dead-drive reconciliation (specs/wb-interrupted-drives.spec.md): `detail = { lastHolder: number \| null, repoLock: { repo, acquiredAt } \| null, requeued: true }`, row `stage` = the mid-flight stage | `src/pipeline.ts` `reconcileInterrupted` |
 
 Resolution (spec rule): the renderer keys off the **DB event strings**. Map: `claimed`→claim line, `resurrected`→claim-resurrect line, `stage-gate-fail`→the task's "stage-fail" rule. Everything not explicitly mapped (`stage-retry`, `approved`, `archived`, anything unknown) goes through the "other/unknown event" rule.
 
@@ -127,10 +128,10 @@ ellipsize(s: string, max: number): string           // existing repo pattern, se
 formatEventText(row: WatchEventRow, item: WatchItem | undefined, maxGateAttempts: number | null): string
 formatEventLine(row, item, maxGateAttempts): string  // includes ⚠/(!)/bell, see §4
 parkedFixHint(reason: string, parkedReason: string | null): string | null
-renderCard(items: WatchItem[]): string               // full block incl. separator rules
-runWatchOnce(rows: WatchEventRow[], items: WatchItem[], state: WatchState, maxGateAttempts: number | null): WatchOutcome
-pollOnce(db: FactoryDb, state: WatchState, maxGateAttempts: number | null): WatchOutcome  // queries DB then calls runWatchOnce; guarded per §6
-startWatch(db: FactoryDb, state: WatchState, maxGateAttempts: number, intervalSec: number, out: (line: string) => void, notify: (text: string) => void, tick: (ms: number) => void): () => void  // loop used by CLI; tick injectable for tests
+renderCard(items: WatchItem[], interrupted?: WatchItem[]): string   // full block incl. separator rules + the optional INTERRUPTED line (§4.2)
+runWatchOnce(rows: WatchEventRow[], items: WatchItem[], state: WatchState, maxGateAttempts: number | null, interrupted?: WatchItem[]): WatchOutcome
+pollOnce(db: FactoryDb, state: WatchState, maxGateAttempts: number | null, observeLock?: () => LockInfo | null): WatchOutcome  // queries DB then calls runWatchOnce; guarded per §6. observeLock: ABSENT = no probe (the interrupted-drive signal stays off — legacy behavior unchanged); PROVIDED = one read-only factory.lock read per poll (never an acquire) that derives the §4.2 INTERRUPTED set from the snapshot's running items
+startWatch(db: FactoryDb, state: WatchState, maxGateAttempts: number, intervalSec: number, observeLock?: () => LockInfo | null, out: (line: string) => void, notify: (text: string) => void, tick: (ms: number) => void): () => void  // loop used by CLI; tick injectable for tests. The CLI passes () => readLockInfo(root) as observeLock — the read-only probe behind the §4.2 INTERRUPTED card line
 notifyParked(text: string, platform: NodeJS.Platform = process.platform, spawnFn = spawn): void
 ```
 
@@ -163,7 +164,7 @@ Action body (read-only mirror of `status`):
 5. Print the startup banner (exact string):
    `wb watch — polling every ${intervalSec}s · quit with Ctrl+C`
 6. `let exitRequested` — install `process.on("SIGINT", () => { process.exit(0) })` (implicit exit code 0; no cursor restoration needed since no cursor is manipulated; wrap in try/finally so `db.close()` runs before exit).
-7. Run the loop via `startWatch(...)`, where the real `tick` is `setTimeout`-based: run `pollOnce` synchronously, print each of `outcome.lines` with `console.log`/`process.stdout.write`, call `notifyParked` for each `outcome.notificationTexts`, replace `pollState` with `outcome.state`, then schedule the next tick after `intervalSec * 1000`. Use a chained `setTimeout` (not drifting `setInterval`); schedule the first poll immediately (poll once, then schedule).
+7. Run the loop via `startWatch(...)`, where the real `tick` is `setTimeout`-based: run `pollOnce` synchronously, print each of `outcome.lines` with `console.log`/`process.stdout.write`, call `notifyParked` for each `outcome.notificationTexts`, replace `pollState` with `outcome.state`, then schedule the next tick after `intervalSec * 1000`. Use a chained `setTimeout` (not drifting `setInterval`); schedule the first poll immediately (poll once, then schedule). The CLI passes `() => readLockInfo(root)` as `observeLock` — the read-only probe behind the §4.2 INTERRUPTED card line: one `readFileSync` of `factory.lock` per poll, never a lock acquisition, so watch stays fully read-only.
 
 No factory lock is taken anywhere in this path. `maxGateAttempts = config.budgets.maxGateAttempts`.
 
@@ -192,6 +193,7 @@ No factory lock is taken anywhere in this path. `maxGateAttempts = config.budget
   - `PARKED (n):` lists items whose status is any of: `awaiting-approval`, `needs-human`, `exhausted-rework`, `infrastructure-failure`, `human-rejected`, `malformed` — i.e. all `ItemStatus` values except `queued`, `running`, `done`, `rejected` (terminal, `TERMINAL_STATUSES` in `src/types.ts`). Empty → `  PARKED (0): none` (two leading spaces). `n` is the live entry count (`parked.length`).
   - Entry format: `#<id> <slug>` for RUN; `#<id> <slug> (<reason>)` for PARKED, where `<reason>` = `ellipsize(item.parkedReason ?? "?", 60)` (short reason string, as the task says; malformed items will show `malformed front-matter: …` truncated).
   - Each content line (the `RUN (n): …` / `PARKED (n): …` text **without** the two-space indent, so the full printed line is ≤ 80 chars including the two-space indent) is truncated with `ellipsize(line, 78)` before indenting. Entries are joined with ` · `.
+  - **Optional `INTERRUPTED (n)` line** (specs/wb-interrupted-drives.spec.md): when `renderCard` receives a non-empty `interrupted` set — running items with no live factory lock, the dead-drive tell-tale — one more counted content line is appended **after `PARKED (n):` and before the closing rule**: `INTERRUPTED (n): #<id> <slug> <stage> · #<id> <slug> <stage> · …` (entries joined with ` · `, ellipsized to 78 content chars like the other lines). Empty/absent set: the card stays byte-identical to the two-line format. The count in the header keeps the truncated prefix honest, same as RUN/PARKED.
 - Card comparison is on the full rendered block string (all lines joined with `\n`), never identical twice in a row.
 
 ### 4.3 Event line rendering
@@ -230,6 +232,7 @@ Line shape: `[<HH:MM:SS>] #<itemId> <slug> <event-text>`.
 8. `answered` → `questions answered → <stage>` (stage is `"triage"` in practice; omit the arrow segment when stage null).
 9. `pr-created` → `PR created → <detail.url>` when `detail.url` is a string; if url missing, fall through to the unknown rule.
 10. `rejected-by-human` → `rejected at <row.stage> — <ellipsize(detail.reason, 60)>` (stage present in practice).
+10a. `drive-interrupted` (specs/wb-interrupted-drives.spec.md) → `drive interrupted at <stage> — item requeued (last holder pid <pid>)`, or `… (holder unknown)` when `detail.lastHolder` is null/absent. An explicit rule, better than the unknown-event fallback: the reconciliation is a first-class recovery event. NOT a parked row — no `⚠`/`(!)`/bell decoration and no OS notification (only `parked` rows notify, the same invariant as `base-stale`).
 11. Any other event → `<event>` + (stage ? ` <stage>` : ``); if `Object.keys(detail).length > 0` append ` (<keys>)` with keys in insertion order joined by `, `. Example from the task: `custom_event (via, round)`; a real one: `stage-retry test (attempt, backoffMs, error)`.
 
 Parked-line shape (with markers and bell), full example:

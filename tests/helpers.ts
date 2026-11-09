@@ -183,6 +183,10 @@ export function makeOrchestrator(
     curator?: CuratorRunner | null;
     maxResumeTicks?: number;
     baseCheck?: BaseFreshnessChecker | null;
+    /** Pre-acquire dead-holder evidence for the interrupted-drive reconcile
+     *  (specs/wb-interrupted-drives.spec.md): the pid a killed previous drive
+     *  left in its lock file. Omitted = holder unknown (null). */
+    lastHolderPid?: number | null;
   } = {},
 ): Orchestrator {
   const { config, configFile } = { config: harness.config, configFile: "" };
@@ -202,6 +206,7 @@ export function makeOrchestrator(
     // tested directly against GitBaseFreshnessChecker and via fakes at this
     // port in tests/base-freshness.test.ts.
     baseCheck: "baseCheck" in opts ? opts.baseCheck : { check: (): BaseFreshnessResult => ({ action: "proceed", message: null, localTip: null, upstreamTip: null }) } satisfies BaseFreshnessChecker,
+    ...(opts.lastHolderPid !== undefined ? { interruptedDrive: { lastHolderPid: opts.lastHolderPid } } : {}),
   });
 }
 

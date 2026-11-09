@@ -501,7 +501,7 @@ var FEED_COLOR = {
   claimed: '#2563eb', resurrected: '#2563eb', 'stage-pass': '#059669', 'stage-start': '#78716c',
   parked: '#d97706', 'stage-gate-fail': '#dc2626', 'stage-infra-fail': '#ea580c', 'stage-retry': '#60a5fa',
   'pr-created': '#059669', 'base-stale': '#78716c', unparked: '#059669', answered: '#7c3aed',
-  approved: '#059669', 'rejected-by-human': '#dc2626', archived: '#78716c'
+  approved: '#059669', 'rejected-by-human': '#dc2626', archived: '#78716c', 'drive-interrupted': '#ea580c'
 };
 
 var FLOW_CLS = { inbox: 'bg-ink-300', queue: 'bg-ink-500', parked: 'bg-amber-400', done: 'bg-emerald-500' };
@@ -1178,14 +1178,18 @@ function applyGlanceCollapsed(collapsed) {
   if (btn && btn.setAttribute) btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
 }
 
-/* Header run-state pill — a four-state operator machine (spec §Page),
+/* Header run-state pill — a five-state operator machine (spec §Page),
  * derived client-side on EVERY status payload (and on the 409 renderLock
  * shim path) from data already present; no new API, no server change.
- * Priority: RUNNING (live lock) > verbatim stale-lock text (dead holder —
- * informational, kept ahead of the operator states so a dead lock is never
- * silently displaced by a state that doesn't mention it) > NEEDS REVIEW
- * (no live lock, counts.decisions > 0) > PAUSED (no lock, zero decisions,
- * at least one queued/running item) > IDLE. The clock machinery (#26) stays
+ * Priority: RUNNING (live lock) > INTERRUPTED (running items with NO live
+ * lock — a drive died mid-stage; the payload's 'interrupted' signal) >
+ * verbatim stale-lock text (dead holder — informational, kept ahead of
+ * the operator states so a dead lock is never silently displaced by a
+ * state that doesn't mention it; INTERRUPTED outranks it only because its
+ * pill names the dead holder pid itself, preserving the information and
+ * attaching the recovery action) > NEEDS REVIEW (no live lock,
+ * counts.decisions > 0) > PAUSED (no lock, zero decisions, at least one
+ * queued/running item) > IDLE. The clock machinery (#26) stays
  * as-is within RUNNING: runAnchor is re-derived from lock.ageMs on every
  * lock.alive payload; a single 1s interval (created once, at init)
  * extrapolates between events — no extra polling. payloadLike is a whole
@@ -1223,8 +1227,9 @@ function renderRunButton(p) {
     : '▶ Start Processing';
 }
 
-function deriveRunState(lock, decisions, actionable) {
+function deriveRunState(lock, decisions, actionable, interrupted) {
   if (lock && lock.alive) return 'running';
+  if (interrupted) return 'interrupted'; // running items, no live lock — a dead drive
   if (lock) return 'stale';              // dead holder — verbatim stale text, unchanged
   if (decisions > 0) return 'review';
   if (actionable >= 1) return 'paused';
@@ -1238,7 +1243,8 @@ function renderRunState(p) {
   var counts = (p && p.counts) || null;
   var decisions = counts ? (counts.decisions || 0) : 0;
   var actionable = counts ? ((counts.queued || 0) + (counts.running || 0)) : 0;
-  runStateKind = deriveRunState(lock, decisions, actionable);
+  var interrupted = (p && p.interrupted) || null;
+  runStateKind = deriveRunState(lock, decisions, actionable, interrupted);
   if (runStateKind === 'idle') {
     runAnchor.running = false;
     el.innerHTML = '<span class="rounded-full text-[10px] font-semibold tracking-widest text-ink-400 bg-white ring-1 ring-ink-200 px-3 py-1">IDLE</span>';
@@ -1285,6 +1291,28 @@ function renderRunState(p) {
       '<span>· ' + frag + '</span>' +
       '<span class="font-mono tabular-nums" id="run-clock">' + fmtMMSS(runAnchor.ageMs) + '</span>' +
       '</button>';
+  } else if (runStateKind === 'interrupted') {
+    // A drive ended without a parking decision while an item was mid-stage:
+    // the PAUSED-shaped state gets its WHY. The payload's 'interrupted'
+    // signal names the items and the last known lock holder (pid where
+    // knowable, else the honest "no live factory lock"). Clicking the pill is
+    // the SAME recovery action as Start Processing (recovery contract
+    // unchanged) — pressRun() in the delegated click handler. Orange (infra
+    // family), distinct from the amber NEEDS REVIEW and stone PAUSED.
+    runAnchor.running = false;
+    var ints = (interrupted && interrupted.items) || [];
+    var intNames = ints.map(function (it) {
+      return '#' + it.id + ' ' + esc(it.slug) + ' at ' + esc(it.stage || '');
+    }).join(' · ');
+    var holderClause = interrupted && typeof interrupted.lastHolder === 'number'
+      ? '(last holder pid ' + esc(interrupted.lastHolder) + ')'
+      : '(no live factory lock)';
+    html =
+      '<button type="button" class="rounded-full ring-1 ' + STATUS_PILL['infrastructure-failure'] + ' text-xs px-3 py-1 inline-flex items-center gap-1.5 cursor-pointer" title="the previous drive did not end cleanly — press Start Processing to recover">' +
+      '<span class="h-1.5 w-1.5 rounded-full bg-orange-500"></span>' +
+      '<span class="text-[10px] font-semibold tracking-widest">INTERRUPTED</span>' +
+      '<span>· drive did not end cleanly — ' + intNames + ' ' + holderClause + ' — <span class="text-blue-700">press Start Processing</span></span>' +
+      '</button>';
   } else if (runStateKind === 'review') {
     // The first pending thing, in the parking lot's own order (every parked
     // item carries a non-empty stage; 'parked' is a defensive fallback).
@@ -1329,6 +1357,11 @@ function feedDetail(row) {
   if (row.event === 'unparked' && d.via) return ' (via ' + d.via + ')';
   if (row.event === 'stage-gate-fail' && d.attempt) return ' (attempt ' + d.attempt + ')';
   if (row.event === 'stage-pass' && d.nextStage) return ' → ' + d.nextStage;
+  if (row.event === 'drive-interrupted') {
+    return typeof d.lastHolder === 'number'
+      ? ' — item requeued (last holder pid ' + d.lastHolder + ')'
+      : ' — item requeued (holder unknown)';
+  }
   return '';
 }
 
@@ -2207,8 +2240,9 @@ setInterval(function () {
  * #run-state container (it survives every innerHTML re-render),
  * dispatching on the state machine: RUNNING → the #26 glance
  * expand/scroll/flash affordance; NEEDS REVIEW → scroll to the parking
- * lot; PAUSED → pressRun() (the same shared path as the Run button, flight
- * guard included). IDLE is an inert span and the stale text is
+ * lot; INTERRUPTED and PAUSED → pressRun() (the same shared path as the
+ * Start Processing button, flight guard included — recovery stays one
+ * action). IDLE is an inert span and the stale text is
  * informational — both are no-ops. */
 $('run-state').addEventListener('click', function () {
   if (runStateKind === 'running') {
@@ -2226,6 +2260,8 @@ $('run-state').addEventListener('click', function () {
   } else if (runStateKind === 'review') {
     var lot = $('parking-lot');
     if (lot.scrollIntoView) lot.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (runStateKind === 'interrupted') {
+    pressRun();
   } else if (runStateKind === 'paused') {
     pressRun();
   }
