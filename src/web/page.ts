@@ -2241,11 +2241,14 @@ $('btn-template').addEventListener('click', function () {
           if (m) fm[m[1]] = m[2];
         });
         if (!$('f-title').value && fm.title) $('f-title').value = fm.title;
-        if (!$('f-repo').value && fm.repo && fm.repo.indexOf('/path/to') !== 0) {
-          /* Only fill an empty field. Pick mode + a repo that is one of the
-           * known options: select it outright. Otherwise swap to the
-           * free-form input (no focus steal — the operator is clicking a
-           * button, not typing) and let the server expand the value. */
+        if (!currentRepoValue() && fm.repo && fm.repo.indexOf('/path/to') !== 0) {
+          /* Only fill an empty field, read through the canonical accessor —
+           * in pick mode the select's value IS the field's value, so a
+           * half-picked repo must not be clobbered by a prefill. Pick mode
+           * + a repo that is one of the known options: select it outright.
+           * Otherwise swap to the free-form input (no focus steal — the
+           * operator is clicking a button, not typing) and let the server
+           * expand the value. */
           if (repoFieldMode === 'pick' && knownRepoListed(fm.repo)) {
             $('f-repo-select').value = fm.repo;
           } else {

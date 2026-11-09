@@ -381,8 +381,9 @@ empty input — no focus steal), or an empty-list autoflip; the option
 rebuild is change-gated and preserves an in-progress selection across
 snapshots; submit posts `currentRepoValue()` — the sentinel posts as an
 empty repo (server-side 422), and template prefill only fills an empty
-field — a known repo is selected outright in pick mode, anything else
-swaps to the free-form input — base default "main", five approval-gate checkboxes, markdown
+field — emptiness is read through `currentRepoValue()`, so a pick-mode
+selection is the field's value: a known repo is selected outright in pick
+mode, anything else swaps to the free-form input — base default "main", five approval-gate checkboxes, markdown
 description, "Start from template" prefill from `/api/template`, "start processing now",
 and a file drop zone); the parking lot — one card per parked item (decision
 order: awaiting-approval, needs-human, exhausted-rework,
@@ -603,7 +604,9 @@ through the real `postJSON` bodies — the select's value in pick mode, the
 raw free-form value in add-new mode, and the sentinel never submitting
 (posted as an empty repo); and the template-prefill matrix — a known repo
 selected outright in pick mode, an unknown repo swapped into the free-form
-input, and a non-empty field never overwritten); the item detail overlay (open from a flight row / parked card /
+input, and a non-empty field never overwritten — including pick mode, where
+an already-selected repo is never displaced by a template naming a
+different or unknown repo); the item detail overlay (open from a flight row / parked card /
 glance chip / inbox row with exactly one fetch; action/control clicks never
 open it; inbox mode via the artifact route; Esc/backdrop/close dismissals
 with focus returned to the opener; an open overlay survives a live SSE

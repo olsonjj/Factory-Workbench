@@ -2563,5 +2563,36 @@ describe("wb serve page script: repository picker (runtime)", () => {
       url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("/a/r1") } : undefined,
     );
     expect(ctx3.el("f-repo").value).toBe("keep-me");
+
+    // a pick-mode selection is the field's value: a template naming a
+    // DIFFERENT known repo must not steal it (the guard reads
+    // currentRepoValue(), not the hidden input's raw value).
+    const ctx4 = makeContext();
+    ctx4.run(pageScript(PAGE_HTML));
+    await ctx4.settle();
+    ctx4.fire("status", withRepos(KNOWN_REPOS)); // default flip → pick mode
+    ctx4.el("f-repo-select").value = "/b/r2";
+    ctx4.click("btn-template");
+    await ctx4.settle((url) =>
+      url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("/a/r1") } : undefined,
+    );
+    expect(ctx4.el("f-repo-select").value).toBe("/b/r2");
+    expect(ctx4.el("f-repo-select").classList.contains("hidden")).toBe(false);
+
+    // likewise for an unknown template repo: an already-picked value wins —
+    // the form does not swap to add-new mode and the selection survives.
+    const ctx5 = makeContext();
+    ctx5.run(pageScript(PAGE_HTML));
+    await ctx5.settle();
+    ctx5.fire("status", withRepos(KNOWN_REPOS));
+    ctx5.el("f-repo-select").value = "/b/r2";
+    ctx5.click("btn-template");
+    await ctx5.settle((url) =>
+      url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("Code/x") } : undefined,
+    );
+    expect(ctx5.el("f-repo-select").value).toBe("/b/r2");
+    expect(ctx5.el("f-repo-select").classList.contains("hidden")).toBe(false);
+    expect(ctx5.el("f-repo").classList.contains("hidden")).toBe(true);
+    expect(ctx5.el("f-repo").value).toBe("");
   });
 });
