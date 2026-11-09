@@ -798,16 +798,28 @@ function applyFlightCollapsed(collapsed) {
 
 /* Repository picker — two modes over the one required field. 'pick': a
  * <select> of the payload's known repos (newest-first, option labels carry
- * a basename + per-repo item count) ending in the "add a new repo path…"
- * sentinel. 'new': the free-form input whose value the server expands
- * (~, bare known-repo name, factory-root-relative, absolute — README's
- * expansion rules, all server-side). Mode is sticky and changes only via
- * the two toggle buttons, the sentinel option, the one-time default flip,
- * or the empty-list autoflip; every button/sentinel switch carries focus
- * to the newly revealed control, the flips never steal focus. */
+ * a basename + per-repo item count) behind a disabled placeholder option —
+ * the explicit unselected state the field resets to. 'new': the free-form
+ * input whose value the server expands (~, bare known-repo name,
+ * factory-root-relative, absolute — README's expansion rules, all
+ * server-side). "Add a new repo path" is its own toggle link, never an
+ * option inside the dropdown: the select only ever holds real repos, so a
+ * mode switch can never masquerade as a picked value (the old
+ * sentinel-in-the-select design left the sentinel selected after backing
+ * out of add-new, and currentRepoValue() had to un-map it on submit).
+ * Mode is sticky and changes only via the two toggle buttons, the one-time
+ * default flip, or the empty-list autoflip; every button switch carries
+ * focus to the newly revealed control, the flips never steal focus. */
 var repoFieldMode = 'new';
 var repoOptionsHtml = null;
 var repoDefaultFlipped = false;
+
+/* \`block\` and \`hidden\` are both display utilities in this stylesheet, and
+ * \`block\` wins the cascade — an element carrying both classes still renders.
+ * Hiding a toggle therefore swaps the two instead of just adding \`hidden\`
+ * (the both-links-visible bug). */
+function showToggle(btn) { btn.classList.remove('hidden'); btn.classList.add('block'); }
+function hideToggle(btn) { btn.classList.remove('block'); btn.classList.add('hidden'); }
 
 function repoBasename(repo) {
   var parts = String(repo).split(/[\\/]/);
@@ -821,21 +833,20 @@ function applyRepoMode(mode) {
   var input = $('f-repo');
   if (pick) { sel.classList.remove('hidden'); input.classList.add('hidden'); }
   else { sel.classList.add('hidden'); input.classList.remove('hidden'); }
-  /* Toggles: pick mode offers "add a new repo path"; add-new mode offers
-   * "pick a known repo" only while the list is non-empty — it can never
-   * cycle into an empty dropdown. */
+  /* Toggles: exactly one is ever visible — pick mode offers "add a new
+   * repo path"; add-new mode offers "pick a known repo" only while the
+   * list is non-empty — it can never cycle into an empty dropdown. */
   var newBtn = $('repo-mode-new');
   var pickBtn = $('repo-mode-pick');
-  if (pick) newBtn.classList.remove('hidden'); else newBtn.classList.add('hidden');
+  if (pick) showToggle(newBtn); else hideToggle(newBtn);
   var has = CURRENT && (CURRENT.knownRepos || []).length > 0;
-  if (!pick && has) pickBtn.classList.remove('hidden'); else pickBtn.classList.add('hidden');
+  if (!pick && has) showToggle(pickBtn); else hideToggle(pickBtn);
 }
 
 function currentRepoValue() {
-  if (repoFieldMode === 'pick') {
-    var v = $('f-repo-select').value;
-    return v === '__wb_new__' ? '' : v;   // the sentinel is a mode switch, never a value
-  }
+  /* In pick mode an unselected field reads as '' — the disabled placeholder
+   * posts as an empty repo (server-side 422), never a mode token. */
+  if (repoFieldMode === 'pick') return $('f-repo-select').value;
   return $('f-repo').value;
 }
 
@@ -848,19 +859,21 @@ function knownRepoListed(repo) {
  * zero DOM writes — the renderParking guard pattern. */
 function renderRepoOptions(knownRepos) {
   knownRepos = knownRepos || [];
-  var html = knownRepos.map(function (k) {
-    var label = repoBasename(k.repo) + (k.count > 0 ? ' (' + k.count + (k.count === 1 ? ' item' : ' items') + ')' : '');
-    return '<option value="' + esc(k.repo) + '">' + esc(label) + '</option>';
-  }).join('') + '<option value="__wb_new__">➕ add a new repo path…</option>';
+  var html = '<option value="" disabled>— pick a repository —</option>' +
+    knownRepos.map(function (k) {
+      var label = repoBasename(k.repo) + (k.count > 0 ? ' (' + k.count + (k.count === 1 ? ' item' : ' items') + ')' : '');
+      return '<option value="' + esc(k.repo) + '">' + esc(label) + '</option>';
+    }).join('');
   var sel = $('f-repo-select');
   if (html !== repoOptionsHtml) {
     repoOptionsHtml = html;
     /* A fresh innerHTML on a real <select> resets the selection — restore
      * the operator's previous pick when it survives the new list so a live
-     * snapshot never erases a half-completed form. */
+     * snapshot never erases a half-completed form; a vanished (or
+     * placeholder) selection drops to the unselected placeholder. */
     var prev = sel.value;
     sel.innerHTML = html;
-    var keep = prev === '__wb_new__' || knownRepos.some(function (k) { return k.repo === prev; });
+    var keep = knownRepos.some(function (k) { return k.repo === prev; });
     sel.value = keep ? prev : '';
   }
   /* One-time default flip: the first snapshot carrying known repos moves an
@@ -884,11 +897,6 @@ $('repo-mode-new').addEventListener('click', function () {
 $('repo-mode-pick').addEventListener('click', function () {
   applyRepoMode('pick');
   var s = $('f-repo-select'); if (s && s.focus) s.focus();
-});
-$('f-repo-select').addEventListener('change', function () {
-  if ($('f-repo-select').value !== '__wb_new__') return;
-  applyRepoMode('new');
-  var f = $('f-repo'); if (f && f.focus) f.focus();
 });
 
 function stageDots(it) {

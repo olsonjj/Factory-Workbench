@@ -243,14 +243,17 @@ describe("wb serve: page, template, snapshot (CLI status contract)", () => {
     // tests/web-page-runtime.test.ts).
     expect(PAGE_HTML).toContain('id="glance-body"');
     expect(PAGE_HTML).toContain("data-glance-summary");
-    // Repo picker: a known-repos <select> ending in the "add a new repo
-    // path" sentinel plus the two mode toggles (the datalist combobox is
-    // gone). Option labels carry the per-repo item-count logic (escaped),
-    // and the free-form input advertises the accepted forms.
+    // Repo picker: a known-repos <select> (rebuilt by the runtime script
+    // behind a disabled placeholder option) plus the two mode toggles —
+    // "add a new repo path" is its own control, never an option inside the
+    // dropdown (the datalist combobox is gone, and with it the
+    // sentinel-in-the-select mode token). Option labels carry the per-repo
+    // item-count logic (escaped), and the free-form input advertises the
+    // accepted forms.
     expect(PAGE_HTML).toContain('id="f-repo-select"');
-    expect(PAGE_HTML).toContain('<option value="__wb_new__">');
     expect(PAGE_HTML).toContain('id="repo-mode-new"');
     expect(PAGE_HTML).toContain('id="repo-mode-pick"');
+    expect(PAGE_HTML).not.toContain('__wb_new__');
     expect(PAGE_HTML).not.toContain('list="repos-dl"');
     expect(PAGE_HTML).not.toContain("<datalist");
     expect(PAGE_HTML).toContain("k.count === 1 ? ' item' : ' items'");

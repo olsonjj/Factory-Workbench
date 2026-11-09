@@ -2346,7 +2346,7 @@ const focusSpy = (el: StubElement, log: string[], tag: string) => {
 };
 
 describe("wb serve page script: repository picker (runtime)", () => {
-  it("builds the known-repos dropdown in payload order with escaped basename+count labels and the sentinel last", async () => {
+  it("builds the known-repos dropdown in payload order with escaped basename+count labels behind the unselected placeholder", async () => {
     const ctx = makeContext();
     ctx.run(pageScript(PAGE_HTML));
     await ctx.settle(); // initial paint: idle payload, add-new mode
@@ -2355,10 +2355,12 @@ describe("wb serve page script: repository picker (runtime)", () => {
     const html = ctx.el("f-repo-select").innerHTML;
     expect(html).toContain('<option value="/a/r1">r1 (2 items)</option>');
     expect(html).toContain('<option value="/b/r2">r2 (1 item)</option>');
-    // newest-first = payload order, and the sentinel trails the list
+    // newest-first = payload order, behind a disabled leading placeholder
     expect(html.indexOf("/a/r1")).toBeLessThan(html.indexOf("/b/r2"));
-    expect(html.indexOf("__wb_new__")).toBeGreaterThan(html.indexOf("/b/r2"));
-    expect(html.endsWith('<option value="__wb_new__">➕ add a new repo path…</option>')).toBe(true);
+    expect(html.startsWith('<option value="" disabled>— pick a repository —</option>')).toBe(true);
+
+    // "Add new" is its own control: no mode-switch sentinel inside the dropdown
+    expect(html).not.toContain("__wb_new__");
 
     // Hostile repo string: both the value and the basename label are esc()'d.
     ctx.fire("status", withRepos([{ repo: '/x/r"q<r', count: 1 }]));
@@ -2428,7 +2430,7 @@ describe("wb serve page script: repository picker (runtime)", () => {
     expect(ctx2.el("repo-mode-pick").classList.contains("hidden")).toBe(false);
   });
 
-  it("toggles and sentinel switch modes with focus carry — and the pick toggle hides on an empty list", async () => {
+  it("toggles switch modes with focus carry, backing out keeps a real selection or the placeholder, and the pick toggle hides on an empty list", async () => {
     const ctx = makeContext();
     ctx.run(pageScript(PAGE_HTML));
     await ctx.settle();
@@ -2447,11 +2449,14 @@ describe("wb serve page script: repository picker (runtime)", () => {
     expect(ctx.el("f-repo").classList.contains("hidden")).toBe(true);
     expect(focusLog).toEqual(["input", "select"]);
 
-    // the sentinel option is a mode switch, not a value
-    ctx.el("f-repo-select").value = "__wb_new__";
-    ctx.fireEl("f-repo-select", "change");
-    expect(ctx.el("f-repo").classList.contains("hidden")).toBe(false);
-    expect(focusLog).toEqual(["input", "select", "input"]);
+    // backing out never leaves a stale mode token in the select: an
+    // unselected field reads as '' (the placeholder), a real pick survives
+    ctx.el("f-repo-select").value = "/b/r2";
+    ctx.click("repo-mode-new");
+    ctx.click("repo-mode-pick");
+    expect(ctx.el("f-repo-select").value).toBe("/b/r2");
+    ctx.fire("status", withRepos([{ repo: "/a/r1", count: 2 }])); // /b/r2 vanishes
+    expect(ctx.el("f-repo-select").value).toBe("");
 
     // empty known-repo list: the pick toggle can never cycle into an empty
     // dropdown — it stays hidden in add-new mode.
@@ -2509,12 +2514,14 @@ describe("wb serve page script: repository picker (runtime)", () => {
     expect(posted.repo).toBe("Code/x");
   });
 
-  it("never submits the sentinel — it posts as an empty repo for the server's 422", async () => {
+  it("an unselected pick-mode field posts an empty repo for the server's 422 — no mode token is ever submitted", async () => {
     const ctx = makeContext();
     ctx.run(pageScript(PAGE_HTML));
     await ctx.settle();
     ctx.fire("status", withRepos(KNOWN_REPOS));
-    ctx.el("f-repo-select").value = "__wb_new__";
+    // the operator backed out of add-new (or never picked): the disabled
+    // placeholder is the unselected state, and mouse users can't select it
+    ctx.el("f-repo-select").value = "";
     ctx.el("f-title").value = "T";
 
     ctx.click("btn-submit");
