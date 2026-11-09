@@ -250,6 +250,7 @@ describe("wb serve: page, template, snapshot (CLI status contract)", () => {
     // every sentinel-in-the-select or two-mode token. Option labels carry
     // the per-repo item-count logic (escaped).
     expect(PAGE_HTML).toContain('id="f-repo-select"');
+    expect(PAGE_HTML).toContain('<label class="block" for="f-repo-select">');
     expect(PAGE_HTML).toContain('id="repo-add-open"');
     expect(PAGE_HTML).toContain('id="repo-add-ok"');
     expect(PAGE_HTML).toContain('id="repo-add-cancel"');

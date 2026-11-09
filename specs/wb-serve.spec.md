@@ -370,15 +370,20 @@ Decision-desk layout (prototype variant C): pulse tiles (decisions amber /
 in flight / inbox / landed) + proportional flow bar (sub-9% segments demoted
 to a legend); the collapsible composer (title, repo picker — one required
 field over one visible control: a `<select>` of the payload's known
-repos (newest-first, option labels carry a basename + per-repo item count,
-all `esc()`-escaped, values the stored repo strings posted verbatim)
+repos (newest-first, option labels carry a basename + per-repo item count —
+a basename shared by more than one stored path falls back to the full
+stored path so look-alike forks stay distinguishable — all `esc()`-escaped,
+values the stored repo strings posted verbatim)
 behind a disabled `— pick a repository —` placeholder option — the
-explicit unselected state the field resets to; "add a new repo path" opens
+explicit unselected state the field resets to; the visible label is the
+select's explicit `for` label and the add form + opener sit outside it
+(a button must never become the field's labeled control); "add a new repo path" opens
 an inline Ok/Cancel form below the picker — Add (or Enter) commits the
 trimmed path as a removable chip whose raw value the submit posts
 verbatim (`~`, bare repo name, factory-root-relative, absolute — expansion
 stays entirely server-side, unchanged), Esc/Cancel dismiss without
-committing, and the chip's × resets the field to the picker; the option
+committing, and the chip's × resets the field to the picker's unselected
+state (never silently restoring a pre-chip pick); the option
 rebuild is change-gated and preserves an in-progress selection across
 snapshots; submit posts `currentRepoValue()` — a committed chip wins,
 otherwise an unselected field posts as an empty repo (server-side 422),
@@ -544,7 +549,8 @@ no remote URLs) plus the Start Processing button's static markers (idle
 label, composer checkbox wording, spinner/disabled CSS, old-string absence)
 and the repo picker's static markers (the `f-repo-select` dropdown, the
 inline add form (`repo-add-open`/`repo-add-input`/`repo-add-ok`/`repo-add-cancel`) and
-its chip pieces (`f-repo-chip`/`f-repo-chip-x`), the singular/plural
+its chip pieces (`f-repo-chip`/`f-repo-chip-x`), the visible label's
+explicit `for="f-repo-select"` binding, the singular/plural
 count-label logic, the add-form placeholder — the old datalist combobox's
 absence, and every mode-token (`repo-mode-*`, `__wb_new__`) absence from
 the page entirely);
@@ -599,7 +605,8 @@ and idle re-enable), its no-double-fire guard while disabled (zero
 `POST /api/run` entries), and the 202 toast copy (plain and capped
 suffix); the repository picker (option build in payload order — escaped
 basename + singular/plural
-count labels, behind the disabled unselected placeholder and with no
+count labels with a shared-basename fallback to the full stored path, behind
+disabled unselected placeholder and with no
 sentinel token anywhere in the dropdown; the skip-if-identical change-gate
 on the option rebuild;
 selection preservation across a composition-changed snapshot and the drop
@@ -608,7 +615,8 @@ visible-control invariant (add row and chip closed at rest); the inline
 add form — open focusing its input, Ok/Enter committing the trimmed chip,
 Esc/Cancel dismissing with focus returned to the opener, an empty Ok
 declined in place, the chip posted verbatim through the real `postJSON`
-body, and the chip's × resetting to the picker; submit routing asserted
+body, and the chip's × resetting to the picker's unselected state (no
+stale pre-chip pick restored); submit routing asserted
 through the real `postJSON` bodies — the select's value when a known repo
 is picked, the raw committed chip value verbatim, and an unselected field
 never submitting a mode token (posted as an empty repo);

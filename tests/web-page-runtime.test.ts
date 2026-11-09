@@ -2379,6 +2379,22 @@ describe("wb serve page script: repository picker (runtime)", () => {
     expect(ctx.el("f-repo-select").innerHTML).toContain(
       '<option value="/x/r&quot;q&lt;r">r&quot;q&lt;r (1 item)</option>',
     );
+
+    // Look-alikes: a shared basename falls back to the full stored path so
+    // the options stay distinguishable (a unique basename keeps the short
+    // label).
+    const ctx2 = makeContext();
+    ctx2.run(pageScript(PAGE_HTML));
+    await ctx2.settle();
+    ctx2.fire("status", withRepos([
+      { repo: "/work/app", count: 1 },
+      { repo: "/forks/app", count: 1 },
+      { repo: "/solo/app2", count: 3 },
+    ]));
+    const html2 = ctx2.el("f-repo-select").innerHTML;
+    expect(html2).toContain('<option value="/work/app">/work/app (1 item)</option>');
+    expect(html2).toContain('<option value="/forks/app">/forks/app (1 item)</option>');
+    expect(html2).toContain('<option value="/solo/app2">app2 (3 items)</option>');
   });
 
   it("change-gates the option rebuild — identical snapshots write nothing, a changed list does", async () => {
@@ -2474,6 +2490,10 @@ describe("wb serve page script: repository picker (runtime)", () => {
     focusSpy(ctx.el("repo-add-open"), focusLog, "open");
 
     ctx.fire("status", withRepos(KNOWN_REPOS));
+    // a pick survives the add-form commit (rebuild preservation) — but the
+    // × reset must return to the documented UNSELECTED state, not silently
+    // restore a stale pick
+    ctx.el("f-repo-select").value = "/b/r2";
     ctx.click("repo-add-open");
     ctx.el("repo-add-input").value = "  ~/scratch  ";
     ctx.fireEl("repo-add-input", "keydown", { key: "Enter" });
@@ -2484,6 +2504,8 @@ describe("wb serve page script: repository picker (runtime)", () => {
     ctx.click("f-repo-chip-x");
     expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(true);
     expect(ctx.el("f-repo-chip-text").textContent).toBe("");
+    expect(ctx.el("f-repo-select").value).toBe(""); // no stale pick restored
+    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
     expect(focusLog).toEqual(["add-input", "open"]);
 
     // Esc dismisses without committing; focus returns to the opener

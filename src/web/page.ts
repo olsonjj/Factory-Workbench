@@ -417,12 +417,15 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
             <div class="ferr" data-err="title"></div>
           </label>
           <label class="block">
-            <div class="lbl">Repository <span class="text-red-500">*</span></div>
-            <select id="f-repo-select" class="finput font-mono" aria-label="known repositories"></select>
-            <div id="f-repo-chip" class="fchip hidden">
-              <span id="f-repo-chip-text" class="font-mono"></span>
-              <button type="button" id="f-repo-chip-x" class="repo-chip-x" title="clear the custom repo — back to the picker">×</button>
-            </div>
+          <div>
+            <label class="block" for="f-repo-select">
+              <div class="lbl">Repository <span class="text-red-500">*</span></div>
+              <select id="f-repo-select" class="finput font-mono" aria-label="known repositories"></select>
+              <div id="f-repo-chip" class="fchip hidden">
+                <span id="f-repo-chip-text" class="font-mono"></span>
+                <button type="button" id="f-repo-chip-x" class="repo-chip-x" title="clear the custom repo — back to the picker">×</button>
+              </div>
+            </label>
             <div id="repo-add-row" class="repo-add-row hidden">
               <input id="repo-add-input" class="finput font-mono" placeholder="repo name, Code/rel/path, ~/path, or /abs/path" aria-label="new repository path">
               <div class="repo-add-actions">
@@ -434,6 +437,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
               <button type="button" id="repo-add-open" class="btn btn-out btn-repo-toggle">＋ Add a new repo path</button>
             </div>
             <div class="ferr" data-err="repo"></div>
+          </div>
           </label>
           <label class="block">
             <div class="lbl">Base branch</div>
@@ -855,9 +859,21 @@ function knownRepoListed(repo) {
  * zero DOM writes — the renderParking guard pattern. */
 function renderRepoOptions(knownRepos) {
   knownRepos = knownRepos || [];
+  /* Option labels disambiguate: the basename carries the picker's scan,
+   * but two stored paths can share one (a fork alongside its origin) — any
+   * basename appearing more than once falls back to the full stored path,
+   * so every option in a list of look-alikes is distinguishable at a
+   * glance and work can't be silently sent to the wrong checkout. */
+  var baseCounts = {};
+  knownRepos.forEach(function (k) {
+    var b = repoBasename(k.repo);
+    baseCounts[b] = (baseCounts[b] || 0) + 1;
+  });
   var html = '<option value="" disabled>— pick a repository —</option>' +
     knownRepos.map(function (k) {
-      var label = repoBasename(k.repo) + (k.count > 0 ? ' (' + k.count + (k.count === 1 ? ' item' : ' items') + ')' : '');
+      var b = repoBasename(k.repo);
+      var label = (baseCounts[b] > 1 ? k.repo : b) +
+        (k.count > 0 ? ' (' + k.count + (k.count === 1 ? ' item' : ' items') + ')' : '');
       return '<option value="' + esc(k.repo) + '">' + esc(label) + '</option>';
     }).join('');
   var sel = $('f-repo-select');
@@ -905,6 +921,10 @@ function clearRepoChip() {
   repoCustomValue = '';
   $('f-repo-chip-text').textContent = '';
   $('f-repo-chip').classList.add('hidden');
+  /* Reset to the documented unselected state — the picker may hold a stale
+   * pick from before the chip was committed (the rebuild's preservation
+   * keeps it), so an ×-reset must not silently restore it. */
+  $('f-repo-select').value = '';
   $('f-repo-select').classList.remove('hidden');
 }
 
