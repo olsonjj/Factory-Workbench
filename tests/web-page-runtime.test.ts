@@ -1792,12 +1792,20 @@ describe("wb serve page script (runtime behavior)", () => {
     // a parked card carries a Details button (the card itself must stay a
     // div — it nests the note/reject inputs)
     const PARKED = payload(
-      [{ id: 20, slug: "approve-me", title: "Approve me", stage: "spec", status: "awaiting-approval" }],
+      [{ id: 20, slug: "approve-me", title: "Approve me", stage: "spec", status: "awaiting-approval",
+         parkedDetail: { stage: "spec" },
+         artifacts: [{ name: "spec", stage: "spec", path: "items/approve-me/artifacts/20261108-0900-000-spec-spec.md", createdAt: "2026-11-08T09:00:00.000Z" }] }],
       null,
     );
     PARKED.counts.decisions = 1;
     ctx.fire("status", PARKED);
     expect(ctx.el("parking-lot").innerHTML).toContain('data-action="detail"');
+    // the raw-artifact link on the approval card is gone (option 2): the
+    // Details affordance is the one path to the spec; the raw escape hatch
+    // lives inside the overlay's per-artifact View raw links
+    expect(ctx.el("parking-lot").innerHTML).toContain("read the spec before approving or rejecting");
+    expect(ctx.el("parking-lot").innerHTML).not.toContain('href="/api/artifact');
+    expect(ctx.el("parking-lot").innerHTML).not.toContain("read before approving");
     // and it opens the overlay through the shared action path
     ctx.click("parking-lot", DETAIL_BTN_TARGET);
     expect(ctx.el("item-overlay").classList.contains("hidden")).toBe(false);

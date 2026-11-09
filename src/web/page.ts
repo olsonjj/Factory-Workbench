@@ -800,11 +800,6 @@ function statusPill(it) {
     esc(STATUS_LABEL[it.status] || it.status) + '</span>';
 }
 
-function artifactLink(a) {
-  return '<a href="/api/artifact?path=' + encodeURIComponent(a.path) + '" target="_blank" rel="noopener" ' +
-    'class="text-xs text-blue-700 underline underline-offset-2">' + esc(a.name) + '</a>';
-}
-
 function feedbackBox(text) {
   if (!text) return '';
   return '<div class="flex items-start gap-2 text-xs text-ink-600 bg-white/70 border border-red-200 rounded-md p-2.5">' +
@@ -829,12 +824,6 @@ function cardHtml(it) {
     '</div>' +
     stageDots(it) +
     '<div class="mt-4 space-y-3">';
-
-  if (it.status === 'awaiting-approval' && it.artifacts && it.artifacts.length) {
-    html += '<div class="rounded-lg bg-white/70 border border-amber-200 p-3 text-sm">' +
-      '<div class="text-amber-800 text-xs uppercase tracking-wide font-semibold mb-1.5">' + esc('artifact from ' + (d.stage || 'the parked stage') + ' — read before approving') + '</div>' +
-      '<div class="flex flex-col gap-1">' + it.artifacts.map(artifactLink).join('') + '</div></div>';
-  }
 
   if (it.status === 'needs-human' && it.questions && it.questions.length) {
     it.questions.forEach(function (q, i) {
@@ -868,7 +857,15 @@ function cardHtml(it) {
   // itself must stay a div (a button cannot legally contain the note/reject
   // inputs the actions below render), so the keyboard path to the detail
   // overlay is this real <button> — mouse users keep the whole-card click.
-  html += '<button type="button" data-action="detail" class="btn btn-out" title="view the full detail: spec, artifacts, source">Details</button>';
+  // On approval cards it is also the "read before approving" nudge: the old
+  // raw-file artifact link (a new tab of unrendered markdown) duplicated
+  // exactly what the overlay provides, minus the rendering, so it became a
+  // mid-decision context switch; the overlay's per-artifact View raw links
+  // keep the raw escape hatch for anyone who wants it.
+  var detailTitle = it.status === 'awaiting-approval'
+    ? 'read the spec before approving or rejecting'
+    : 'view the full detail: spec, artifacts, source';
+  html += '<button type="button" data-action="detail" class="btn btn-out" title="' + detailTitle + '">Details</button>';
   if (it.status === 'awaiting-approval') {
     html += '<input class="note-input finput !w-52" placeholder="optional note">' +
       '<button data-action="approve" class="btn btn-ok">Approve</button>' +
