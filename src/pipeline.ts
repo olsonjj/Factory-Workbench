@@ -8,7 +8,7 @@ import { artifactDir, itemDir } from "./paths.js";
 import type { FactoryConfig } from "./config.js";
 import { parseItemMarkdown } from "./frontmatter.js";
 import type { BaseFreshnessChecker, BaseFreshnessResult } from "./base-freshness.js";
-import { appendEntry, chunkKbLayer, globalKbFile, kbDigestIndex, loadKbSnapshot, projectKbFile, readKbFile, repoSlug, type KbDigestIndex } from "./kb.js";
+import { appendEntry, chunkKbLayer, globalKbFile, kbDigestIndex, loadKbSnapshot, projectKbFile, readKbFile, repoSlug } from "./kb.js";
 import { stamp } from "./util.js";
 
 /** PR publication happens on the host, outside the stage seam. Never merges. */
@@ -148,7 +148,7 @@ export class Orchestrator {
   reconcileInterrupted(lastHolder: number | null): TickEntry[] {
     const entries: TickEntry[] = [];
     for (const item of this.db.itemsWithStatus(["running"])) {
-      const repoLock = this.db.reconcileInterruptedItem(item.id, item.stage, lastHolder);
+      this.db.reconcileInterruptedItem(item.id, item.stage, lastHolder);
       entries.push({
         id: item.id,
         slug: item.slug,
@@ -1036,7 +1036,7 @@ export function previousStage(stage: StageName): StageName {
 }
 
 /** Where gate feedback routes: both gates fix via a re-run of implement. */
-export function reworkTarget(stage: StageName): StageName {
+export function reworkTarget(_stage: StageName): StageName {
   return "implement";
 }
 

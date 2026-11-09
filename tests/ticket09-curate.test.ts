@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import * as path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { createHarness, claim, makeOrchestrator, type TestHarness } from "./helpers.js";
-import { readKbFile, projectKbFile, globalKbFile, chunkKbLayer, kbDigestIndex } from "../src/kb.js";
+import { projectKbFile, globalKbFile, chunkKbLayer, kbDigestIndex } from "../src/kb.js";
 import type { CuratorRequest, CuratorRunner, StageResult } from "../src/types.js";
 
 let harness: TestHarness;

@@ -840,7 +840,7 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
    *  (never an error status), so callers degrade to the `file unreadable`
    *  marker. Async read (rework-5 discipline). */
   async function readContentOrNull(rel: string): Promise<string | null> {
-    const verdict = await artifactFileVerdict(rel);
+    const verdict = artifactFileVerdict(rel);
     if ("reason" in verdict) return null;
     try {
       return await readFile(verdict.realAbs, "utf8");

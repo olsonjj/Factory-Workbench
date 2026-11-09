@@ -3,7 +3,7 @@ import * as os from "node:os";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, } from "node:fs";
 import { FactoryDb } from "../src/db.js";
 import { makePaths, type FactoryPaths } from "../src/paths.js";
-import { loadConfig, type FactoryConfig } from "../src/config.js";
+import { type FactoryConfig } from "../src/config.js";
 import { scanInbox } from "../src/inbox.js";
 import { Orchestrator, type PrPublishRequest, type PrPublisher } from "../src/pipeline.js";
 import type { BaseFreshnessChecker, BaseFreshnessResult } from "../src/base-freshness.js";
@@ -39,17 +39,6 @@ export function createHarness(budgetOverrides: Partial<FactoryConfig["budgets"]>
     sandbox: { imageName: "test:sandbox" },
     kb: { maxGlobalChars: 24000, maxProjectChars: 24000 },
   };
-  let fileNo = 0;
-  function uniqueName(rootDir: string, base: string): string {
-    const inbox = path.join(rootDir, "inbox");
-    let name = base;
-    let n = 0;
-    while (existsSync(path.join(inbox, `${name}.md`))) {
-      n += 1;
-      name = `${base}-${n}`;
-    }
-    return name;
-  }
   const harness: TestHarness = {
     root,
     paths,
@@ -189,9 +178,6 @@ export function makeOrchestrator(
     lastHolderPid?: number | null;
   } = {},
 ): Orchestrator {
-  const { config, configFile } = { config: harness.config, configFile: "" };
-  void configFile;
-  void loadConfig;
   return new Orchestrator({
     db: harness.db,
     paths: harness.paths,
@@ -200,7 +186,7 @@ export function makeOrchestrator(
     curator: opts.curator ?? null,
     publisher: opts.publisher ?? new FakePublisher(),
     sleep: async () => {},
-    maxResumeTicks: opts.maxResumeTicks,
+    ...(opts.maxResumeTicks !== undefined ? { maxResumeTicks: opts.maxResumeTicks } : {}),
     // Silent proceed: existing tests tick items with fake repo paths like
     // /tmp/repo — the real checker would print noise. Real-git behavior is
     // tested directly against GitBaseFreshnessChecker and via fakes at this

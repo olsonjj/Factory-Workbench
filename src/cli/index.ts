@@ -96,7 +96,7 @@ function openAuthoringRoot(rootOverride?: string): {
   db: FactoryDb;
   release: () => void;
 } {
-  const { config, root } = loadConfig(rootOverride);
+  const { root } = loadConfig(rootOverride);
   ensureConfigFile(root);
   const paths = makePaths(root);
   ensureLayout(paths);

@@ -63,6 +63,8 @@ describe("wb watch (integration)", () => {
     expect(second.lines[0]).toMatch(/^\[\d{2}:\d{2}:\d{2}\] #1 add-dark-mode test → start \(gate 2\/3\)$/);
     expect(second.lines[1]).toMatch(/^\[\d{2}:\d{2}:\d{2}\] #1 add-dark-mode test → pass → review$/);
     expect(second.lines[2]).toMatch(
+      // \x07 is the terminal BEL the watch log intentionally emits on a park.
+      // oxlint-disable-next-line eslint/no-control-regex
       /^⚠ \[\d{2}:\d{2}:\d{2}\] \(!\) #1 add-dark-mode parked at review — awaiting-approval → `wb approve add-dark-mode`\x07$/,
     );
     expect(second.lines[3]).toBe(
@@ -106,6 +108,8 @@ describe("wb watch (integration)", () => {
     expect(second.lines).toHaveLength(3);
     expect(second.lines[0]).toMatch(/^\[\d{2}:\d{2}:\d{2}\] #1 broken claim$/);
     expect(second.lines[1]).toMatch(
+      // \x07 is the terminal BEL the watch log intentionally emits on a park.
+      // oxlint-disable-next-line eslint/no-control-regex
       /^⚠ \[\d{2}:\d{2}:\d{2}\] \(!\) #1 broken parked at triage — front-matter must include a non-empty `title` → `wb retry broken  # fix front-matter first`\x07$/,
     );
     expect(second.lines[2]).toContain("PARKED (1): #1 broken (malformed front-matter:");

@@ -4,16 +4,12 @@ import * as fs from "node:fs";
 import { mkdtempSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-  createHarness,
-  claim,
-  type TestHarness,
-} from "../helpers.js";
+import { createHarness, type TestHarness } from "../helpers.js";
 import { 
   createWorktree,
   type Worktree,
 } from "@ai-hero/sandcastle";
-import { SandcastleStageRunner, GhPrPublisher, ollamaEnv, claudeEnv } from "../../src/adapters/sandcastle.js";
+import { SandcastleStageRunner, ollamaEnv, claudeEnv } from "../../src/adapters/sandcastle.js";
 
 /** Same realpath normalization the adapter does (realRepoPath is private):
  *  on macOS /var, /tmp and friends are symlinks — sandcastle mounts the parent

@@ -83,21 +83,26 @@ export function printStatusItems(db: FactoryDb, opts: { all?: boolean }): void {
     if (item.parkedDetail) {
       const d = item.parkedDetail;
       if (item.parkedReason === "stale-base" && typeof d.base === "string" && typeof d.repo === "string") {
+        // parkedDetail is Record<string, unknown> — narrow the tips before
+        // interpolating (never template an unknown).
+        const localTip = typeof d.localTip === "string" ? d.localTip : "?";
+        const upstreamTip = typeof d.upstreamTip === "string" ? d.upstreamTip : "?";
         console.log(
-          `    stale base: ${d.base} (${d.localTip ?? "?"}) behind origin/${d.base} (${d.upstreamTip ?? "?"}) — git pull in ${d.repo}`,
+          `    stale base: ${d.base} (${localTip}) behind origin/${d.base} (${upstreamTip}) — git pull in ${d.repo}`,
         );
       }
       if (Array.isArray(d.questions) && d.questions.length > 0) {
         console.log("    questions:");
         for (const q of d.questions as string[]) console.log(`      - ${q}`);
       }
-      if (typeof d.stage === "string" && d.stage !== item.stage) {
-        console.log(`    completed stage: ${d.stage}`);
+      const doneStage = typeof d.stage === "string" ? d.stage : null;
+      if (doneStage !== null && doneStage !== item.stage) {
+        console.log(`    completed stage: ${doneStage}`);
       }
-      if (item.parkedReason === "awaiting-approval") {
-        const artifacts = db.getArtifacts(item.id).filter((a) => a.stage === d.stage);
+      if (item.parkedReason === "awaiting-approval" && doneStage !== null) {
+        const artifacts = db.getArtifacts(item.id).filter((a) => a.stage === doneStage);
         if (artifacts.length > 0) {
-          console.log(`    artifact from ${d.stage}: ` + artifacts.map((a) => a.path).join(", "));
+          console.log(`    artifact from ${doneStage}: ` + artifacts.map((a) => a.path).join(", "));
         }
       }
     }

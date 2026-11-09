@@ -245,7 +245,7 @@ export function loadConfig(rootOverride?: string, cwd: string = process.cwd()): 
       ...(provider === "claude"
         ? { default: CLAUDE_DEFAULT_MODEL, review: CLAUDE_DEFAULT_REVIEW_MODEL }
         : DEFAULT_CONFIG.models),
-      ...(raw.models ?? {}),
+      ...raw.models,
     },
     agent: { provider },
     // Multi-profile review gates (ticket 11): pass through verbatim — zod
@@ -253,15 +253,15 @@ export function loadConfig(rootOverride?: string, cwd: string = process.cwd()): 
     ...(raw.review ? { review: { gates: raw.review.gates } } : {}),
     budgets: {
       ...DEFAULT_CONFIG.budgets,
-      ...(raw.budgets ?? {}),
+      ...raw.budgets,
     },
     sandbox: {
       ...DEFAULT_CONFIG.sandbox,
-      ...(raw.sandbox ?? {}),
+      ...raw.sandbox,
     },
     kb: {
       ...DEFAULT_CONFIG.kb,
-      ...(raw.kb ?? {}),
+      ...raw.kb,
     },
   };
   const parsed = configSchema.safeParse(config);

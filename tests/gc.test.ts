@@ -320,7 +320,7 @@ describe("runGc (fake scanner + spy reaper + real FactoryDb)", () => {
     while (harnesses.length > 0) harnesses.pop()?.cleanup();
   });
 
-  function scannerFor(h: TestHarness, status: ItemRecord["status"]): FakeScanner {
+  function scannerFor(_h: TestHarness, _status: ItemRecord["status"]): FakeScanner {
     return new FakeScanner((repo, items) => ({
       repo,
       reachable: true,
@@ -537,7 +537,6 @@ describe("GitGcScanner / GitGcReaper (real git, temp repos)", () => {
 
   it("detects orphans (no item row) and prunable dirs, report-only by default", async () => {
     const repo = makeRepo();
-    const h = makeHarness();
     addManagedWorktree(repo, "factory/gone-item"); // no DB row for it
     const repoReal = fs.realpathSync(repo.dir);
     const leftover = path.join(repoReal, ".sandcastle", "worktrees", "factory-crash-leftover");
@@ -595,7 +594,6 @@ describe("GitGcScanner / GitGcReaper (real git, temp repos)", () => {
   });
 
   it("reports an unreachable repo instead of crashing", async () => {
-    const h = makeHarness();
     const report = await new GitGcScanner().scanTarget(path.join(os.tmpdir(), "gc-no-such-repo-xyz"), []);
     expect(report.reachable).toBe(false);
     expect(report.findings[0]!.kind).toBe("unreachable-repo");

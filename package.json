@@ -4,6 +4,7 @@
   "description": "Factory Workbench (wb) — markdown work items in, reviewed pull requests out",
   "scripts": {
     "test": "vitest run",
+    "lint": "oxlint --type-aware",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "wb": "tsx src/cli/index.ts"
@@ -25,6 +26,8 @@
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.6.5",
+    "oxlint": "^1.93.0",
+    "oxlint-tsgolint": "^7.0.2006",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"

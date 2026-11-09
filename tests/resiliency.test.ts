@@ -195,7 +195,8 @@ describe("P0-2: wb retry recovery verb", () => {
     expect(parked.stage).toBe("triage"); // the stage the item was working in — was null before unification
     expect(Object.keys(parked.detail)).toEqual(["reason"]);
     expect(parked.detail.reason).toBe("front-matter must include a non-empty `title`");
-    expect(item.parkedReason).toBe(`malformed front-matter: ${parked.detail.reason}`);
+    // detail is Record<string, unknown>; the expect above pins the type.
+    expect(item.parkedReason).toBe(`malformed front-matter: ${parked.detail.reason as string}`);
   });
 
   it("parks a mid-run corruption at the item's current stage, not the claim path's (Greptile P2)", async () => {

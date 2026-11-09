@@ -89,7 +89,7 @@ describe("ticket 02: stage state machine + run/resume (stub stages)", () => {
     const item = harness.db.listItems()[0]!;
     expect(item.status).toBe("needs-human");
     expect(item.parkedReason).toBe("needs-human");
-    expect((item.parkedDetail?.questions as string[]).join("")).toContain("auth provider");
+    expect((item.parkedDetail?.questions ?? []).join("")).toContain("auth provider");
     expect(harness.db.itemsWithStatus(["needs-human"])).toHaveLength(1);
     expect(harness.db.itemsWithStatus(["done"])).toHaveLength(0);
   });

@@ -6,13 +6,8 @@ import { z } from "zod";
 import { createWorktree, pi, claudeCode } from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import type { Worktree, RunResult, SandboxHooks, AgentProvider } from "@ai-hero/sandcastle";
-
-/** Read a structured-output payload from a run result. */
-function outputOf<T>(result: RunResult): T {
-  return (result as unknown as { output: T }).output;
-}
 import { modelFor, resolveReviewGates, type AgentProviderName, type FactoryConfig, type ReviewGate } from "../config.js";
-import type { ItemContext, KbSnapshot, StageArtifact, StageRequest, StageResult, StageRunner, CuratorRequest, CuratorRunner } from "../types.js";
+import type { ItemContext, StageArtifact, StageRequest, StageResult, StageRunner, CuratorRequest, CuratorRunner } from "../types.js";
 
 /**
  * The real StageRunner implementation below the seam: every agent stage runs
@@ -342,9 +337,6 @@ export function buildReviewPrompt(gate: ReviewGate, base: string): string {
   return sections.join("\n\n");
 }
 
-interface WtRunOptionsOutput {
-  output?: { tag: string; [k: string]: unknown };
-}
 interface SandcastleRunnerDeps {
   config: FactoryConfig;
   /** Extra env injected into the sandbox pi process (e.g. OLLAMA_API_KEY). */
@@ -931,8 +923,8 @@ ${COMPLETE}`;
     const staged = this.staging();
     const mounts = provider === "pi" ? piConfigMounts(opts.agentDir!, staged?.npmGlobalPrefixBase ?? null, "curator") : [];
     const env = provider === "claude"
-      ? { ...(this.deps.env ?? {}) }
-      : { ...(this.deps.env ?? {}), ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefixBase }) };
+      ? { ...this.deps.env }
+      : { ...this.deps.env, ...piEnvFor({ npmGlobalPrefixMount: !!staged?.npmGlobalPrefixBase }) };
     // Deliberately NO hooks.sandbox.onSandboxReady here (unlike wtRun): the
     // scratch cwd has no package.json (it only hosts read-only KB mounts), so
     // an npm install would fail and abort the run. Skipping is the designed

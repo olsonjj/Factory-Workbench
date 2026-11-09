@@ -439,6 +439,9 @@ hand.
   `CLAUDE_CODE_OAUTH_TOKEN`. They skip when their requirements are unavailable.
 - Typecheck: `npm run typecheck`. Build: `npm run build`. CI runs both before
   the test suite.
+- Lint: `npm run lint` — oxlint with type-aware rules via tsgolint
+  (`typescript/no-floating-promises` is the one that matters most here). CI
+  runs it with the typecheck.
 
 ## Architecture notes
 
