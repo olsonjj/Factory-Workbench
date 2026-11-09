@@ -6,7 +6,7 @@
  * (read-only snapshot feeds). No internal reach-ins; no Docker, no model
  * calls; SSE ticks driven by `app.flush()` (intervalMs: 0, no real timers).
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import * as http from "node:http";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -1949,5 +1949,159 @@ describe("wb serve: SSE ledger reset + unicode-safe slicing", () => {
     // the UTF-8 buffer delivers the payload byte-exactly.
     expect(delivered).toBe(EMOJI_FILLER);
     stream.abort();
+  });
+});
+
+describe("wb serve: dead-drive observability (specs/wb-interrupted-drives.spec.md)", () => {
+  /** Claim an item, drive its triage through the shared runner, then simulate
+   *  the killed drive: `running` persisted mid-stage, process gone, no lock
+   *  file — the 2026-11-08 incident fixture. */
+  async function seedOrphan(
+    s: ServerHarness,
+    opts: { approvals?: string[]; stage?: "spec" } = {},
+  ): Promise<number> {
+    s.h.inboxFile(
+      "item-27",
+      { title: "Item 27", repo: "/tmp/repo", base: "main", approvals: opts.approvals ?? [] },
+      "Body.",
+    );
+    claim(s.h);
+    const id = s.h.db.listItems()[0]!.id;
+    await makeOrchestrator(s.h, s.runner).tickAll(); // triage passes → queued at spec
+    parkAs(s.h, id, { status: "running", stage: opts.stage ?? "spec" }); // killed mid-spec
+    return id;
+  }
+
+  it("/api/status reports the interrupted drive (running orphan, no live lock) read-only, naming a dead holder", async () => {
+    const s = await makeServer();
+    const id = await seedOrphan(s);
+    const payload = (await (await fetch(s.url + "/api/status")).json()) as {
+      interrupted: { items: { id: number; slug: string; stage: string }[]; lastHolder: number | null } | null;
+    };
+    expect(payload.interrupted).toEqual({
+      items: [{ id, slug: "item-27", stage: "spec" }],
+      lastHolder: null,
+    });
+    // observation stays lock-free: no factory.lock was ever created
+    expect(existsSync(path.join(s.h.root, "factory.lock"))).toBe(false);
+    // a hard kill leaves the lock file behind: it names the dead holder
+    writeFileSync(path.join(s.h.root, "factory.lock"), JSON.stringify({ pid: 999_999_999, ts: Date.now(), id: "dead-drive" }));
+    const dead = (await (await fetch(s.url + "/api/status")).json()) as typeof payload;
+    expect(dead.interrupted!.lastHolder).toBe(999_999_999);
+    expect(dead.interrupted!.items).toEqual([{ id, slug: "item-27", stage: "spec" }]);
+    // a live holder owns the running state: no signal
+    const release = acquireFactoryLock(s.h.root);
+    try {
+      const live = (await (await fetch(s.url + "/api/status")).json()) as typeof payload;
+      expect(live.interrupted).toBeNull();
+    } finally {
+      release();
+    }
+  });
+
+  it("the SSE connect snapshot carries the interrupted field (no lock acquired)", async () => {
+    const s = await makeServer();
+    const id = await seedOrphan(s);
+    const stream = connectEvents(s);
+    try {
+      await stream.waitUntil((n) => n >= 1);
+      expect(stream.events[0]!.event).toBe("status");
+      const snapshot = JSON.parse(stream.events[0]!.data) as {
+        interrupted: { items: { id: number; slug: string; stage: string }[]; lastHolder: number | null } | null;
+      };
+      expect(snapshot.interrupted).toEqual({
+        items: [{ id, slug: "item-27", stage: "spec" }],
+        lastHolder: null,
+      });
+      expect(existsSync(path.join(s.h.root, "factory.lock"))).toBe(false);
+    } finally {
+      stream.abort();
+    }
+  });
+
+  it("POST /api/run reconciles the orphan before driving: label, then the next stage-start", async () => {
+    const s = await makeServer();
+    const id = await seedOrphan(s, { approvals: ["spec"] }); // parks at the spec gate after recovery
+    const r = await post(s.url + "/api/run", {});
+    expect(r.status).toBe(202);
+    expect(s.h.db.getItem(id)!.status).toBe("awaiting-approval");
+    // the audit trail shows the gap AND the recovery, not just the resumption
+    const events = s.h.db.getHistory(id);
+    const label = events.find((e) => e.event === "drive-interrupted")!;
+    expect(label.stage).toBe("spec");
+    expect(label.detail).toMatchObject({ lastHolder: null, requeued: true });
+    const after = events.slice(events.indexOf(label) + 1);
+    expect(after[0]).toMatchObject({ event: "stage-start", stage: "spec" });
+    // observation is clean again: the PAUSED-shaped state lost its why
+    const payload = (await (await fetch(s.url + "/api/status")).json()) as { interrupted: unknown };
+    expect(payload.interrupted).toBeNull();
+  });
+
+  it("the web drive emits exactly one completed exit marker server-side", async () => {
+    const s = await makeServer();
+    s.h.inboxFile("gated", { title: "Gated", repo: "/tmp/repo", base: "main", approvals: ["spec"] }, "Body.");
+    claim(s.h);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const r = await post(s.url + "/api/run", {});
+      expect(r.status).toBe(202);
+      const markers = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith("drive exited:"));
+      expect(markers).toEqual(["drive exited: completed (nothing actionable left)"]);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("a capped drive logs the capped marker beside the existing safety-cap stderr line", async () => {
+    const s = await makeServer({}, { maxResumeTicks: 1 });
+    s.h.inboxFile("cap-a", { title: "Cap A", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    s.h.inboxFile("cap-b", { title: "Cap B", repo: "/tmp/repo", base: "main", approvals: [] }, "Body.");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const r = await post(s.url + "/api/resume", {});
+      expect(r.status).toBe(202);
+      expect(r.body.capped).toBe(true);
+      expect(errSpy.mock.calls.map((c) => String(c[0])).some((l) => l.startsWith("resume hit its safety cap"))).toBe(true);
+      expect(logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith("drive exited:"))).toEqual([
+        "drive exited: capped — run `wb resume` again to continue",
+      ]);
+    } finally {
+      logSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
+  it("a drive that dies by throw still requeues + labels the orphan (its own pid) and marks the log", async () => {
+    const s = await makeServer();
+    const id = await seedOrphan(s);
+    // the claim pass itself fails (the inbox path is a plain file): the drive
+    // throws AFTER the orchestrator exists — the graceful-death path.
+    rmSync(s.h.paths.inbox, { recursive: true, force: true });
+    writeFileSync(s.h.paths.inbox, "not a directory");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const r = await post(s.url + "/api/run", {});
+      expect(r.status).toBe(500);
+      expect(errSpy.mock.calls.map((c) => String(c[0])).some((l) => l.startsWith("drive exited: interrupted —"))).toBe(true);
+      // the orphaned mid-stage item was requeued and labeled with the dying
+      // drive's own pid (the serve task held the lock at that moment)
+      const item = s.h.db.getItem(id)!;
+      expect(item.status).toBe("queued");
+      const label = s.h.db.getHistory(id).find((e) => e.event === "drive-interrupted")!;
+      expect(label.detail).toMatchObject({ lastHolder: process.pid, requeued: true });
+      // a follow-up drive finds nothing to double-label (idempotency)
+      rmSync(s.h.paths.inbox, { force: true });
+      mkdirSync(s.h.paths.inbox, { recursive: true });
+      const again = await post(s.url + "/api/run", {});
+      expect(again.status).toBe(202);
+      expect(s.h.db.getHistory(id).filter((e) => e.event === "drive-interrupted")).toHaveLength(1);
+      const payload = (await (await fetch(s.url + "/api/status")).json()) as { interrupted: unknown };
+      expect(payload.interrupted).toBeNull();
+    } finally {
+      logSpy.mockRestore();
+      errSpy.mockRestore();
+    }
   });
 });

@@ -32,6 +32,7 @@ import {
   STALE_LOCK_MS,
 } from "../lock.js";
 import { Orchestrator } from "../pipeline.js";
+import { driveExitLine } from "../drive.js";
 import type { CuratorRunner, ItemRecord, StageRunner } from "../types.js";
 import type { PrPublisher } from "../pipeline.js";
 import { ITEM_TEMPLATE, parseApprovalsInput } from "../frontmatter.js";
@@ -101,6 +102,10 @@ export interface ServeAppDeps {
   clock?: { now(): number };
   /** "background" (prod): run/resume answer 202 immediately. "await" (tests): answer after completion. */
   runMode?: "background" | "await";
+  /** Safety-cap override for the drive's resume loop (mirrors the
+   *  Orchestrator's own knob; tests make a capped drive cheap). Default: the
+   *  Orchestrator's 500. */
+  maxResumeTicks?: number;
   /** The address the server is bound to (runServe passes `--host`). API requests
    *  with a Host header naming anything other than 127.0.0.1 / localhost / this
    *  host are rejected (CSRF + DNS-rebinding guard; see checkApiRequest). */
@@ -452,8 +457,18 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
    *  claim pass + drive-until-parked (`Orchestrator.resume()`) happen in a
    *  detached task (awaited in tests); progress reaches clients only via the
    *  SSE stream. Both verbs ("run" and "resume") drive identically — the web
-   *  Run button maps to the same resume loop the CLI's `wb resume` runs. */
+   *  Run button maps to the same resume loop the CLI's `wb resume` runs.
+   *
+   *  Dead-drive observability (specs/wb-interrupted-drives.spec.md): the
+   *  pre-acquire lock (a dead previous drive's pid, when its lock file
+   *  survived) rides into the Orchestrator so `resume()` reconciles
+   *  interrupted items first; the task emits exactly one drive-exit marker
+   *  line server-side (completed / capped / interrupted), and a throw out of
+   *  the drive requeues + labels any mid-stage item with THIS process's pid
+   *  before rethrowing (the graceful-death path — the lock is released, the
+   *  audit trail still names the dying holder). */
   async function startRun(kind: "run" | "resume"): Promise<{ started: boolean; busy: boolean; capped?: boolean }> {
+    const preLock = readLockInfo(deps.root);
     let release: () => void;
     try {
       release = acquireFactoryLock(deps.root);
@@ -476,6 +491,8 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
           publisher,
           sleep,
           baseCheck: baseCheck !== undefined ? baseCheck : new GitBaseFreshnessChecker(),
+          interruptedDrive: { lastHolderPid: preLock?.pid ?? null },
+          maxResumeTicks: deps.maxResumeTicks,
         });
         // The claim pass belongs to run/resume (the openFactory-equivalent),
         // never to serve startup or per-item actions.
@@ -484,8 +501,24 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
         if (report.capped) {
           // Parity with the CLI's message: the client may need to press Run again.
           console.error("resume hit its safety cap — run `wb resume` again to continue.");
+          console.log(driveExitLine("resume", "capped"));
+        } else {
+          console.log(driveExitLine("resume", "completed"));
         }
         return { capped: report.capped ?? false };
+      } catch (err) {
+        // Graceful-death labeling: this task WAS the drive and lock holder —
+        // requeue + label any mid-stage item with our pid while the DB still
+        // lets us. Swallowed around the rethrow: the labeling must never mask
+        // the original error (which surfaces as the request's 500 / the
+        // background-failure log line).
+        try {
+          orch?.reconcileInterrupted(process.pid);
+        } catch {
+          /* the DB may itself be what failed */
+        }
+        console.error(driveExitLine("resume", "interrupted", err instanceof Error ? `${err.name}: ${err.message}` : String(err)));
+        throw err;
       } finally {
         try {
           await orch?.dispose();

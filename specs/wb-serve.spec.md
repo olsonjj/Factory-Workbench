@@ -165,7 +165,7 @@ and exits 1; other listen errors print `could not listen on <host>:<port> — <r
   — verbatim CLI presentation helpers (see above).
 - `buildStatusPayload({root, paths, db, clock?})` → `StatusPayload`:
   `{ root, generatedAt, maxHistoryId, lock, counts, flow, stages, knownRepos,
-  inbox, items }`. Read-only calls only (no lock, no writes).
+  inbox, items, interrupted }`. Read-only calls only (no lock, no writes).
   - `lock`: `readLockInfo` + `lockHolderAlive` + age (`stale` when older than
     the 10-minute threshold), or `null`.
   - `counts`: `decisions` = every status that is neither actionable
@@ -179,11 +179,24 @@ and exits 1; other listen errors print `could not listen on <host>:<port> — <r
     `awaiting-approval`; all artifacts for `done`), `prUrl`/`prDraft` (from
     `parkedDetail` when done), `questions` (from `parkedDetail` when
     `needs-human`). `artifact.path` is root-relative as stored.
+  - `interrupted` (specs/wb-interrupted-drives.spec.md): the dead-drive signal —
+    `{ items: [{id, slug, stage}], lastHolder: number | null } | null`. Items
+    claiming `running` while NO live lock exists were orphaned mid-stage by a
+    drive that died; `lastHolder` is the (dead) lock file's pid when one
+    exists, `null` when no lock file remains — never fabricated. `null` when a
+    live lock holds (the holder owns the running state). Derived from data
+    the build already holds (no extra read, no write, no lock).
+    `statusFingerprint` is deliberately unchanged: both inputs (item status,
+    lock liveness) are already fingerprinted, so every interrupted↔healthy
+    transition changes it and emits an SSE `status` event for free — the
+    derived field itself must not enter the fingerprint.
 
 ## HTTP surface (`createServeApp(deps)` → `{handler, flush, stop}`)
 
 `deps`: `{ root, paths, config, db (readonly), makeRunner, intervalMs? (0 = no
 timer, tests drive `flush()`), clock?, runMode? ("background" | "await"),
+maxResumeTicks? (safety-cap override for the drive's resume loop — mirrors
+the Orchestrator's own knob; tests make a capped drive cheap),
 bindHost? (the `--host` the server is bound to; the Host/Origin guard below
 also accepts it) }`.
 `makeRunner()` returns `{ runner, curator, publisher, baseCheck? }`; production
@@ -287,6 +300,16 @@ throw to the response.
   next run — the UI Start Processing button inherits that behavior. Progress reaches
   clients only via SSE. Single-flight is enforced by the lock itself (a
   second POST during a run → 409).
+- Dead-drive observability (specs/wb-interrupted-drives.spec.md) rides this
+  task: the pre-acquire lock (a dead previous drive's pid, when its lock
+  file survived) is passed into the task's Orchestrator, whose `resume()`
+  reconciles interrupted items first; the task emits exactly one terminal
+  `drive exited: …` marker line server-side — `completed (nothing actionable
+  left)` on the natural end, `capped — run `wb resume` again to continue`
+  beside the existing safety-cap stderr line, or `interrupted — <message>`
+  on a throw (after the requeue + `drive-interrupted` labeling with the
+  serve process's pid, swallowed-around-rethrow so the original error still
+  surfaces as the request's 500).
 - Composer writes go through `authorItem` (explicit-field mode,
   non-interactive `AuthoringIO`); `runNow: true` performs the identical
   background-resume procedure after the write and reports `runStarted` /
@@ -388,18 +411,31 @@ emits). The lock-driven state derives from the same SSE status payload as
 the run-state pill — no new endpoint, no polling; no stop toggle, since a
 real stop would need a cancellation seam through the stage runner and is
 out of scope; under `prefers-reduced-motion` no animation (spinner,
-pulse, flash) runs) and the run-state pill in the header — a four-state machine derived
-on every status payload with the priority RUNNING > NEEDS REVIEW >
-PAUSED > IDLE: IDLE (a calm stone chip, visibly inert: no pulse, no
+pulse, flash) runs) and the run-state pill in the header — a five-state machine derived
+on every status payload with the priority RUNNING > INTERRUPTED > STALE >
+NEEDS REVIEW > PAUSED > IDLE (the INTERRUPTED state is the dead-drive signal
+of specs/wb-interrupted-drives.spec.md): IDLE (a calm stone chip, visibly inert: no pulse, no
 accent) when no lock is held and nothing is actionable; RUNNING while a
 live lock exists (a small spinner beside the pulsing blue dot, `#id slug
 · stage` per running item — or the holder pid when no item is running —
 and a `mm:ss` elapsed clock that ticks client-side every second and
 re-anchors from `lock.ageMs` on each status event; clicking the pill
 scrolls to the glance row, auto-expanding it first if it is collapsed, and
-one-shot-flashes the running item's chip); the verbatim stale-lock text
-for a dead holder (kept in lock-held priority ahead of the operator
-states, as a non-interactive span); NEEDS REVIEW when no live lock exists
+one-shot-flashes the running item's chip); INTERRUPTED when the payload's
+`interrupted` signal is non-null — items claiming `running` while no live
+lock exists (an orange/infra `<button type="button">` pill, distinct from
+the amber NEEDS REVIEW and stone PAUSED, reading `INTERRUPTED · drive did
+not end cleanly — #<id> <slug> at <stage> (last holder pid <pid> | (no
+live factory lock)) — press Start Processing`, tooltip "the previous drive
+did not end cleanly — press Start Processing to recover"; clicking it calls
+the same shared pressRun path as the Start Processing button and the
+PAUSED pill, flight guard and busy-409 handling included — the recovery
+contract is unchanged, the pill explains why the PAUSED-shaped state
+exists; it outranks the stale text only because it names the dead holder
+pid itself, preserving the "a dead lock is never silently displaced"
+invariant); the verbatim stale-lock text
+for a dead holder (a non-interactive span; unchanged when the dead lock
+has no running items); NEEDS REVIEW when no live lock exists
 and `counts.decisions > 0` (an amber pill reading `NEEDS REVIEW · N
 parked — #<first parked id> at <its stage>`, first in parking-lot order;
 clicking it scrolls to the parking lot); PAUSED when no live lock, zero
@@ -407,11 +443,14 @@ decisions, and at least one actionable item (queued/running; a stone pill
 reading `PAUSED · press Start Processing — #<first id> at <its stage>`,
 non-error blue/stone accent; clicking it calls the same shared pressRun
 path as the Start Processing button, including the busy-409 handling);
-the pill states that carry actions (RUNNING, NEEDS REVIEW, PAUSED) are
+the pill states that carry actions (RUNNING, INTERRUPTED, NEEDS REVIEW, PAUSED) are
 plain `<button type="button">` elements so Tab/Enter/Space reach them
 (focus restored across re-renders like the glance summary), IDLE is a
 span; an
-append-only live feed colored by event. EventSource auto-reconnect with
+append-only live feed colored by event (`drive-interrupted` rows render in
+the orange `#ea580c` with the ` — item requeued (last holder pid <pid>)` /
+` (holder unknown)` detail clause, so the SSE narrative tells the item's
+episode story). EventSource auto-reconnect with
 `Last-Event-ID` provides gapless resume. Every untrusted string is rendered
 through `esc()`/`textContent` (no raw `innerHTML` interpolation of data); all
 actions are same-origin `POST` with `Content-Type: application/json`; no CORS
@@ -499,7 +538,20 @@ acquisition; the API Host guard covers the route; the status snapshot gains
 no detail fields and the fingerprint is unchanged) plus the artifact route's
 `inbox/` extension (byte-exact serve, the full containment matrix including
 symlink files, symlinked dirs escaping the root, and symlinked dirs pointing
-inside the root caught by the realpath allowlist re-check).
+inside the root caught by the realpath allowlist re-check); plus dead-drive
+observability (specs/wb-interrupted-drives.spec.md): `/api/status` and the
+SSE connect snapshot carry the `interrupted` field (running orphan + no lock
+→ items + `lastHolder: null`; a hand-written dead-lock fixture → its pid; a
+live lock held by the test → null; observation acquires no lock), `POST
+/api/run` reconciles a mid-`running` orphan before driving (the item's
+history shows the `drive-interrupted` row followed by the next
+`stage-start`, then the status snapshot is clean again), the drive-exit
+markers server-side (exactly one `drive exited: completed …` line on a
+natural end; the capped line beside the existing safety-cap stderr line via
+a tiny `maxResumeTicks` dep), and the graceful-throw case (a drive whose
+claim pass fails answers 500, logs the `drive exited: interrupted — …` line,
+and leaves the orphan requeued + labeled with the serve process's pid —
+idempotent on the follow-up drive).
 
 `tests/web-page-runtime.test.ts` — runs the page's inline script in a fresh
 V8 context with a minimal DOM stub and drives it exactly the way the browser
@@ -530,4 +582,14 @@ with focus returned to the opener; an open overlay survives a live SSE
 snapshot re-render untouched; the failed-fetch retry re-issues exactly one
 fetch; hostile markdown fixtures render inert through the escaped-first
 renderer while good links, bold/italic/code, and every block shape render —
-asserted via `#item-overlay`'s innerHTML, never by importing the renderer).
+asserted via `#item-overlay`'s innerHTML, never by importing the renderer);
+plus the dead-drive INTERRUPTED state (specs/wb-interrupted-drives.spec.md):
+the pill render (a real orange `<button>` naming `#id slug at stage`, the
+holder clause — pid or the honest "no live factory lock" — and the recovery
+tooltip), the priority table (a live lock beats it; a dead lock + running
+items → INTERRUPTED over the verbatim stale text, which itself stays for a
+dead lock without running items; a cleared signal + queued item → PAUSED),
+the click firing exactly one `POST /api/run` through the shared single-flight
+path, and the live-feed `drive-interrupted` row (orange `#ea580c` event span,
+the ` — item requeued (last holder pid …)` / `(holder unknown)` detail
+clause).

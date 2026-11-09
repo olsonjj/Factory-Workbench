@@ -170,7 +170,15 @@ export type HistoryEvent =
   // item is NOT parked (status/stage unchanged, stays queued) — the operator
   // remedy is `git pull` + re-run. Deliberately no OS notification: only
   // `parked` rows notify in wb watch, and a skip is not a park.
-  | "base-stale";
+  | "base-stale"
+  // A previous drive (wb run / wb resume / the web Start Processing drive)
+  // ended without reaching a parking decision or the drive loop's natural
+  // end while this item was mid-stage; the reconciler requeued it before the
+  // next drive. detail: { lastHolder: number | null (pid where knowable),
+  // repoLock: { repo, acquiredAt } | null (the orphaned per-repo lock row,
+  // honest evidence the stage had begun), requeued: true }. Like base-stale,
+  // never an OS notification: only `parked` rows notify.
+  | "drive-interrupted";
 
 export interface HistoryRecord {
   ts: string;

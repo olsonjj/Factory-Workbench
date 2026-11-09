@@ -148,10 +148,10 @@ read `FACTORY_ROOT` or an existing config's `root` value.
 | `wb init [--root <dir>]` | Create the factory layout and default config. |
 | `wb template` | Print a work-item markdown template. |
 | `wb new [description]` | Author an item interactively or with `--title`, `--repo`, `--base`, `--approvals`, and `--description-file`. `--repo` accepts `~/…`, a bare known-repo name, or a path relative to the factory root. |
-| `wb run` | Claim inbox items and advance every actionable item by one stage. |
-| `wb resume` | Recover interrupted/rejected items and continue until they park or finish. |
-| `wb status [--all]` | Show items other than completed ones and their parked reasons; `--all` includes done items. |
-| `wb watch [--interval <seconds>]` | Poll read-only for new events, show a compact status card, and notify when items park (default: 5 seconds; Ctrl+C to stop). |
+| `wb run` | Claim inbox items and advance every actionable item by one stage. Requeues and labels any item a dead previous drive left mid-stage, and ends with a `drive exited:` marker line. |
+| `wb resume` | Recover interrupted/rejected items and continue until they park or finish; a `drive-interrupted` history row records any gap left by a dead drive. |
+| `wb status [--all]` | Show items other than completed ones and their parked reasons; `--all` includes done items. Reports an interrupted drive (items claiming running with no live factory lock) with the last known holder pid. |
+| `wb watch [--interval <seconds>]` | Poll read-only for new events, show a compact status card (with an `INTERRUPTED` line when a drive died mid-stage), and notify when items park (default: 5 seconds; Ctrl+C to stop). |
 | `wb serve [--port <n>] [--host <addr>] [--interval <seconds>]` | Host a local browser UI over the factory (default: http://127.0.0.1:7466, poll every 2 seconds): live status snapshot, parked-item decision cards (approve/reject/answer/retry), work intake (compose an item or drop `.md` files into the inbox), backgrounded Run/Resume, and an item detail overlay — click any work item (inbox file, in-flight row, parked card, landed chip) for an inline view of its record, spec, artifacts, and source. Binds to localhost only by default; `--host` is the escape hatch. |
 | `wb approve <id-or-slug> [-n <note>]` | Release a parked approval gate. |
 | `wb reject <id-or-slug> -r <reason>` | Reject stage output; the reason becomes rework feedback. |
@@ -183,6 +183,36 @@ served only from real files under `items/` and `inbox/` inside the factory
 root (no
 symlinks). `--port` must be an integer between 1 and 65535; a taken or
 invalid port exits with a friendly error.
+
+### When a drive dies
+
+A drive (`wb run`, `wb resume`, or the web UI's Start Processing) that is
+killed mid-stage leaves a recognizable signature instead of silence:
+
+- **Detection**: an item claiming `running` while no live factory lock exists
+  was, by construction, orphaned mid-stage — `wb status` says so explicitly,
+  `wb watch` adds an `INTERRUPTED` line to its card, and the web UI's run-state
+  pill shows an INTERRUPTED state naming the items and the last known lock
+  holder pid. Observation is read-only: none of these surfaces takes the lock
+  or writes anything.
+- **Labeling**: the next `wb run`/`wb resume`/Start Processing requeues the
+  orphan and appends a `drive-interrupted` history row (with the last known
+  holder pid, where the dead drive's lock file named one, and the orphaned
+  per-repo lock it left behind) before driving the item on. Recovery itself is
+  the same action as always — press Start Processing or run `wb resume`.
+- **Exit markers**: every drive ends its log with one terminal line —
+  `drive exited: completed …`, `drive exited: capped — …`, or
+  `drive exited: interrupted …` (a throw; SIGTERM prints
+  `drive exited: interrupted (SIGTERM)` before exiting). A SIGKILL (or any
+  death no handler survives) leaves the marker missing — **a run log that
+  simply stops right after a stage transition is itself the crash
+  signature**. Ctrl+C keeps its default immediate behavior; the lock file it
+  leaves behind carries the pid for the next drive's reconciliation.
+- **Limitation**: items left `queued` between stages (rather than mid-stage)
+  are not per-item labeled — no persisted state distinguishes them from a
+  deliberate pause; only the run-log marker (or its absence) covers them.
+
+Spec: `specs/wb-interrupted-drives.spec.md`.
 
 Before an item's first stage run of a round, `wb run`/`wb resume` check the
 item's base branch (`base:` front-matter, typically `main`) against its

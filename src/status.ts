@@ -130,6 +130,18 @@ export interface StatusItem extends ItemRecord {
   questions?: string[];
 }
 
+/** Interrupted-drive signal (specs/wb-interrupted-drives.spec.md): items
+ *  claiming `running` while NO live factory lock exists. `running` is only
+ *  ever written by a drive holding the lock, so a lockless running item is
+ *  provably orphaned mid-stage by a drive that ended without a parking
+ *  decision. `lastHolder` = the (dead) lock file's pid when one exists, null
+ *  when no lock file remains — never fabricated. Null when a live lock holds
+ *  (the holder legitimately owns the running state). */
+export interface StatusInterrupted {
+  items: { id: number; slug: string; stage: StageName }[];
+  lastHolder: number | null;
+}
+
 export interface StatusPayload {
   root: string;
   generatedAt: string;
@@ -141,6 +153,7 @@ export interface StatusPayload {
   knownRepos: { repo: string; count: number }[];
   inbox: StatusInbox;
   items: StatusItem[];
+  interrupted: StatusInterrupted | null;
 }
 
 /** The parked / waiting-on-you set: every status that is neither actionable
@@ -238,6 +251,22 @@ export function buildStatusPayload(input: {
   const running = items.filter((i) => i.status === "running");
   const queued = items.filter((i) => i.status === "queued").length;
   const done = items.filter((i) => i.status === "done").length;
+  const lock = serializeLock(input.root, clock);
+  // Interrupted-drive tell-tale, derived from data already in hand — no extra
+  // DB read, no write, no lock (the wb status discipline). Sound because
+  // `running` is only ever written by a lock-holding drive: with a live lock
+  // the holder owns the running state (null signal); without one, the running
+  // items were orphaned mid-stage by a dead drive. statusFingerprint already
+  // embeds item status and lock liveness, so every interrupted↔healthy
+  // transition changes it — the signal itself must NOT enter the fingerprint
+  // (both inputs are covered; see the spec's fingerprint note).
+  const interrupted: StatusInterrupted | null =
+    running.length > 0 && !(lock && lock.alive)
+      ? {
+          items: running.map((i) => ({ id: i.id, slug: i.slug, stage: i.stage })),
+          lastHolder: lock ? lock.pid : null,
+        }
+      : null;
   // Flow segments in factory order, zero-count omitted (inbox → queue → one
   // per running stage → parked → done): what the proportional bar renders.
   const flow: { label: string; n: number }[] = [
@@ -251,7 +280,7 @@ export function buildStatusPayload(input: {
     root: input.root,
     generatedAt: new Date(clock.now()).toISOString(),
     maxHistoryId,
-    lock: serializeLock(input.root, clock),
+    lock,
     counts: {
       decisions,
       running: running.length,
@@ -272,5 +301,6 @@ export function buildStatusPayload(input: {
     },
     // ALL items (incl. done), newest-last — the UI filters.
     items: items.map((item) => toStatusItem(item, artifactsByItem)),
+    interrupted,
   };
 }

@@ -103,6 +103,13 @@ export class FactoryDb {
    *  closure stays valid for the connection's lifetime. */
   private snapshotTxn: ((afterId: number | null) => WatchSnapshot) | undefined;
 
+  /** Cached one-item interrupt-reconciliation transaction (same plumbing
+   *  rationale as `snapshotTxn`). Undefined until first use; the bound `this`
+   *  in the closure stays valid for the connection's lifetime. */
+  private reconcileTxn:
+    | ((itemId: number, stage: StageName, lastHolder: number | null) => { repo: string; acquiredAt: string } | null)
+    | undefined;
+
   constructor(root: string, options: { readonly?: boolean } = {}) {
     const dbPath = path.join(root, "factory.db");
     if (options.readonly) {
@@ -430,6 +437,52 @@ export class FactoryDb {
 
   releaseRepoLock(repo: string, itemId: number): void {
     this.stmt("DELETE FROM repo_locks WHERE repo = ? AND item_id = ?").run(repo, itemId);
+  }
+
+  /** Atomically reconcile one orphaned running item (specs/
+   *  wb-interrupted-drives.spec.md §3.1): read+clear the orphaned `repo_locks`
+   *  row (the returned evidence), requeue the item, and write the
+   *  `drive-interrupted` history row — one transaction, so a hard kill between
+   *  the statements cannot tear them apart. Without this, a crash after the
+   *  requeue but before the label would leave the item `queued` with no record
+   *  of the interruption, and the next drive's reconcile (which scans only
+   *  `running` items) could never re-label it. Rolled back, the item stays
+   *  `running` and the next drive re-reconciles — the label is written exactly
+   *  once per orphaned item per episode. Returns the removed repo-lock row as
+   *  honest evidence the stage had actually begun, or null when none existed.
+   *  Writable handles only (every call site holds the factory lock). */
+  reconcileInterruptedItem(
+    itemId: number,
+    stage: StageName,
+    lastHolder: number | null,
+  ): { repo: string; acquiredAt: string } | null {
+    if (!this.reconcileTxn) {
+      this.reconcileTxn = this.db.transaction((id, st, holder) => {
+        const repoLock = this.clearRepoLockForItem(id);
+        this.updateItem(id, { status: "queued", parkedReason: null, parkedDetail: null });
+        this.appendHistory(id, "drive-interrupted", st, {
+          lastHolder: holder,
+          repoLock,
+          requeued: true,
+        });
+        return repoLock;
+      });
+    }
+    return this.reconcileTxn(itemId, stage, lastHolder);
+  }
+
+  /** Read-and-clear any orphaned repo_locks row for this item (a crashed
+   *  stage leaves one behind: rows are only ever written per-item, so an
+   *  item-keyed delete is exact). Returns the removed row as honest evidence
+   *  the stage had actually begun, or null when none existed. Used by the
+   *  interrupted-drive reconciler (specs/wb-interrupted-drives.spec.md). */
+  clearRepoLockForItem(itemId: number): { repo: string; acquiredAt: string } | null {
+    const row = this.stmt("SELECT repo, acquired_at FROM repo_locks WHERE item_id = ?").get(itemId) as
+      | { repo: string; acquired_at: string }
+      | undefined;
+    if (!row) return null;
+    this.stmt("DELETE FROM repo_locks WHERE item_id = ?").run(itemId);
+    return { repo: row.repo, acquiredAt: row.acquired_at };
   }
 
   knownRepos(): { repo: string; count: number }[] {

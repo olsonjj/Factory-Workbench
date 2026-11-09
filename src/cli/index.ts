@@ -14,6 +14,7 @@ import { ITEM_TEMPLATE } from "../frontmatter.js";
 import { authorItem, type NewOptions } from "../new.js";
 import { makeRealIO } from "../prompt.js";
 import { Orchestrator, matchAnswers } from "../pipeline.js";
+import { driveExitLine } from "../drive.js";
 import { GitBaseFreshnessChecker } from "../baseFreshness.js";
 import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, agentEnvFor } from "../adapters/sandcastle.js";
 import { parseIntervalSeconds, startWatch, type WatchState } from "../watch.js";
@@ -39,18 +40,29 @@ const packageVersion = readPackageVersion();
 
 interface StatusFlags { all?: boolean }
 
+function errMessage(err: unknown): string {
+  return err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+}
+
 function openFactory(rootOverride?: string): {
   root: string;
   paths: ReturnType<typeof makePaths>;
   db: FactoryDb;
   orch: Orchestrator;
   claimReport: ReturnType<typeof scanInbox>;
+  /** The pre-acquire lock: a dead previous drive's pid when it left a lock
+   *  file behind (the SIGKILL / default-signal case), null when none existed.
+   *  Threaded into the Orchestrator so `resume()` labels interrupted items
+   *  with the LAST known holder, and available to the run action's explicit
+   *  reconcile (specs/wb-interrupted-drives.spec.md). */
+  preLockPid: number | null;
   release: () => void;
 } {
   const { config, root } = loadConfig(rootOverride);
   ensureConfigFile(root);
   const paths = makePaths(root);
   ensureLayout(paths);
+  const preLock = readLockInfo(root);
   const release = acquireFactoryLock(root);
   try {
     const db = new FactoryDb(root);
@@ -65,8 +77,9 @@ function openFactory(rootOverride?: string): {
       publisher: new GhPrPublisher(),
       sleep,
       baseCheck: new GitBaseFreshnessChecker(),
+      interruptedDrive: { lastHolderPid: preLock?.pid ?? null },
     });
-    return { root, paths, db, orch, claimReport, release };
+    return { root, paths, db, orch, claimReport, preLockPid: preLock?.pid ?? null, release };
   } catch (err) {
     release();
     throw err;
@@ -99,7 +112,7 @@ function openAuthoringRoot(rootOverride?: string): {
 /** Shared command scaffold: open factory, run the body, always release resources. */
 async function withFactory<T>(
   root: string | undefined,
-  body: (ctx: { db: FactoryDb; orch: Orchestrator; claimReport: ReturnType<typeof scanInbox> }) => Promise<T> | T,
+  body: (ctx: { db: FactoryDb; orch: Orchestrator; claimReport: ReturnType<typeof scanInbox>; preLockPid: number | null }) => Promise<T> | T,
 ): Promise<void> {
   const ctx = openFactory(root);
   try {
@@ -197,9 +210,45 @@ program
   .description("Claim inbox items and advance every actionable item one stage")
   .option("--root <dir>", "factory root directory")
   .action(async (opts: { root?: string }) => {
-    await withFactory(opts.root, async ({ orch, claimReport }) => {
-      logClaimReport(claimReport);
-      printTick((await orch.tickAll()).entries, "Nothing to do.");
+    await withFactory(opts.root, async ({ orch, claimReport, preLockPid }) => {
+      // Drive-exit marker + graceful-death labeling (specs/wb-interrupted-drives.spec.md):
+      // every exit path of the episode emits exactly one terminal line. SIGTERM
+      // gets an explicit interrupted marker (best-effort synchronous write; a
+      // lost write degrades to the truncation signature, same as SIGKILL).
+      // SIGINT is deliberately NOT hooked: Ctrl+C keeps its default immediate
+      // behavior, and the lock file it leaves behind carries this pid for the
+      // next drive's reconcile.
+      const onSigterm = () => {
+        console.error(driveExitLine("run", "interrupted"));
+        nodeProcess.exit(1);
+      };
+      nodeProcess.on("SIGTERM", onSigterm);
+      try {
+        try {
+          logClaimReport(claimReport);
+          // We exclusively hold the lock: any `running` item is orphaned by a
+          // dead previous drive — requeue + label before driving, so the audit
+          // trail shows the gap and the recovery.
+          const reconcile = orch.reconcileInterrupted(preLockPid);
+          const tick = await orch.tickAll();
+          printTick([...reconcile, ...tick.entries], "Nothing to do.");
+          console.log(driveExitLine("run", "completed"));
+        } catch (err) {
+          // A graceful crash (throw) releases the lock via withFactory's
+          // finally: label the episode with OUR pid while the DB still lets us,
+          // then mark the log. The reconcile/marker must never mask the
+          // original error.
+          try {
+            orch.reconcileInterrupted(process.pid);
+          } catch {
+            /* the DB may itself be what failed */
+          }
+          console.error(driveExitLine("run", "interrupted", errMessage(err)));
+          throw err;
+        }
+      } finally {
+        nodeProcess.removeListener("SIGTERM", onSigterm);
+      }
     });
   });
 
@@ -209,9 +258,36 @@ program
   .option("--root <dir>", "factory root directory")
   .action(async (opts: { root?: string }) => {
     await withFactory(opts.root, async ({ orch }) => {
-      const report = await orch.resume();
-      printTick(report.entries, "Nothing to resume.");
-      if (report.capped) console.error("resume hit its safety cap — run `wb resume` again to continue.");
+      const onSigterm = () => {
+        console.error(driveExitLine("resume", "interrupted"));
+        nodeProcess.exit(1);
+      };
+      nodeProcess.on("SIGTERM", onSigterm);
+      try {
+        try {
+          // resume() reconciles interrupted items first (the orchestrator's
+          // deps carry the pre-acquire last holder pid), then unparks
+          // human-rejected items and drives until parked/done/capped.
+          const report = await orch.resume();
+          printTick(report.entries, "Nothing to resume.");
+          if (report.capped) {
+            console.error("resume hit its safety cap — run `wb resume` again to continue.");
+            console.log(driveExitLine("resume", "capped"));
+          } else {
+            console.log(driveExitLine("resume", "completed"));
+          }
+        } catch (err) {
+          try {
+            orch.reconcileInterrupted(process.pid);
+          } catch {
+            /* the DB may itself be what failed */
+          }
+          console.error(driveExitLine("resume", "interrupted", errMessage(err)));
+          throw err;
+        }
+      } finally {
+        nodeProcess.removeListener("SIGTERM", onSigterm);
+      }
     });
   });
 
@@ -245,6 +321,20 @@ program
             `if no run is in progress you can remove ${path.join(root, "factory.lock")}`,
           );
         }
+      }
+      // Interrupted-drive signal (specs/wb-interrupted-drives.spec.md): items
+      // claiming `running` while no live lock exists were orphaned mid-stage
+      // by a drive that died — never a deliberate pause. Read-only like the
+      // lock block above; recovery stays the usual `wb run`/`wb resume`.
+      const orphaned = db.itemsWithStatus(["running"]);
+      if (orphaned.length > 0 && !(lock && lockHolderAlive(lock))) {
+        const itemsText = orphaned.map((i) => `#${i.id} ${i.slug} (${i.stage})`).join(", ");
+        const holder = lock ? `pid ${lock.pid}` : "none";
+        console.log(
+          `interrupted drive: ${itemsText} claims running but no live factory lock holds ` +
+          `(last known holder: ${holder}) — the previous drive did not end cleanly; ` +
+          "recover with `wb run` or `wb resume`",
+        );
       }
       const inbox = classifyInbox(db, makePaths(root).inbox);
       if (inbox.error) {
@@ -283,7 +373,11 @@ program
     try {
       console.log(`wb watch — polling every ${intervalSec}s · quit with Ctrl+C`);
       const state: WatchState = { lastEventId: 0, lastCard: null, first: true };
-      const stop = startWatch(db, state, config.budgets.maxGateAttempts, intervalSec);
+      // observeLock: one tiny readFileSync of factory.lock per poll — the
+      // same read-only class as the snapshot poll, never an acquire. It lets
+      // the card surface interrupted drives (running items with no live
+      // lock) instead of a normal-looking RUN line (specs/wb-interrupted-drives.spec.md).
+      const stop = startWatch(db, state, config.budgets.maxGateAttempts, intervalSec, () => readLockInfo(root));
       nodeProcess.on("SIGINT", () => {
         stop();
         nodeProcess.exit(0);
