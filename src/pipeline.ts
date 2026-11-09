@@ -131,8 +131,12 @@ export class Orchestrator {
    * exclusively holds the factory lock (every call site is a drive entry):
    * `running` is written solely by a lock-holding drive, so any running item
    * seen here is provably orphaned. Stage unchanged — the stage re-runs with
-   * stage-level idempotency. The orphaned repo_locks row is read BEFORE it
-   * is deleted and rides as honest evidence the stage had begun.
+   * stage-level idempotency. The orphaned repo_locks row is read BEFORE it is
+   * deleted and rides as honest evidence the stage had begun. Each item's
+   * requeue + label is one atomic `FactoryDb.reconcileInterruptedItem`
+   * transaction: a crash between the requeue and the label rolls the item back
+   * to `running`, so the next drive re-reconciles instead of losing the
+   * interruption record (a `queued` item would be invisible to this scan).
    *
    * `lastHolder`: the dead drive's pid where knowable (the lock file a hard
    * kill leaves behind carries it; a cleanly-released lock means unknown —
@@ -144,13 +148,7 @@ export class Orchestrator {
   reconcileInterrupted(lastHolder: number | null): TickEntry[] {
     const entries: TickEntry[] = [];
     for (const item of this.db.itemsWithStatus(["running"])) {
-      const repoLock = this.db.clearRepoLockForItem(item.id);
-      this.db.updateItem(item.id, { status: "queued", parkedReason: null, parkedDetail: null });
-      this.db.appendHistory(item.id, "drive-interrupted", item.stage, {
-        lastHolder,
-        repoLock,
-        requeued: true,
-      });
+      const repoLock = this.db.reconcileInterruptedItem(item.id, item.stage, lastHolder);
       entries.push({
         id: item.id,
         slug: item.slug,

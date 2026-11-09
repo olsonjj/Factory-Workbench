@@ -12,7 +12,7 @@
  * models. The web-side surfaces are covered in additions to the web-serve and
  * page-runtime suites.
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { spawnSync } from "node:child_process";
 import * as path from "node:path";
 import { existsSync, writeFileSync } from "node:fs";
@@ -128,6 +128,39 @@ describe("dead-drive reconciliation (orchestrator entry)", () => {
     const row = h.db.getHistory(id).find((e) => e.event === "drive-interrupted")!;
     expect(row.detail.lastHolder).toBeNull();
     expect(row.detail.requeued).toBe(true);
+  });
+
+  it("the reconcile's requeue + label are atomic: a failure between them rolls back to running (next drive re-reconciles)", async () => {
+    const h = makeHarness();
+    const id = seed(h);
+    const runner = new ScriptedRunner({});
+    await makeOrchestrator(h, runner).tickAll();
+    crashMidStage(h);
+    // the killed drive left an orphan repo_locks row behind (its evidence)
+    expect(h.db.acquireRepoLock(repoSlug("/tmp/repo"), id)).toBe(true);
+
+    // a mid-reconcile failure (the stand-in for a hard kill between the
+    // requeue and the label) must leave NOTHING partially written
+    const orch = makeOrchestrator(h, runner, { lastHolderPid: 4242 });
+    const spy = vi.spyOn(h.db, "updateItem").mockImplementation(() => {
+      throw new Error("hard kill");
+    });
+    expect(() => orch.reconcileInterrupted(4242)).toThrow("hard kill");
+    spy.mockRestore();
+
+    // rolled back: the item is still `running` with its repo-lock intact —
+    // the next drive's reconcile sees it (a torn write would have left the
+    // item `queued`, invisible to that scan, with the label permanently lost)
+    expect(h.db.listItems()[0]!.status).toBe("running");
+    expect(h.db.acquireRepoLock(repoSlug("/tmp/repo"), id)).toBe(false); // still held
+    expect(h.db.getHistory(id).filter((e) => e.event === "drive-interrupted")).toHaveLength(0);
+
+    // the next drive reconciles it exactly once, evidence intact
+    await makeOrchestrator(h, runner, { lastHolderPid: 4242 }).resume();
+    const rows = h.db.getHistory(id).filter((e) => e.event === "drive-interrupted");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.detail.repoLock).toMatchObject({ repo: repoSlug("/tmp/repo") });
+    expect(h.db.listItems()[0]!.status).toBe("done");
   });
 
   it("is idempotent: a second drive start finds nothing running and writes no duplicate event", async () => {
