@@ -243,9 +243,25 @@ describe("wb serve: page, template, snapshot (CLI status contract)", () => {
     // tests/web-page-runtime.test.ts).
     expect(PAGE_HTML).toContain('id="glance-body"');
     expect(PAGE_HTML).toContain("data-glance-summary");
-    // Combobox: the known-repos datalist options carry a per-repo item-count
-    // label (escaped), and the repo input advertises the accepted forms.
-    expect(PAGE_HTML).toContain("repos-dl");
+    // Repo picker: a known-repos <select> (rebuilt by the runtime script
+    // behind a disabled placeholder option) plus the inline add-repo form
+    // (Ok/Cancel) and its opener button — "add a new repo path" opens the
+    // form and commits a chip; the datalist combobox is gone, and so is
+    // every sentinel-in-the-select or two-mode token. Option labels carry
+    // the per-repo item-count logic (escaped).
+    expect(PAGE_HTML).toContain('id="f-repo-select"');
+    expect(PAGE_HTML).toContain('<label class="block" for="f-repo-select">');
+    expect(PAGE_HTML).toContain('id="repo-add-open"');
+    expect(PAGE_HTML).toContain('id="repo-add-ok"');
+    expect(PAGE_HTML).toContain('id="repo-add-cancel"');
+    expect(PAGE_HTML).toContain('id="repo-add-input"');
+    expect(PAGE_HTML).toContain('id="f-repo-chip-x"');
+    expect(PAGE_HTML).toContain('btn btn-out btn-repo-toggle');
+    expect(PAGE_HTML).not.toContain('repo-mode-new');
+    expect(PAGE_HTML).not.toContain('repo-mode-pick');
+    expect(PAGE_HTML).not.toContain('__wb_new__');
+    expect(PAGE_HTML).not.toContain('list="repos-dl"');
+    expect(PAGE_HTML).not.toContain("<datalist");
     expect(PAGE_HTML).toContain("k.count === 1 ? ' item' : ' items'");
     expect(PAGE_HTML).toContain("placeholder=\"repo name, Code/rel/path, ~/path, or /abs/path\"");
     // Start Processing button: the renamed label, the renamed composer

@@ -117,6 +117,10 @@ function makeContext() {
     // The live feed builds its rows with createElement (appendFeed).
     createElement: () => makeStubElement(),
     querySelector: () => null,
+    // Document-level selector sweeps (clearFieldErrors' `.ferr` pass, the
+    // 201-reset's `.approval-cb:checked`) — empty: the stub has no parsed
+    // DOM, and no runtime test needs those elements cleared.
+    querySelectorAll: () => [],
     addEventListener: (t: string, fn: (ev: unknown) => void) => {
       const fns = documentListeners.get(t) ?? [];
       fns.push(fn);
@@ -162,9 +166,13 @@ function makeContext() {
 
   const fetches: Array<{ url: string; resolve: (r: unknown) => void }> = [];
   const requestLog: string[] = []; // every fetch call, ever — survives settle()'s drain
-  const fetch = (url: string) =>
+  /** Every request body string the page handed fetch (URL → body), for the
+   * composer submit-routing asserts. */
+  const bodyLog: Array<{ url: string; body?: string }> = [];
+  const fetch = (url: string, init?: { body?: string }) =>
     new Promise((resolve) => {
       requestLog.push(url);
+      bodyLog.push({ url, body: init?.body });
       fetches.push({ url, resolve });
     });
 
@@ -249,6 +257,26 @@ function makeContext() {
     /** Total fetches ever issued for a URL (the no-double-fire guard needs
      * the cumulative count — the pending queue drains on settle). */
     totalRequests: (url: string) => requestLog.filter((u: string) => u === url).length,
+    /** The JSON-parsed bodies POSTed to a URL, oldest first — the composer
+     * contract is asserted through the real postJSON call, not by
+     * re-reading input stubs. */
+    bodies: (url: string) =>
+      bodyLog
+        .filter((b) => b.url === url && b.body !== undefined)
+        .map((b) => JSON.parse(b.body!)),
+    /** Dispatch an element-level event (e.g. the repo select's `change`)
+     * exactly like the browser does — the handler reads the element's
+     * current state, so the test sets value/checked first. */
+    fireEl: (id: string, t: string, ev?: { key?: string }) => {
+      const el = document.getElementById(id);
+      for (const fn of el.listeners.get(t) ?? []) {
+        (fn as (ev: { target: unknown; key?: string; preventDefault(): void }) => void)({
+          target: el,
+          preventDefault: () => {},
+          ...ev,
+        });
+      }
+    },
   };
 }
 
@@ -2301,5 +2329,323 @@ describe("wb serve page script: interrupted drives (dead-drive observability)", 
     });
     expect(feed.children).toHaveLength(2);
     expect(feed.children[1]!.children[2]!.textContent).toContain(" — item requeued (holder unknown)");
+  });
+});
+
+/** The repo picker's known-repos fixtures — payload order IS the dropdown
+ * order (the server delivers newest-first via knownReposNewestFirst). */
+const KNOWN_REPOS = [
+  { repo: "/a/r1", count: 2 },
+  { repo: "/b/r2", count: 1 },
+];
+/** A status payload variant carrying known repos (payload() hard-codes the
+ * default-mode `knownRepos: []`, so repo-picker tests spread it). */
+const withRepos = (repos: unknown[]) => ({ ...IDLE_PAYLOAD, knownRepos: repos });
+/** /api/template front-matter response body for the prefill matrix. */
+const templateWith = (repo: string) => "---\ntitle: From template\nrepo: " + repo + "\n---\nBody";
+/** Focus spy — the page guards every focus carry with `if (x && x.focus)`,
+ * so installing one on a stub element turns the guard into an assertion. */
+const focusSpy = (el: StubElement, log: string[], tag: string) => {
+  el.focus = () => log.push(tag);
+};
+/** The stub never parses the served markup (see the item-overlay seeding
+ * note at ~1780), so the add form and chip's initial `hidden` state — part
+ * of the served HTML — must be seeded like a browser would render it. The
+ * runtime code then only ever toggles. */
+const seedPickerChrome = (ctx: ReturnType<typeof makeContext>) => {
+  ctx.el("repo-add-row").classList.add("hidden");
+  ctx.el("f-repo-chip").classList.add("hidden");
+};
+
+describe("wb serve page script: repository picker (runtime)", () => {
+  it("builds the known-repos dropdown in payload order with escaped basename+count labels behind the unselected placeholder", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle(); // initial paint: idle payload, add-new mode
+
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    const html = ctx.el("f-repo-select").innerHTML;
+    expect(html).toContain('<option value="/a/r1">r1 (2 items)</option>');
+    expect(html).toContain('<option value="/b/r2">r2 (1 item)</option>');
+    // newest-first = payload order, behind a disabled leading placeholder
+    expect(html.indexOf("/a/r1")).toBeLessThan(html.indexOf("/b/r2"));
+    expect(html.startsWith('<option value="" disabled>— pick a repository —</option>')).toBe(true);
+
+    // "Add new" is its own control: no mode-switch sentinel inside the dropdown
+    expect(html).not.toContain("__wb_new__");
+
+    // Hostile repo string: both the value and the basename label are esc()'d.
+    ctx.fire("status", withRepos([{ repo: '/x/r"q<r', count: 1 }]));
+    expect(ctx.el("f-repo-select").innerHTML).toContain(
+      '<option value="/x/r&quot;q&lt;r">r&quot;q&lt;r (1 item)</option>',
+    );
+
+    // Look-alikes: a shared basename falls back to the full stored path so
+    // the options stay distinguishable (a unique basename keeps the short
+    // label).
+    const ctx2 = makeContext();
+    ctx2.run(pageScript(PAGE_HTML));
+    await ctx2.settle();
+    ctx2.fire("status", withRepos([
+      { repo: "/work/app", count: 1 },
+      { repo: "/forks/app", count: 1 },
+      { repo: "/solo/app2", count: 3 },
+    ]));
+    const html2 = ctx2.el("f-repo-select").innerHTML;
+    expect(html2).toContain('<option value="/work/app">/work/app (1 item)</option>');
+    expect(html2).toContain('<option value="/forks/app">/forks/app (1 item)</option>');
+    expect(html2).toContain('<option value="/solo/app2">app2 (3 items)</option>');
+  });
+
+  it("change-gates the option rebuild — identical snapshots write nothing, a changed list does", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    const sel = ctx.el("f-repo-select");
+    const writes = sel.innerHTMLWrites;
+    ctx.fire("status", withRepos(KNOWN_REPOS)); // byte-identical composition
+    expect(sel.innerHTMLWrites).toBe(writes);
+    expect(sel.innerHTML).toContain("/b/r2");
+    // one repo gone → the rebuild fires
+    ctx.fire("status", withRepos([{ repo: "/a/r1", count: 2 }]));
+    expect(sel.innerHTMLWrites).toBe(writes + 1);
+    expect(sel.innerHTML).not.toContain("/b/r2");
+  });
+
+  it("preserves the operator's in-progress selection across a changed snapshot", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    const sel = ctx.el("f-repo-select");
+    sel.value = "/b/r2";
+    // counts changed (fresh innerHTML on a real <select> resets selection)
+    ctx.fire("status", withRepos([{ repo: "/a/r1", count: 2 }, { repo: "/b/r2", count: 3 }]));
+    expect(sel.innerHTML).toContain("r2 (3 items)");
+    expect(sel.value).toBe("/b/r2");
+    // a selection that no longer exists is dropped, not silently submitted
+    ctx.fire("status", withRepos([{ repo: "/a/r1", count: 2 }]));
+    expect(sel.value).toBe("");
+  });
+
+  it("the select is the starting control — no mode flips, and the first known-repos snapshot never moves focus", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    seedPickerChrome(ctx);
+    const focusLog: string[] = [];
+    focusSpy(ctx.el("f-repo-select"), focusLog, "select");
+
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
+    expect(ctx.el("repo-add-row").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(true);
+    expect(focusLog).toEqual([]); // snapshots never steal focus
+  });
+
+  it("the inline add form: open carries focus, Ok and Enter commit the chip, and the chip is submitted verbatim", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    seedPickerChrome(ctx);
+    const focusLog: string[] = [];
+    focusSpy(ctx.el("repo-add-input"), focusLog, "add-input");
+
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    ctx.click("repo-add-open");
+    expect(ctx.el("repo-add-row").classList.contains("hidden")).toBe(false);
+    expect(focusLog).toEqual(["add-input"]); // opening focuses the input
+    expect(ctx.el("repo-add-input").value).toBe(""); // each open starts clean
+
+    ctx.el("repo-add-input").value = "Code/x";
+    ctx.click("repo-add-ok");
+    expect(ctx.el("repo-add-row").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(false);
+    expect(ctx.el("f-repo-chip-text").textContent).toBe("Code/x");
+
+    // the committed chip is the field's value — posted raw, server expands
+    ctx.el("f-title").value = "T";
+    ctx.click("btn-submit");
+    await ctx.settle((url) =>
+      url === "/api/items" ? { ok: true, status: 201, json: async () => ({ file: "f.md" }) } : undefined,
+    );
+    const [posted] = ctx.bodies("/api/items");
+    expect(posted.repo).toBe("Code/x");
+
+    // a fresh open starts from a clean input (the cleared row keeps no stale text)
+    ctx.click("repo-add-open");
+    expect(ctx.el("repo-add-input").value).toBe("");
+  });
+
+  it("the inline add form: Enter commits, Esc/Cancel dismiss, an empty Ok is declined, and the chip's × resets to the picker", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    seedPickerChrome(ctx);
+    const focusLog: string[] = [];
+    focusSpy(ctx.el("repo-add-input"), focusLog, "add-input");
+    focusSpy(ctx.el("repo-add-open"), focusLog, "open");
+
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    // a pick survives the add-form commit (rebuild preservation) — but the
+    // × reset must return to the documented UNSELECTED state, not silently
+    // restore a stale pick
+    ctx.el("f-repo-select").value = "/b/r2";
+    ctx.click("repo-add-open");
+    ctx.el("repo-add-input").value = "  ~/scratch  ";
+    ctx.fireEl("repo-add-input", "keydown", { key: "Enter" });
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(false);
+    expect(ctx.el("f-repo-chip-text").textContent).toBe("~/scratch"); // trimmed
+
+    // × resets: the chip is discarded, focus returns to the opener
+    ctx.click("f-repo-chip-x");
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("f-repo-chip-text").textContent).toBe("");
+    expect(ctx.el("f-repo-select").value).toBe(""); // no stale pick restored
+    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
+    expect(focusLog).toEqual(["add-input", "open"]);
+
+    // Esc dismisses without committing; focus returns to the opener
+    ctx.click("repo-add-open");
+    ctx.el("repo-add-input").value = "typed-but-not-added";
+    ctx.fireEl("repo-add-input", "keydown", { key: "Escape" });
+    expect(ctx.el("repo-add-row").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(true);
+    expect(focusLog).toEqual(["add-input", "open", "add-input", "open"]);
+
+    // Cancel: same dismissal through the pointer path
+    ctx.click("repo-add-open");
+    ctx.click("repo-add-cancel");
+    expect(ctx.el("repo-add-row").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(true);
+
+    // an empty Ok is declined — the row stays open, nothing is committed
+    ctx.click("repo-add-open");
+    ctx.el("repo-add-input").value = "   ";
+    ctx.click("repo-add-ok");
+    expect(ctx.el("repo-add-row").classList.contains("hidden")).toBe(false);
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("f-repo-chip-text").textContent).toBe("");
+  });
+
+  it("submits the select's value when a known repo is picked and keeps it after a 201", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    ctx.el("f-repo-select").value = "/b/r2";
+    ctx.el("f-title").value = "T";
+
+    ctx.click("btn-submit");
+    expect(ctx.countRequests("/api/items")).toBe(1);
+    await ctx.settle((url) => {
+      if (url === "/api/items") return { ok: true, status: 201, json: async () => ({ file: "inbox/x.md" }) };
+      if (url === "/api/status") return { ok: true, status: 200, json: async () => withRepos(KNOWN_REPOS) };
+      return undefined;
+    });
+    const [posted] = ctx.bodies("/api/items");
+    expect(posted.repo).toBe("/b/r2");
+    // 201 success leaves the repo control alone (one-click next item)
+    expect(ctx.el("f-repo-select").value).toBe("/b/r2");
+    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
+  });
+
+  it("submits the raw committed chip value verbatim — expansion stays server-side", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    ctx.click("repo-add-open");
+    ctx.el("repo-add-input").value = "Code/x";
+    ctx.click("repo-add-ok");
+    ctx.el("f-title").value = "T";
+
+    ctx.click("btn-submit");
+    await ctx.settle((url) =>
+      url === "/api/items" ? { ok: true, status: 201, json: async () => ({ file: "f.md" }) } : undefined,
+    );
+    const [posted] = ctx.bodies("/api/items");
+    expect(posted.repo).toBe("Code/x");
+    // the chip survives the 201 (one-click next item)
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(false);
+  });
+
+  it("an unselected field posts an empty repo for the server's 422 — no mode token is ever submitted", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    // the disabled placeholder is the unselected state, and mouse users
+    // can't select it
+    ctx.el("f-repo-select").value = "";
+    ctx.el("f-title").value = "T";
+
+    ctx.click("btn-submit");
+    await ctx.settle((url) =>
+      url === "/api/items"
+        ? { ok: true, status: 422, json: async () => ({ errors: [{ field: "repo", reason: "repo is required" }] }) }
+        : undefined,
+    );
+    const [posted] = ctx.bodies("/api/items");
+    expect(posted.repo).toBe("");
+  });
+
+  it("template prefill: selects a known repo, commits an unknown repo as the chip, never overwrites a non-empty field", async () => {
+    // known repo → selected outright in the dropdown
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    ctx.fire("status", withRepos([{ repo: "/a/r1", count: 2 }]));
+    ctx.click("btn-template");
+    await ctx.settle((url) =>
+      url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("/a/r1") } : undefined,
+    );
+    expect(ctx.el("f-repo-select").value).toBe("/a/r1");
+
+    // unknown repo → committed through the add-form path as the chip
+    const ctx2 = makeContext();
+    ctx2.run(pageScript(PAGE_HTML));
+    await ctx2.settle();
+    ctx2.fire("status", withRepos([{ repo: "/a/r1", count: 2 }]));
+    ctx2.click("btn-template");
+    await ctx2.settle((url) =>
+      url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("Code/x") } : undefined,
+    );
+    expect(ctx2.el("f-repo-chip").classList.contains("hidden")).toBe(false);
+    expect(ctx2.el("f-repo-chip-text").textContent).toBe("Code/x");
+    expect(ctx2.el("repo-add-row").classList.contains("hidden")).toBe(true);
+    expect(ctx2.el("f-repo-select").classList.contains("hidden")).toBe(true); // the chip replaces the picker
+
+    // a non-empty field is never overwritten
+    const ctx3 = makeContext();
+    ctx3.run(pageScript(PAGE_HTML));
+    await ctx3.settle();
+    seedPickerChrome(ctx3);
+    ctx3.el("f-repo-select").value = "/a/r1";
+    ctx3.click("btn-template");
+    await ctx3.settle((url) =>
+      url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("Code/x") } : undefined,
+    );
+    expect(ctx3.el("f-repo-select").value).toBe("/a/r1");
+    expect(ctx3.el("f-repo-chip").classList.contains("hidden")).toBe(true);
+
+    // likewise with a committed chip: it is the field's value, and a
+    // template naming a DIFFERENT repo must not steal it (the guard reads
+    // currentRepoValue()).
+    const ctx4 = makeContext();
+    ctx4.run(pageScript(PAGE_HTML));
+    await ctx4.settle();
+    ctx4.fire("status", withRepos(KNOWN_REPOS));
+    ctx4.click("repo-add-open");
+    ctx4.el("repo-add-input").value = "Code/keep";
+    ctx4.click("repo-add-ok");
+    ctx4.click("btn-template");
+    await ctx4.settle((url) =>
+      url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("/a/r1") } : undefined,
+    );
+    expect(ctx4.el("f-repo-chip-text").textContent).toBe("Code/keep");
+    expect(ctx4.el("f-repo-select").value).toBe("");
   });
 });

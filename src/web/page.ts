@@ -81,6 +81,19 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .btn:disabled { cursor: default; }
   .btn-dark:disabled { background: #1c1917; }
   .btn-dark:disabled:hover { background: #1c1917; } /* suppress the hover darken */
+  /* The repo picker's mode toggles: btn + btn-out give the outline, hover
+   * tint, and pointer cursor; this sizes the button down and colors the
+   * affordance so it reads as a control, not a stray link. */
+  .btn-repo-toggle { color: #4f46e5; font-size: 12px; padding: 3px 10px; }
+  /* The inline add-repo form (Ok/Cancel) and the committed custom-repo
+   * chip — the chip's × resets the field to the picker. */
+  .repo-add-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  .repo-add-row .finput { width: auto; flex: 1; min-width: 0; }
+  .repo-add-actions { display: flex; gap: 6px; flex: none; }
+  .repo-add-actions .btn { font-size: 12px; padding: 5px 12px; }
+  .fchip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; border: 1px solid #a5b4fc; background: #eef2ff; color: #3730a3; border-radius: 9999px; padding: 4px 6px 4px 12px; font-size: 12px; }
+  .fchip .repo-chip-x { cursor: pointer; font-weight: 700; line-height: 1.1; padding: 0 6px; border-radius: 9999px; }
+  .fchip .repo-chip-x:hover { background: #c7d2fe; }
 
 /* ---- utilities: display / flex / grid / gaps ---- */
   .hidden { display: none; }
@@ -404,10 +417,27 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
             <div class="ferr" data-err="title"></div>
           </label>
           <label class="block">
-            <div class="lbl">Repository <span class="text-red-500">*</span></div>
-            <input id="f-repo" class="finput font-mono" list="repos-dl" placeholder="repo name, Code/rel/path, ~/path, or /abs/path">
-            <datalist id="repos-dl"></datalist>
+          <div>
+            <label class="block" for="f-repo-select">
+              <div class="lbl">Repository <span class="text-red-500">*</span></div>
+              <select id="f-repo-select" class="finput font-mono" aria-label="known repositories"></select>
+              <div id="f-repo-chip" class="fchip hidden">
+                <span id="f-repo-chip-text" class="font-mono"></span>
+                <button type="button" id="f-repo-chip-x" class="repo-chip-x" title="clear the custom repo — back to the picker">×</button>
+              </div>
+            </label>
+            <div id="repo-add-row" class="repo-add-row hidden">
+              <input id="repo-add-input" class="finput font-mono" placeholder="repo name, Code/rel/path, ~/path, or /abs/path" aria-label="new repository path">
+              <div class="repo-add-actions">
+                <button type="button" id="repo-add-ok" class="btn btn-dark">Add</button>
+                <button type="button" id="repo-add-cancel" class="btn btn-out">Cancel</button>
+              </div>
+            </div>
+            <div class="mt-2">
+              <button type="button" id="repo-add-open" class="btn btn-out btn-repo-toggle">＋ Add a new repo path</button>
+            </div>
             <div class="ferr" data-err="repo"></div>
+          </div>
           </label>
           <label class="block">
             <div class="lbl">Base branch</div>
@@ -603,7 +633,7 @@ function render(p) {
    * fast-finished drive) — either way the Run button must come back. */
   if (runInFlight && flightAwaited && !flightPending) clearRunFlight();
   renderPulse(p);
-  renderDatalist(p.knownRepos || []);
+  renderRepoOptions(p.knownRepos || []);
   renderParking(p);
   renderGlance(p);
   renderRunState(p);
@@ -792,17 +822,132 @@ function applyFlightCollapsed(collapsed) {
   if (btn && btn.setAttribute) btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
 }
 
-/* Dropdown options carry a per-repo item-count label. Chromium/WebKit
- * surface option labels; Firefox shows values only — acceptable, since the
- * value (the absolute known-repo path) is the pick data and free-form entry
- * keeps working regardless. */
-function renderDatalist(knownRepos) {
-  var dl = $('repos-dl');
-  dl.innerHTML = knownRepos.map(function (k) {
-    var label = k.count > 0 ? (k.count + (k.count === 1 ? ' item' : ' items')) : '';
-    return '<option value="' + esc(k.repo) + '">' + esc(label) + '</option>';
-  }).join('');
+/* Repository picker — one <select> of the payload's known repos
+ * (newest-first, option labels carry a basename + per-repo item count)
+ * behind a disabled placeholder option — the explicit unselected state the
+ * field resets to. "Add a new repo path" opens an inline Ok/Cancel form
+ * below the picker; Add commits the typed path as a removable chip, whose
+ * raw value the submit posts verbatim (expansion stays server-side: ~,
+ * bare known-repo name, factory-root-relative, absolute — README's
+ * expansion rules). The select only ever holds real repos, so a mode
+ * interaction can never masquerade as a picked value; the chip's × (or a
+ * Cancel) returns the field to the picker — no committed-but-invisible
+ * state. */
+var repoOptionsHtml = null;
+var repoCustomValue = '';
+
+/* The field's value: a committed custom-repo chip wins; otherwise the
+ * select's value — an unselected field reads as '' (the disabled
+ * placeholder posts as an empty repo, server-side 422), never a mode
+ * token. */
+function currentRepoValue() {
+  if (repoCustomValue) return repoCustomValue;
+  return $('f-repo-select').value;
 }
+
+function repoBasename(repo) {
+  var parts = String(repo).split(/[\\/]/);
+  return parts[parts.length - 1];
+}
+
+function knownRepoListed(repo) {
+  return !!(CURRENT && (CURRENT.knownRepos || []).some(function (k) { return k.repo === repo; }));
+}
+
+/* Options are rebuilt only on fingerprint-changed status events (never on
+ * the 1s clock), and the skip-if-identical gate makes repeated snapshots do
+ * zero DOM writes — the renderParking guard pattern. */
+function renderRepoOptions(knownRepos) {
+  knownRepos = knownRepos || [];
+  /* Option labels disambiguate: the basename carries the picker's scan,
+   * but two stored paths can share one (a fork alongside its origin) — any
+   * basename appearing more than once falls back to the full stored path,
+   * so every option in a list of look-alikes is distinguishable at a
+   * glance and work can't be silently sent to the wrong checkout. */
+  var baseCounts = {};
+  knownRepos.forEach(function (k) {
+    var b = repoBasename(k.repo);
+    baseCounts[b] = (baseCounts[b] || 0) + 1;
+  });
+  var html = '<option value="" disabled>— pick a repository —</option>' +
+    knownRepos.map(function (k) {
+      var b = repoBasename(k.repo);
+      var label = (baseCounts[b] > 1 ? k.repo : b) +
+        (k.count > 0 ? ' (' + k.count + (k.count === 1 ? ' item' : ' items') + ')' : '');
+      return '<option value="' + esc(k.repo) + '">' + esc(label) + '</option>';
+    }).join('');
+  var sel = $('f-repo-select');
+  if (html !== repoOptionsHtml) {
+    repoOptionsHtml = html;
+    /* A fresh innerHTML on a real <select> resets the selection — restore
+     * the operator's previous pick when it survives the new list so a live
+     * snapshot never erases a half-completed form; a vanished (or
+     * placeholder) selection drops to the unselected placeholder. */
+    var prev = sel.value;
+    sel.innerHTML = html;
+    var keep = knownRepos.some(function (k) { return k.repo === prev; });
+    sel.value = keep ? prev : '';
+  }
+  /* One-time default flip and empty-list autoflip are gone with the mode
+   * system: the select is always the resting control; snapshots only feed
+   * it options. */
+}
+
+/* The inline add form: open focuses its input, Ok commits a non-empty path
+ * as the chip (Enter is a commit path, Esc is a cancel path), Cancel
+ * dismisses without committing and the chip's × resets to the picker. */
+function openRepoAdd() {
+  $('repo-add-row').classList.remove('hidden');
+  var f = $('repo-add-input');
+  f.value = '';
+  if (f.focus) f.focus();
+}
+
+function closeRepoAdd() {
+  $('repo-add-row').classList.add('hidden');
+}
+
+function commitRepoValue(v) {
+  repoCustomValue = v;
+  $('f-repo-chip-text').textContent = v;
+  $('f-repo-chip').classList.remove('hidden');
+  /* The chip replaces the picker while committed — the field shows one
+   * control at a time; the × (or any reset) brings the picker back. */
+  $('f-repo-select').classList.add('hidden');
+  closeRepoAdd();
+}
+
+function clearRepoChip() {
+  repoCustomValue = '';
+  $('f-repo-chip-text').textContent = '';
+  $('f-repo-chip').classList.add('hidden');
+  /* Reset to the documented unselected state — the picker may hold a stale
+   * pick from before the chip was committed (the rebuild's preservation
+   * keeps it), so an ×-reset must not silently restore it. */
+  $('f-repo-select').value = '';
+  $('f-repo-select').classList.remove('hidden');
+}
+
+$('repo-add-open').addEventListener('click', function () {
+  openRepoAdd();
+});
+$('repo-add-cancel').addEventListener('click', function () {
+  closeRepoAdd();
+  var b = $('repo-add-open'); if (b && b.focus) b.focus();
+});
+$('repo-add-ok').addEventListener('click', function () {
+  var v = $('repo-add-input').value.trim();
+  if (!v) { renderFieldErrors([{ field: 'repo', reason: 'repo path is required' }]); return; }
+  commitRepoValue(v);
+});
+$('repo-add-input').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter') { e.preventDefault(); var v = $('repo-add-input').value.trim(); if (v) commitRepoValue(v); }
+  else if (e.key === 'Escape') { closeRepoAdd(); var b = $('repo-add-open'); if (b && b.focus) b.focus(); }
+});
+$('f-repo-chip-x').addEventListener('click', function () {
+  clearRepoChip();
+  var b = $('repo-add-open'); if (b && b.focus) b.focus();
+});
 
 function stageDots(it) {
   /* Queued rows (the in-flight panel) render all six dots hollow — a queued
@@ -2116,7 +2261,7 @@ $('btn-submit').addEventListener('click', function () {
   document.querySelectorAll('.approval-cb:checked').forEach(function (cb) { approvals.push(cb.value); });
   var body = {
     title: $('f-title').value,
-    repo: $('f-repo').value,
+    repo: currentRepoValue(),
     base: $('f-base').value || 'main',
     approvals: approvals,
     description: $('f-desc').value,
@@ -2154,7 +2299,20 @@ $('btn-template').addEventListener('click', function () {
           if (m) fm[m[1]] = m[2];
         });
         if (!$('f-title').value && fm.title) $('f-title').value = fm.title;
-        if (!$('f-repo').value && fm.repo && fm.repo.indexOf('/path/to') !== 0) $('f-repo').value = fm.repo;
+        if (!currentRepoValue() && fm.repo && fm.repo.indexOf('/path/to') !== 0) {
+          /* Only fill an empty field, read through the canonical accessor —
+           * the select's value IS the field's value, so a half-picked repo
+           * must not be clobbered by a prefill. A repo that is one of the
+           * known options: select it outright. Anything else: commit it
+           * through the add-form path as the custom-repo chip (no focus
+           * steal — the operator is clicking a button, not typing; the
+           * server expands the raw value). */
+          if (knownRepoListed(fm.repo)) {
+            $('f-repo-select').value = fm.repo;
+          } else {
+            commitRepoValue(fm.repo);
+          }
+        }
         if (!$('f-base').value && fm.base) $('f-base').value = fm.base;
         if (fm.approvals) {
           var inner = fm.approvals.replace(/#.*$/, '').replace(/^[\\[]+/, '').replace(/[\\]]+$/, '').trim();

@@ -368,9 +368,30 @@ with `Cache-Control: no-store`.
 
 Decision-desk layout (prototype variant C): pulse tiles (decisions amber /
 in flight / inbox / landed) + proportional flow bar (sub-9% segments demoted
-to a legend); the collapsible composer (title, repo combobox — free-form
-input plus a known-repos datalist whose option labels carry per-repo item
-counts, newest-first — base default "main", five approval-gate checkboxes, markdown
+to a legend); the collapsible composer (title, repo picker — one required
+field over one visible control: a `<select>` of the payload's known
+repos (newest-first, option labels carry a basename + per-repo item count —
+a basename shared by more than one stored path falls back to the full
+stored path so look-alike forks stay distinguishable — all `esc()`-escaped,
+values the stored repo strings posted verbatim)
+behind a disabled `— pick a repository —` placeholder option — the
+explicit unselected state the field resets to; the visible label is the
+select's explicit `for` label and the add form + opener sit outside it
+(a button must never become the field's labeled control); "add a new repo path" opens
+an inline Ok/Cancel form below the picker — Add (or Enter) commits the
+trimmed path as a removable chip whose raw value the submit posts
+verbatim (`~`, bare repo name, factory-root-relative, absolute — expansion
+stays entirely server-side, unchanged), Esc/Cancel dismiss without
+committing, and the chip's × resets the field to the picker's unselected
+state (never silently restoring a pre-chip pick); the option
+rebuild is change-gated and preserves an in-progress selection across
+snapshots; submit posts `currentRepoValue()` — a committed chip wins,
+otherwise an unselected field posts as an empty repo (server-side 422),
+and template prefill only fills an empty
+field — emptiness is read through `currentRepoValue()`, so an existing
+choice (picked repo or chip) is the field's value: a known repo is
+selected outright, anything else commits through the add-form path as the
+chip — base default "main", five approval-gate checkboxes, markdown
 description, "Start from template" prefill from `/api/template`, "start processing now",
 and a file drop zone); the parking lot — one card per parked item (decision
 order: awaiting-approval, needs-human, exhausted-rework,
@@ -525,7 +546,14 @@ wrong-port / absent Host and mismatched Origin on `/api/*` → 403 while the
 static page is served regardless; the strict CSP on every response (page,
 JSON, artifact, error, SSE) and the page's self-containment (no CDN script,
 no remote URLs) plus the Start Processing button's static markers (idle
-label, composer checkbox wording, spinner/disabled CSS, old-string absence);
+label, composer checkbox wording, spinner/disabled CSS, old-string absence)
+and the repo picker's static markers (the `f-repo-select` dropdown, the
+inline add form (`repo-add-open`/`repo-add-input`/`repo-add-ok`/`repo-add-cancel`) and
+its chip pieces (`f-repo-chip`/`f-repo-chip-x`), the visible label's
+explicit `for="f-repo-select"` binding, the singular/plural
+count-label logic, the add-form placeholder — the old datalist combobox's
+absence, and every mode-token (`repo-mode-*`, `__wb_new__`) absence from
+the page entirely);
 CLI entry (spawned): fresh-root refusal
 (exit 0), invalid `--port` (friendly message, exit 1), EADDRINUSE (friendly
 message, exit 1); the item detail endpoint (`GET /api/items/:id`: envelope
@@ -575,7 +603,28 @@ state, and the Start Processing button's label/disabled/tooltip lifecycle
 (idle → live-lock `Processing…` with spinner and the stop tooltip → stale
 and idle re-enable), its no-double-fire guard while disabled (zero
 `POST /api/run` entries), and the 202 toast copy (plain and capped
-suffix); the item detail overlay (open from a flight row / parked card /
+suffix); the repository picker (option build in payload order — escaped
+basename + singular/plural
+count labels with a shared-basename fallback to the full stored path, behind
+disabled unselected placeholder and with no
+sentinel token anywhere in the dropdown; the skip-if-identical change-gate
+on the option rebuild;
+selection preservation across a composition-changed snapshot and the drop
+of a vanished selection; snapshots never stealing focus and the one
+visible-control invariant (add row and chip closed at rest); the inline
+add form — open focusing its input, Ok/Enter committing the trimmed chip,
+Esc/Cancel dismissing with focus returned to the opener, an empty Ok
+declined in place, the chip posted verbatim through the real `postJSON`
+body, and the chip's × resetting to the picker's unselected state (no
+stale pre-chip pick restored); submit routing asserted
+through the real `postJSON` bodies — the select's value when a known repo
+is picked, the raw committed chip value verbatim, and an unselected field
+never submitting a mode token (posted as an empty repo);
+and the template-prefill matrix — a known repo
+selected outright, an unknown repo committed as the chip through the
+add-form path, and a non-empty field never overwritten — including a
+committed chip that is never displaced by a template naming a different
+or unknown repo); the item detail overlay (open from a flight row / parked card /
 glance chip / inbox row with exactly one fetch; action/control clicks never
 open it; inbox mode via the artifact route; Esc/backdrop/close dismissals
 with focus returned to the opener; an open overlay survives a live SSE
