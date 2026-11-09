@@ -234,6 +234,9 @@ method) is therefore guarded before routing:
 | Method/Path | Result |
 |---|---|
 | `GET /` | 200 `text/html` — `PAGE_HTML` |
+| `GET /admin` | 200 `text/html` — `PAGE_ADMIN_HTML` (the tabbed admin shell, served like `GET /`: static markup, no API guard; see specs/wb-serve-admin.spec.md). `/admin/<else>` → 404 |
+| `GET /api/admin/tables` | 200 `{tables: [{name, count, columns}]}` — the four allowlisted tables in fixed order (`items, history, artifacts, repo_locks`), live counts, columns equal to `PRAGMA table_info`. Read-only (readonly DB handle, no lock) |
+| `GET /api/admin/table/:name?after=<cursor>&limit=<n>&filter=<expr>` | 200 `{name, columns, rows, nextAfter}` — one bounded page (newest-first `ORDER BY id DESC`, keyset `WHERE id < ?`, SQL `LIMIT`, cap 200, default 50; `repo_locks` pages on `ORDER BY repo ASC` + a string cursor) / 404 unknown (non-allowlisted) table / 400 bad `limit` (integer 1–200), bad `after`, or bad `filter` grammar (`<id>`, `<lo>-<hi>` with lo ≤ hi, `item:<id>`). Read-only; **no mutation route of any kind exists on `/api/admin/*`** (non-GET falls to the generic 404) |
 | `GET /api/status` | 200 `StatusPayload` |
 | `GET /api/events?afterId=<n>` | 200 `text/event-stream` (below) |
 | `GET /api/template` | 200 `text/markdown` — `ITEM_TEMPLATE` |
@@ -368,7 +371,11 @@ with `Cache-Control: no-store`.
 
 Decision-desk layout (prototype variant C): pulse tiles (decisions amber /
 in flight / inbox / landed) + proportional flow bar (sub-9% segments demoted
-to a legend); the collapsible composer (title, repo picker — one required
+to a legend); the header's action group carries a gear link (`#btn-admin` — a
+plain anchor to `/admin`, the tabbed admin shell with the read-only SQLite
+observation tab; see specs/wb-serve-admin.spec.md) next to the Start
+Processing button — no popover, no script change; the collapsible
+composer (title, repo picker — one required
 field over one visible control: a `<select>` of the payload's known
 repos (newest-first, option labels carry a basename + per-repo item count —
 a basename shared by more than one stored path falls back to the full
@@ -579,7 +586,24 @@ natural end; the capped line beside the existing safety-cap stderr line via
 a tiny `maxResumeTicks` dep), and the graceful-throw case (a drive whose
 claim pass fails answers 500, logs the `drive exited: interrupted — …` line,
 and leaves the orphan requeued + labeled with the serve process's pid —
-idempotent on the follow-up drive).
+idempotent on the follow-up drive); plus the admin shell + SQLite observation
+tab (specs/wb-serve-admin.spec.md): the dashboard gear-link static markers
+and `GET /admin` serving the self-contained `PAGE_ADMIN_HTML` (banner
+present, no `EventSource`, no remote code, no form) under the full CSP;
+`/admin/<else>` and every non-GET on `/api/admin/*` → 404;
+`/api/admin/tables` (fixed order, live counts against a seeded store
+including a hand-written `repo_locks` row, columns equal to
+`PRAGMA table_info`, foreign Host → 403, CSP); `/api/admin/table/:name`
+(unknown table → 404, descending order, default/capped/invalid `limit`,
+cursor edges — a full `nextAfter` walk with zero gaps and zero duplicates,
+`nextAfter === null` on the last page, `after` = smallest id → empty page,
+and one several-thousand-row bounded-pagination pass where every fetch is
+row-bounded), the filter matrix (id, range, `lo > hi` → 400, malformed →
+400, `item:<n>` on history/artifacts/items/repo_locks), the `repo_locks`
+repo-key string cursor; and the invariants — all admin GETs answer 200
+while the factory lock is held, per-table counts are identical after the
+full admin request matrix, and the harness app's DB handle is the
+`openReadonly` one.
 
 `tests/web-page-runtime.test.ts` — runs the page's inline script in a fresh
 V8 context with a minimal DOM stub and drives it exactly the way the browser
@@ -641,4 +665,17 @@ dead lock without running items; a cleared signal + queued item → PAUSED),
 the click firing exactly one `POST /api/run` through the shared single-flight
 path, and the live-feed `drive-interrupted` row (orange `#ea580c` event span,
 the ` — item requeued (last holder pid …)` / `(holder unknown)` detail
-clause).
+clause). The admin page's inline script (`PAGE_ADMIN_HTML`) runs through the
+same harness (the stub gains a minimal `location`/`history.replaceState`):
+the tab strip renders and activates the SQLite tab (unknown tab deep link →
+sqlite), the table strip renders live counts and marks the active table with
+exactly one counts fetch + one page fetch per activation, every rendered DB
+value stays escaped against hostile fixtures (a `<script>`-bearing detail, a
+markup-bearing slug — raw markup absent from the grid), JSON columns
+truncate at 200 chars with an expand/collapse toggle round-trip, the filter
+box submits exactly one GET carrying the filter and a 400 renders the inline
+escaped error, table/pager/filter interactions write the full deep-link
+parameter set through `history.replaceState`, and a refresh simulation
+(fresh context, populated `location.search`) restores tab/table/cursor/filter
+and re-issues the matching fetches — the page never touches `/api/status` or
+`/api/events` (quiet observation; the dashboard is the live surface).

@@ -394,6 +394,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   <div id="run-state" class="hidden"></div>
   <div class="ml-auto flex items-center gap-2">
     <span id="feed-status" class="text-xs text-ink-400"></span>
+    <a id="btn-admin" href="/admin" title="Admin — raw store view (observation only)" class="btn btn-out" style="cursor:pointer;">⚙</a>
     <button id="btn-run" class="btn btn-dark">▶ Start Processing</button>
   </div>
 </header>

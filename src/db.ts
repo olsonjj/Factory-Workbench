@@ -49,6 +49,47 @@ export interface WatchSnapshot {
   historySince: HistoryFeedRow[];
 }
 
+// ------------------------------------------------------- admin observation
+
+/** The only tables the `/admin` SQLite browser can ever name. These four
+ *  strings are the only table names that reach SQL on the admin path — the
+ *  server matches the request against this closed list and 404s anything
+ *  else; there is no interpolated, user-controlled table name anywhere
+ *  (specs/wb-serve-admin.spec.md §2.1). */
+export const ADMIN_TABLES = ["items", "history", "artifacts", "repo_locks"] as const;
+export type AdminTableName = (typeof ADMIN_TABLES)[number];
+
+/** Fixed columns per table, kept beside the schema in migrate(). Tests assert
+ *  these match PRAGMA table_info so schema drift cannot silently desync. */
+export const ADMIN_TABLE_COLUMNS: Record<AdminTableName, string[]> = {
+  items: [
+    "id", "slug", "title", "repo", "base", "approvals", "stage", "status",
+    "parked_reason", "parked_detail", "feedback", "answers", "source_file",
+    "branch_name", "gate_attempts", "infra_attempts", "created_at", "updated_at",
+  ],
+  history: ["id", "item_id", "ts", "event", "stage", "detail"],
+  artifacts: ["id", "item_id", "stage", "name", "path", "created_at"],
+  repo_locks: ["repo", "item_id", "acquired_at"],
+};
+
+/** Server-parsed, typed filter for the admin table read. The HTTP layer owns
+ *  the grammar check (`<id>`, `<lo>-<hi>`, `item:<id>`); this shape is all the
+ *  SQL layer ever sees — no raw request text reaches a query. */
+export type AdminTableFilter =
+  | { kind: "id"; id: number }
+  | { kind: "range"; lo: number; hi: number }
+  | { kind: "item"; itemId: number };
+
+/** One bounded page of admin rows. `nextAfter` is the keyset cursor for the
+ *  next page (row id, or the last `repo` string for `repo_locks`), or null
+ *  when the page was the last one — detected via the LIMIT+1 probe, never by
+ *  a second round-trip. */
+export interface AdminTablePage {
+  columns: string[];
+  rows: Record<string, unknown>[];
+  nextAfter: number | string | null;
+}
+
 /** Detail JSON is always stringified by `appendHistory`, but parse defensively. */
 function parseHistoryDetail(raw: string): Record<string, unknown> {
   try {
@@ -59,6 +100,41 @@ function parseHistoryDetail(raw: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+/** Shared LIMIT+1 probe finisher for the id-keyed admin tables: at most
+ *  `limit` rows are returned; the probe row (when fetched) only proves a next
+ *  page exists and is dropped. `nextAfter` is the id of the LAST RETURNED row
+ *  so the next page's `WHERE id < nextAfter` continues with zero gaps and
+ *  zero duplicates (specs/wb-serve-admin.spec.md §2.3). */
+function finishIdPage(
+  columns: string[],
+  probed: Record<string, unknown>[],
+  limit: number,
+): AdminTablePage {
+  const page = probed.length > limit ? probed.slice(0, limit) : probed;
+  const last = page[page.length - 1] as { id?: unknown } | undefined;
+  return {
+    columns,
+    rows: page,
+    nextAfter: probed.length > limit && last !== undefined ? Number(last.id) : null,
+  };
+}
+
+/** Same probe finisher for `repo_locks`, whose real key is the `repo` string
+ *  (no id column): the cursor is the last returned row's repo name. */
+function finishRepoLocksPage(
+  columns: string[],
+  probed: Record<string, unknown>[],
+  limit: number,
+): AdminTablePage {
+  const page = probed.length > limit ? probed.slice(0, limit) : probed;
+  const last = page[page.length - 1] as { repo?: unknown } | undefined;
+  return {
+    columns,
+    rows: page,
+    nextAfter: probed.length > limit && last !== undefined ? String(last.repo) : null,
+  };
 }
 
 function toItem(row: ItemRow): ItemRecord {
@@ -504,5 +580,105 @@ export class FactoryDb {
        ORDER BY latest_id DESC, repo ASC`,
     ).all() as { repo: string; count: number; latest_id: number }[];
     return rows.map((r) => ({ repo: r.repo, count: r.count }));
+  }
+
+  // ----------------------------------------------------- admin observation
+
+  /** Row count for one allowlisted admin table. Read-only; the only SQL is a
+   *  fixed `SELECT COUNT(*)` over a closed-union table name
+   *  (specs/wb-serve-admin.spec.md §2.2). */
+  countAdminTable(name: AdminTableName): number {
+    const row = this.stmt(`SELECT COUNT(*) AS n FROM ${name}`).get() as { n: number };
+    return row.n;
+  }
+
+  /** One bounded page of raw rows from one allowlisted admin table
+   *  (specs/wb-serve-admin.spec.md §2.3). Id-keyed tables page newest-first
+   *  (`ORDER BY id DESC`) with a keyset cursor (`WHERE id < ?` — no OFFSET,
+   *  so the unbounded `history` table costs O(page) per fetch, riding the
+   *  PK index; the `item:` filter on history/artifacts rides their item
+   *  indexes). `repo_locks` has no id column, so it pages on its real key:
+   *  `ORDER BY repo ASC` with a `WHERE repo > ?` string cursor.
+   *
+   *  The page bound is enforced in the query itself: the statement carries
+   *  `LIMIT ?` and is executed with `limit + 1` as the exhaustion probe — the
+   *  extra row (when present) only signals "a next page exists" and fixes
+   *  `nextAfter`; it is never returned, and no code path ever fetches the
+   *  whole table to slice a page out of it (same discipline as
+   *  `getRecentHistorySince`).
+   *
+   *  Filters: `id`/`range` narrow the row id (on `items`, the row id IS the
+   *  item id; on `repo_locks` — no id column — they narrow `item_id`, the
+   *  item linkage that table exists to record); `item` narrows `item_id` on
+   *  `history`/`artifacts` and is equivalent to `id` on `items`/`repo_locks`
+   *  (the server coerces before calling; the branches here keep the union
+   *  honest on direct calls too). Rows come back RAW (snake_case column
+   *  objects, JSON TEXT columns exactly as stored) — the admin view shows
+   *  the raw store; pretty-printing is the client's concern.
+   *
+   *  Read-only. No admin write path exists anywhere in FactoryDb. */
+  adminTablePage(
+    name: AdminTableName,
+    opts: { after: number | string | null; limit: number; filter?: AdminTableFilter },
+  ): AdminTablePage {
+    const limit = opts.limit;
+    if (!Number.isInteger(limit) || limit < 1) throw new Error(`invalid admin page limit: ${limit}`);
+    const columns = ADMIN_TABLE_COLUMNS[name];
+    // `items`/`repo_locks`: the row identity IS the item linkage — an `item`
+    // filter is exactly an id filter there (the server normalizes too; this
+    // keeps the closed union exact even on direct calls).
+    let filter: AdminTableFilter | undefined = opts.filter;
+    if (filter !== undefined && filter.kind === "item" && (name === "items" || name === "repo_locks")) {
+      filter = { kind: "id", id: filter.itemId };
+    }
+    if (name === "repo_locks") {
+      const cursor = typeof opts.after === "string" && opts.after.length > 0 ? opts.after : null;
+      const conds: string[] = [];
+      const params: unknown[] = [];
+      if (cursor !== null) {
+        conds.push("repo > ?");
+        params.push(cursor);
+      }
+      if (filter !== undefined) {
+        if (filter.kind === "range") {
+          conds.push("item_id BETWEEN ? AND ?");
+          params.push(filter.lo, filter.hi);
+        } else {
+          conds.push("item_id = ?");
+          params.push(filter.kind === "id" ? filter.id : filter.itemId);
+        }
+      }
+      const where = conds.length > 0 ? ` WHERE ${conds.join(" AND ")}` : "";
+      const rows = this.stmt(`SELECT * FROM repo_locks${where} ORDER BY repo ASC LIMIT ?`)
+        .all(...params, limit + 1) as Record<string, unknown>[];
+      return finishRepoLocksPage(columns, rows, limit);
+    }
+    const afterId = opts.after === null || opts.after === undefined ? null : Number(opts.after);
+    if (afterId !== null && !Number.isInteger(afterId)) {
+      throw new Error(`invalid admin cursor: ${String(opts.after)}`);
+    }
+    const conds: string[] = [];
+    const params: unknown[] = [];
+    if (afterId !== null) {
+      conds.push("id < ?");
+      params.push(afterId);
+    }
+    if (filter !== undefined) {
+      if (filter.kind === "id" || (filter.kind === "item" && name === "items")) {
+        conds.push("id = ?");
+        params.push(filter.kind === "id" ? filter.id : filter.itemId);
+      } else if (filter.kind === "range") {
+        conds.push("id BETWEEN ? AND ?");
+        params.push(filter.lo, filter.hi);
+      } else {
+        // `item` on history/artifacts: the item_id trace filter.
+        conds.push("item_id = ?");
+        params.push(filter.itemId);
+      }
+    }
+    const where = conds.length > 0 ? ` WHERE ${conds.join(" AND ")}` : "";
+    const rows = this.stmt(`SELECT * FROM ${name}${where} ORDER BY id DESC LIMIT ?`)
+      .all(...params, limit + 1) as Record<string, unknown>[];
+    return finishIdPage(columns, rows, limit);
   }
 }

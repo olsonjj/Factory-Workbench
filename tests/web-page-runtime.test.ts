@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import * as vm from "node:vm";
 import { PAGE_HTML } from "../src/web/page.js";
+import { PAGE_ADMIN_HTML } from "../src/web/admin-page.js";
 
 /**
  * Runtime tests for the wb serve page script. The page is a single static
@@ -176,6 +177,23 @@ function makeContext() {
       fetches.push({ url, resolve });
     });
 
+  /** URL-bar state for the admin shell (the dashboard never touches it):
+   *  the page reads `location.search` on load and writes
+   *  `history.replaceState` on every state change. A fresh context is a
+   *  fresh page load — tests set the search BEFORE running the script, and
+   *  read the replaceState log to assert the deep-link writes. */
+  const replaceStateCalls: string[] = [];
+  let currentSearch = "";
+  const location = {
+    get search() { return currentSearch; },
+    set search(v: string) { currentSearch = String(v); },
+  };
+  const history = {
+    replaceState: (_a: unknown, _b: string, url: string) => {
+      replaceStateCalls.push(String(url));
+    },
+  };
+
   const sandbox: Record<string, unknown> = {
     document,
     fetch,
@@ -185,12 +203,20 @@ function makeContext() {
     setInterval,
     clearInterval,
     localStorage,
+    location,
+    history,
   };
   vm.createContext(sandbox);
   return {
     sandbox,
     /** The same object the page's script sees as global `localStorage`. */
     localStorage,
+    /** Set the URL bar before running the page script (admin deep links). */
+    setSearch: (s: string) => {
+      currentSearch = s;
+    },
+    /** Every URL history.replaceState wrote, oldest first. */
+    replaceStateCalls,
     run: (script: string) => vm.runInContext(script, sandbox, { filename: "page-inline.js" }),
     el: (id: string) => document.getElementById(id),
     /** Pending fetch queue — a click while disabled must add nothing. */
@@ -2649,3 +2675,246 @@ describe("wb serve page script: repository picker (runtime)", () => {
     expect(ctx4.el("f-repo-select").value).toBe("");
   });
 });
+
+// ------------------------------------------------------- admin shell (/admin)
+
+describe("wb serve admin page script (runtime behavior)", () => {
+  /** A delegated-event fake target carrying data attributes (the handlers
+   *  dispatch on getAttribute, never on element identity). */
+  const attrTarget = (attrs: Record<string, string | null>) => ({
+    getAttribute: (n: string) => (n in attrs ? attrs[n] : null),
+  });
+
+  /** Fixed /api/admin/tables body: live counts for all four tables. */
+  const ADMIN_TABLES_BODY = {
+    tables: [
+      { name: "items", count: 3, columns: ["id", "slug", "parked_detail"] },
+      { name: "history", count: 5, columns: ["id", "item_id", "ts", "event", "stage", "detail"] },
+      { name: "artifacts", count: 2, columns: ["id", "item_id", "stage", "name", "path", "created_at"] },
+      { name: "repo_locks", count: 1, columns: ["repo", "item_id", "acquired_at"] },
+    ],
+  };
+
+  const ITEMS_PAGE = {
+    name: "items",
+    columns: ["id", "slug", "parked_detail"],
+    rows: [
+      { id: 2, slug: "normal-slug", parked_detail: null },
+      { id: 1, slug: "hostile<img src=x onerror=alert(1)>slug", parked_detail: `{"q": "a \\"quoted\\" answer"}` },
+    ],
+    nextAfter: 1,
+  };
+
+  const HISTORY_PAGE = {
+    name: "history",
+    columns: ["id", "item_id", "ts", "event", "stage", "detail"],
+    rows: [
+      {
+        id: 4,
+        item_id: 1,
+        ts: "2026-11-09T00:00:00.000Z",
+        event: "stage-start",
+        stage: "spec",
+        detail: JSON.stringify({ note: "a long " + "x".repeat(400) + " tail" }),
+      },
+    ],
+    nextAfter: 4,
+  };
+
+  /** A per-URL admin responder: counts for /api/admin/tables, page bodies for
+   *  /api/admin/table/*, and (when set) an error response. */
+  function adminRespond(overrides?: Record<string, unknown>) {
+    return (url: string) => {
+      if (url === "/api/admin/tables") {
+        return { ok: true, status: 200, json: async () => ADMIN_TABLES_BODY };
+      }
+      if (url.startsWith("/api/admin/table/")) {
+        const table = url.slice("/api/admin/table/".length).split("?")[0]!;
+        const fallback = table === "history" ? HISTORY_PAGE : ITEMS_PAGE;
+        const body = overrides?.[url] ?? overrides?.["*page*"] ?? fallback;
+        if ((body as { status?: number }).status !== undefined) {
+          // an explicit error envelope: { status, body }
+          const err = body as { status: number; body: unknown };
+          return { ok: false, status: err.status, json: async () => err.body };
+        }
+        return { ok: true, status: 200, json: async () => body };
+      }
+      return undefined;
+    };
+  }
+
+  /** Run the admin page script in a fresh context with the given URL. */
+  function runAdminPage(search = "") {
+    const ctx = makeContext();
+    ctx.setSearch(search);
+    ctx.run(pageScript(PAGE_ADMIN_HTML));
+    return ctx;
+  }
+
+  it("renders the tab strip, activates the SQLite tab, and loads counts + the first page with one fetch each", async () => {
+    const ctx = runAdminPage();
+    // Boot already wrote the normalized deep link.
+    expect(ctx.replaceStateCalls).toEqual(["/admin?tab=sqlite&table=items"]);
+    const tabs = ctx.el("admin-tabs");
+    expect(tabs.innerHTML).toContain('data-tab="sqlite"');
+    expect(tabs.innerHTML).toContain("tab-active");
+    expect(tabs.innerHTML).toContain("SQLite");
+    // Two pending fetches: exactly one counts fetch + one page fetch.
+    expect(ctx.countRequests("/api/admin/tables")).toBe(1);
+    expect(ctx.countRequests("/api/admin/table/items?limit=50")).toBe(1);
+    await ctx.settle(adminRespond());
+    const strip = ctx.el("admin-tables");
+    expect(strip.innerHTML).toContain("items (3)");
+    expect(strip.innerHTML).toContain("history (5)");
+    expect(strip.innerHTML).toContain("artifacts (2)");
+    expect(strip.innerHTML).toContain("repo_locks (1)");
+    // The active table is marked.
+    expect(strip.innerHTML).toMatch(/class="tbl-btn tbl-active" data-table="items"/);
+    // Rows render (default table = items).
+    const grid = ctx.el("admin-grid");
+    expect(grid.innerHTML).toContain("normal-slug");
+    // The pager offers the next page (nextAfter = 1).
+    const pager = ctx.el("admin-pager");
+    expect(pager.innerHTML).toContain('data-page="older"');
+    // no "newest" reset on page 1
+    expect(pager.innerHTML).not.toContain('data-page="newest"');
+  });
+
+  it("falls back to the sqlite tab for an unknown tab deep link", async () => {
+    const ctx = runAdminPage("?tab=bogus");
+    expect(ctx.el("admin-tabs").innerHTML).toContain('data-tab="sqlite"');
+    expect(ctx.replaceStateCalls).toEqual(["/admin?tab=sqlite&table=items"]);
+    await ctx.settle(adminRespond());
+  });
+
+  it("renders every DB value escaped — hostile payloads stay inert", async () => {
+    const ctx = runAdminPage("?table=items");
+    await ctx.settle(adminRespond());
+    const html = ctx.el("admin-grid").innerHTML;
+    // The hostile slug appears only in escaped form — never as live markup.
+    expect(html).toContain("hostile&lt;img src=x onerror=alert(1)&gt;slug");
+    expect(html).not.toContain("hostile<img");
+    expect(html).not.toContain("<img");
+    // The JSON column value is pretty-printed and escaped — inner quotes
+    // survive as JSON \\" escapes wrapped in &quot; entities.
+    expect(html).toContain("&quot;q&quot;");
+    expect(html).toContain('\\&quot;quoted\\&quot;');
+    // No script tag ever enters the rendered grid.
+    expect(html).not.toContain("<script");
+  });
+
+  it("truncates long JSON columns at 200 chars and the expand toggle round-trips", async () => {
+    const ctx = runAdminPage("?table=history");
+    await ctx.settle(adminRespond());
+    const grid = ctx.el("admin-grid");
+    const full = JSON.stringify(JSON.parse(HISTORY_PAGE.rows[0]!.detail as string), null, 2);
+    expect(full.length).toBeGreaterThan(200);
+    // Collapsed: the truncated head + the toggle marker, never the full text.
+    expect(grid.innerHTML).toContain(escLike(full.slice(0, 200)));
+    expect(grid.innerHTML).not.toContain(escLike(full.slice(0, 300)));
+    expect(grid.innerHTML).toContain('data-jx="0"');
+    expect(grid.innerHTML).toContain("▸");
+    // Expand: the full pretty text, the collapse marker.
+    ctx.click("tab-content", attrTarget({ "data-jx": "0" }));
+    expect(grid.innerHTML).toContain(escLike(full));
+    expect(grid.innerHTML).toContain("▾");
+    // And back.
+    ctx.click("tab-content", attrTarget({ "data-jx": "0" }));
+    expect(grid.innerHTML).not.toContain(escLike(full.slice(0, 300)));
+    expect(grid.innerHTML).toContain("▸");
+  });
+
+  it("filter submit issues exactly one GET with the filter in the query, and a 400 renders the inline escaped error", async () => {
+    const ctx = runAdminPage();
+    await ctx.settle(adminRespond());
+    const input = ctx.el("admin-filter");
+    input.value = "item:7";
+    expect(ctx.countRequests("/api/admin/table/items?limit=50&filter=item%3A7")).toBe(0);
+    ctx.click("tab-content", attrTarget({ "data-act": "filter" }));
+    expect(ctx.countRequests("/api/admin/table/items?limit=50&filter=item%3A7")).toBe(1);
+    // The deep link carries the applied filter.
+    expect(ctx.replaceStateCalls[ctx.replaceStateCalls.length - 1]).toBe(
+      "/admin?tab=sqlite&table=items&filter=item%3A7",
+    );
+    // A 400 surfaces inline (never alert): the error line shows the message.
+    await ctx.settle(
+      adminRespond({ "*page*": { status: 400, body: { error: "no such thing <script>" } } }),
+    );
+    expect(ctx.el("admin-error").textContent).toContain("no such thing <script>");
+    // The grid is cleared, not left showing stale rows.
+    expect(ctx.el("admin-grid").innerHTML).toBe("");
+  });
+
+  it("table and pager clicks write the full parameter set via history.replaceState", async () => {
+    const ctx = runAdminPage();
+    await ctx.settle(adminRespond());
+    // Click the history table strip button.
+    ctx.click("tab-content", attrTarget({ "data-table": "history" }));
+    let last = ctx.replaceStateCalls[ctx.replaceStateCalls.length - 1]!;
+    expect(last).toBe("/admin?tab=sqlite&table=history");
+    expect(ctx.countRequests("/api/admin/table/history?limit=50")).toBe(1);
+    await ctx.settle(adminRespond());
+    // Next page: the cursor rides in the URL.
+    ctx.click("tab-content", attrTarget({ "data-page": "older" }));
+    last = ctx.replaceStateCalls[ctx.replaceStateCalls.length - 1]!;
+    expect(last).toContain("table=history");
+    expect(last).toContain("after=");
+    expect(ctx.fetches.map((f) => f.url).some((u) => u.startsWith("/api/admin/table/history"))).toBe(true);
+    await ctx.settle(adminRespond());
+    // Reset to newest drops the cursor again.
+    ctx.click("tab-content", attrTarget({ "data-page": "newest" }));
+    last = ctx.replaceStateCalls[ctx.replaceStateCalls.length - 1]!;
+    expect(last).toBe("/admin?tab=sqlite&table=history");
+  });
+
+  it("a refresh restores tab/table/cursor/filter from the URL and re-issues the matching fetches", async () => {
+    // Session one: land on a filtered, second-page history view.
+    const first = runAdminPage("?table=history&filter=item%3A7");
+    await first.settle(adminRespond());
+    expect(first.totalRequests("/api/admin/table/history?limit=50&filter=item%3A7")).toBe(1);
+    // The exact URL a refresh would reload from.
+    const url = first.replaceStateCalls[first.replaceStateCalls.length - 1]!;
+    expect(url).toBe("/admin?tab=sqlite&table=history&filter=item%3A7");
+    // Session two: a fresh context (a real page reload) with that URL.
+    const second = makeContext();
+    second.setSearch(url.slice("/admin".length));
+    second.run(pageScript(PAGE_ADMIN_HTML));
+    expect(second.countRequests("/api/admin/tables")).toBe(1);
+    expect(second.countRequests("/api/admin/table/history?limit=50&filter=item%3A7")).toBe(1);
+    await second.settle(adminRespond());
+    // The filter box is re-seeded from the URL (echoed, escaped).
+    expect(second.el("admin-filter").value).toBe("item:7");
+    expect(second.el("admin-grid").innerHTML).toContain("stage-start"); // history page body
+    // A cursor restores too: page two of history.
+    const third = runAdminPage("?table=history&after=3&filter=item%3A7");
+    expect(third.countRequests("/api/admin/table/history?limit=50&after=3&filter=item%3A7")).toBe(1);
+    await third.settle(adminRespond());
+    const pager = third.el("admin-pager");
+    expect(pager.innerHTML).toContain('data-page="newest"');
+  });
+
+  it("holding no live connection: the admin page never touches the status/SSE endpoints (GET-only quiet observation)", async () => {
+    // Static-marker complement: drive the whole page and assert the network
+    // surface stays quiet — no /api/status poll, no /api/events SSE connect
+    // (the dashboard remains the live surface).
+    const ctx = runAdminPage("?table=history");
+    ctx.click("tab-content", attrTarget({ "data-table": "artifacts" }));
+    ctx.click("tab-content", attrTarget({ "data-page": "older" }));
+    ctx.click("tab-content", attrTarget({ "data-act": "filter" }));
+    await ctx.settle(adminRespond());
+    expect(ctx.totalRequests("/api/status")).toBe(0);
+    expect(ctx.totalRequests("/api/events")).toBe(0);
+    // Every admin fetch was a bare GET (no request body anywhere).
+    const bodies = ctx.bodies("/api/admin/table/artifacts?limit=50");
+    expect(bodies).toEqual([]);
+  });
+});
+
+/** The runtime stub's innerHTML is never parsed, so equality checks against
+ *  expected rendered text must use the page's own escaping. Mirrors esc()
+ *  from the page scripts (both pages define the same helper). */
+function escLike(s: string): string {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string,
+  );
+}

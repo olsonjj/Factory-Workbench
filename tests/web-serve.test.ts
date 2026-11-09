@@ -25,8 +25,9 @@ import {
   type Script,
 } from "./helpers.js";
 import { createServeApp, SERVE_CSP, MAX_SSE_REPLAY_ROWS, type ServeApp, type ServeAppDeps } from "../src/web/server.js";
-import { FactoryDb } from "../src/db.js";
+import { FactoryDb, ADMIN_TABLES, ADMIN_TABLE_COLUMNS } from "../src/db.js";
 import { PAGE_HTML } from "../src/web/page.js";
+import { PAGE_ADMIN_HTML } from "../src/web/admin-page.js";
 import { ITEM_TEMPLATE, parseItemMarkdown } from "../src/frontmatter.js";
 import { classifyInbox, statusFingerprint, type StatusPayload } from "../src/status.js";
 import { STAGES, type ItemRecord, type StageRequest, type StageResult, type StageRunner } from "../src/types.js";
@@ -2119,5 +2120,390 @@ describe("wb serve: dead-drive observability (specs/wb-interrupted-drives.spec.m
       logSpy.mockRestore();
       errSpy.mockRestore();
     }
+  });
+});
+
+// ------------------------------------------------------------ admin (/admin)
+
+describe("wb serve: admin shell + SQLite observation tab (specs/wb-serve-admin.spec.md)", () => {
+  const OBSERVATION_BANNER =
+    "Observation only — this page never acquires the factory lock and never writes.";
+
+  /** Minimal http.request helper with a controllable Host header (node's
+   *  fetch forbids Host overrides; mirrors the request-hardening tests). */
+  function adminRawRequest(
+    s: ServerHarness,
+    opts: { method?: string; urlPath: string; headers?: Record<string, string> },
+  ): Promise<{ status: number; body: PostBody }> {
+    return new Promise((resolve, reject) => {
+      const u = new URL(s.url);
+      const req = http.request(
+        {
+          host: u.hostname,
+          port: u.port,
+          method: opts.method ?? "GET",
+          path: opts.urlPath,
+          headers: opts.headers,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString("utf8");
+            let parsed: PostBody = {};
+            try {
+              parsed = JSON.parse(text) as PostBody;
+            } catch {
+              parsed = { raw: text };
+            }
+            resolve({ status: res.statusCode ?? -1, body: parsed });
+          });
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+  }
+
+  /** Seed a small, countable store: 3 items, per-item history + artifacts,
+   *  and one repo_locks row per item (written test-side through the
+   *  harness's writable handle — the app only ever reads). */
+  function seedAdminStore(s: ServerHarness): number[] {
+    const ids: number[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const item = s.h.db.insertItem({
+        slug: `admin-item-${i}`,
+        title: `Admin item ${i}`,
+        repo: `/tmp/admin-repo-${i}`,
+        base: "main",
+        approvals: ["review"],
+        stage: "spec",
+        status: "queued",
+      });
+      ids.push(item.id);
+      s.h.db.appendHistory(item.id, "stage-start", "spec", { note: `row for ${item.slug}` });
+      s.h.db.appendHistory(item.id, "stage-start", "spec", { note: `second row for ${item.slug}` });
+      s.h.db.addArtifact(item.id, "spec", "spec", `/tmp/admin-artifact-${i}.md`);
+      expect(s.h.db.acquireRepoLock(`/tmp/admin-repo-${i}`, item.id)).toBe(true);
+    }
+    return ids;
+  }
+
+  async function adminTables(s: ServerHarness) {
+    const res = await fetch(s.url + "/api/admin/tables");
+    expect(res.status).toBe(200);
+    return { res, body: (await res.json()) as { tables: { name: string; count: number; columns: string[] }[] } };
+  }
+
+  async function adminPage(s: ServerHarness, query: string) {
+    const res = await fetch(s.url + "/api/admin/table/" + query);
+    const body = (await res.json()) as {
+      name?: string;
+      columns?: string[];
+      rows?: Record<string, unknown>[];
+      nextAfter?: number | string | null;
+      error?: string;
+    };
+    return { status: res.status, body };
+  }
+
+  it("dashboard header carries the gear link to /admin (static markers)", async () => {
+    // The gear is a plain anchor before #btn-run inside the header action
+    // group — no popover, no script change.
+    expect(PAGE_HTML).toContain('id="btn-admin"');
+    expect(PAGE_HTML).toContain('href="/admin"');
+    expect(PAGE_HTML).toContain('title="Admin — raw store view (observation only)"');
+    expect(PAGE_HTML.indexOf('id="btn-admin"')).toBeGreaterThan(-1);
+    expect(PAGE_HTML.indexOf('id="btn-admin"')).toBeLessThan(PAGE_HTML.indexOf('id="btn-run"'));
+  });
+
+  it("GET /admin serves the self-contained observation shell; /admin/<else> and admin mutations 404", async () => {
+    // Self-containment under the standing CSP rules: inline style/script
+    // only, no remote code, no EventSource, no form POST anywhere.
+    expect(PAGE_ADMIN_HTML).toContain("<style>");
+    expect(PAGE_ADMIN_HTML).toContain("<script>");
+    expect(PAGE_ADMIN_HTML).not.toContain("http://");
+    expect(PAGE_ADMIN_HTML).not.toContain("https://");
+    expect(PAGE_ADMIN_HTML).not.toContain("EventSource");
+    expect(PAGE_ADMIN_HTML).not.toContain("<form");
+    expect(PAGE_ADMIN_HTML).not.toMatch(/<script[^>]*\ssrc=/i);
+    // The observation-only banner is statically present in the served page.
+    expect(PAGE_ADMIN_HTML).toContain(OBSERVATION_BANNER);
+    expect(PAGE_ADMIN_HTML).toContain("<title>wb — admin</title>");
+    expect(PAGE_ADMIN_HTML).toContain('href="/"');
+
+    const s = await makeServer();
+    const page = await fetch(s.url + "/admin");
+    expect(page.status).toBe(200);
+    expect(page.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(page.headers.get("content-security-policy")).toBe(SERVE_CSP);
+    expect(await page.text()).toBe(PAGE_ADMIN_HTML);
+
+    // No admin sub-routes exist; unknown admin API tables 404; there is NO
+    // mutation verb on the admin surface at all (non-GET → generic 404).
+    expect((await fetch(s.url + "/admin/xyz")).status).toBe(404);
+    expect((await adminRawRequest(s, { method: "POST", urlPath: "/api/admin/tables" })).status).toBe(404);
+    expect((await adminRawRequest(s, { method: "POST", urlPath: "/api/admin/table/items" })).status).toBe(404);
+    expect((await adminRawRequest(s, { method: "DELETE", urlPath: "/api/admin/tables" })).status).toBe(404);
+    const unknown = await adminPage(s, "nope");
+    expect(unknown.status).toBe(404);
+    expect(unknown.body.error).toBe("unknown admin table");
+  });
+
+  it("GET /api/admin/tables: fixed order, live counts, PRAGMA-matched columns; guarded like every /api/* request", async () => {
+    const s = await makeServer();
+    seedAdminStore(s);
+    const { res, body } = await adminTables(s);
+    // Fixed allowlist order.
+    expect(body.tables.map((t) => t.name)).toEqual([...ADMIN_TABLES]);
+    // Live counts against the seeded store (3 items, 6 history rows, 3
+    // artifacts, 3 repo_locks rows — the hand-written lock included).
+    const counts = Object.fromEntries(body.tables.map((t) => [t.name, t.count]));
+    expect(counts).toEqual({ items: 3, history: 6, artifacts: 3, repo_locks: 3 });
+    // Columns match PRAGMA table_info (schema-drift guard) and the exported
+    // ADMIN_TABLE_COLUMNS constant the endpoints serve.
+    for (const t of body.tables) {
+      const pragma = s.rodb.db.pragma(`table_info(${t.name})`) as { name: string }[];
+      expect(t.columns).toEqual(pragma.map((p) => p.name));
+      expect(t.columns).toEqual(ADMIN_TABLE_COLUMNS[t.name as "items"]);
+    }
+    // The JSON response carries the strict CSP; the Host/Origin guard covers
+    // the admin API exactly like every /api/* request.
+    expect(res.headers.get("content-security-policy")).toBe(SERVE_CSP);
+    const port = (s.server.address() as { port: number }).port;
+    const rebinding = await adminRawRequest(s, {
+      urlPath: "/api/admin/tables",
+      headers: { host: `evil.example:${port}` },
+    });
+    expect(rebinding.status).toBe(403);
+  });
+
+  it("GET /api/admin/table/:name pages newest-first with validated bounds", async () => {
+    const s = await makeServer();
+    const ids = seedAdminStore(s);
+    // Descending id order on the default page.
+    const first = await adminPage(s, "history");
+    expect(first.status).toBe(200);
+    expect(first.body.name).toBe("history");
+    expect(first.body.columns).toEqual(ADMIN_TABLE_COLUMNS.history);
+    const rowIds = first.body.rows!.map((r) => Number(r.id));
+    expect(rowIds).toEqual([...rowIds].sort((a, b) => b - a));
+    // Raw rows: snake_case columns, JSON TEXT exactly as stored.
+    expect(first.body.rows![0]).toHaveProperty("item_id");
+    expect(first.body.rows![0]).toHaveProperty("detail");
+
+    // limit handling: default 50, explicit small cap honored, invalid caps 400.
+    for (let i = 0; i < 60; i += 1) {
+      s.h.db.appendHistory(ids[0]!, "stage-start", "spec", { n: i });
+    }
+    const def = await adminPage(s, "history");
+    expect(def.body.rows).toHaveLength(50);
+    expect(Number(def.body.nextAfter)).toBe(Number(def.body.rows![49]!.id));
+    const small = await adminPage(s, "history?limit=3");
+    expect(small.body.rows).toHaveLength(3);
+    for (const bad of ["limit=0", "limit=-1", "limit=201", "limit=abc", "limit=2.5"]) {
+      const r = await adminPage(s, "history?" + bad);
+      expect(r.status).toBe(400);
+      expect(r.body.error).toBe("limit must be an integer between 1 and 200");
+    }
+    // Cursor validation on id-keyed tables.
+    expect((await adminPage(s, "history?after=abc")).status).toBe(400);
+    expect((await adminPage(s, "history?after=-3")).status).toBe(400);
+
+    // Cursor edges: page 1 → nextAfter walk is gap-free and duplicate-free
+    // across ALL pages of the seeded table; the last page signals null.
+    const expected: number[] = [];
+    const all = s.h.db.db.prepare("SELECT id FROM history ORDER BY id DESC").all() as { id: number }[];
+    for (const r of all) expected.push(r.id);
+    const walked: number[] = [];
+    let after: number | string | null = null;
+    for (;;) {
+      const q = "history?limit=7" + (after === null ? "" : `&after=${after}`);
+      const page = await adminPage(s, q);
+      expect(page.status).toBe(200);
+      expect(page.body.rows!.length).toBeLessThanOrEqual(7);
+      for (const r of page.body.rows!) walked.push(Number(r.id));
+      if (page.body.nextAfter === null) break;
+      expect(page.body.rows!.length).toBe(7);
+      after = page.body.nextAfter as number;
+    }
+    expect(walked).toEqual(expected);
+    // after = the smallest id → an empty last page.
+    const smallest = expected[expected.length - 1]!;
+    const edge = await adminPage(s, `history?after=${smallest}`);
+    expect(edge.body.rows).toEqual([]);
+    expect(edge.body.nextAfter).toBeNull();
+  });
+
+  it("filter grammar: id, range, and item: traces; malformed and inverted inputs 400", async () => {
+    const s = await makeServer();
+    const ids = seedAdminStore(s);
+    // Single id narrows to exactly that row (the HISTORY row id here).
+    const histIds = s.h.db.db.prepare("SELECT id FROM history ORDER BY id").all() as { id: number }[];
+    const one = await adminPage(s, `history?filter=${histIds[1]!.id}`);
+    expect(one.body.rows).toHaveLength(1);
+    expect(Number(one.body.rows![0]!.id)).toBe(histIds[1]!.id);
+    // Range narrows to the id window (descending).
+    const range = await adminPage(s, `history?filter=${ids[0]}-${ids[1]}`);
+    for (const r of range.body.rows!) {
+      const id = Number(r.id);
+      expect(id).toBeGreaterThanOrEqual(ids[0]!);
+      expect(id).toBeLessThanOrEqual(ids[1]!);
+    }
+    // item:<n> follows one item's traces across tables.
+    const itemHist = await adminPage(s, `history?filter=item:${ids[2]}`);
+    expect(itemHist.body.rows!.length).toBeGreaterThan(0);
+    expect(itemHist.body.rows!.every((r) => Number(r.item_id) === ids[2])).toBe(true);
+    const itemArt = await adminPage(s, `artifacts?filter=item:${ids[2]}`);
+    expect(itemArt.body.rows!.every((r) => Number(r.item_id) === ids[2])).toBe(true);
+    // On items (row id IS the item id) the filter coerces to the id.
+    const itemItems = await adminPage(s, `items?filter=item:${ids[2]}`);
+    expect(itemItems.body.rows).toHaveLength(1);
+    expect(Number(itemItems.body.rows![0]!.id)).toBe(ids[2]!);
+    // On repo_locks (no id column) it narrows the item linkage.
+    const itemLocks = await adminPage(s, `repo_locks?filter=item:${ids[2]}`);
+    expect(itemLocks.body.rows).toHaveLength(1);
+    expect(Number(itemLocks.body.rows![0]!.item_id)).toBe(ids[2]!);
+    // Bad grammar and inverted ranges are rejected server-side.
+    expect((await adminPage(s, "history?filter=abc")).status).toBe(400);
+    expect((await adminPage(s, "history?filter=item:xyz")).status).toBe(400);
+    expect((await adminPage(s, "history?filter=7-3")).status).toBe(400);
+    expect((await adminPage(s, "history?filter=1-2-3")).status).toBe(400);
+    const inverted = await adminPage(s, "history?filter=7-3");
+    expect(inverted.body.error).toBe("filter range must satisfy lo <= hi");
+
+    // Acceptance: an id filter finds ALL rows for one item id across pages.
+    const target = ids[0]!;
+    for (let i = 0; i < 40; i += 1) {
+      s.h.db.appendHistory(i % 2 === 0 ? target : ids[1]!, "stage-start", "spec", { n: i });
+    }
+    const found: number[] = [];
+    let after: number | string | null = null;
+    for (;;) {
+      const q = `history?filter=item:${target}&limit=5` + (after === null ? "" : `&after=${after}`);
+      const page = await adminPage(s, q);
+      expect(page.status).toBe(200);
+      for (const r of page.body.rows!) {
+        expect(Number(r.item_id)).toBe(target);
+        found.push(Number(r.id));
+      }
+      if (page.body.nextAfter === null) break;
+      after = page.body.nextAfter;
+    }
+    const seeded = s.h.db.db
+      .prepare("SELECT id FROM history WHERE item_id = ? ORDER BY id DESC")
+      .all(target) as { id: number }[];
+    expect(found).toEqual(seeded.map((r) => r.id));
+  });
+
+  it("repo_locks pages on its repo key with a string cursor (the one intentional asymmetry)", async () => {
+    const s = await makeServer();
+    const ids = seedAdminStore(s);
+    s.h.db.acquireRepoLock("/tmp/admin-repo-0-zzz", ids[0]!); // sorts after the seeded repos
+    // Ascending repo order, string cursor, no gaps/duplicates across pages.
+    const expected = s.h.db.db.prepare("SELECT repo FROM repo_locks ORDER BY repo ASC").all() as { repo: string }[];
+    const walked: string[] = [];
+    let after: string | null = null;
+    for (;;) {
+      const q = "repo_locks?limit=2" + (after === null ? "" : `&after=${encodeURIComponent(after)}`);
+      const page = await adminPage(s, q);
+      expect(page.status).toBe(200);
+      expect(page.body.rows!.length).toBeLessThanOrEqual(2);
+      for (const r of page.body.rows!) walked.push(String(r.repo));
+      if (page.body.nextAfter === null) break;
+      expect(typeof page.body.nextAfter).toBe("string");
+      after = page.body.nextAfter as string;
+    }
+    expect(walked).toEqual(expected.map((r) => r.repo));
+    // A string cursor that sorts past every row → empty page.
+    const edge = await adminPage(s, "repo_locks?after=" + encodeURIComponent("zzzz"));
+    expect(edge.body.rows).toEqual([]);
+    expect(edge.body.nextAfter).toBeNull();
+  });
+
+  it("history stays paged and bounded at several thousand rows (no fetch-all default)", async () => {
+    const s = await makeServer();
+    const item = s.h.db.insertItem({
+      slug: "admin-big-history",
+      title: "Big history",
+      repo: "/tmp/admin-big",
+      base: "main",
+      approvals: [],
+      stage: "spec",
+      status: "queued",
+    });
+    const total = 2500;
+    const insertMany = s.h.db.db.prepare("INSERT INTO history (item_id, ts, event, stage, detail) VALUES (?, ?, 'stage-start', 'spec', '{}')");
+    const big = s.h.db.db.transaction(() => {
+      for (let i = 0; i < total; i += 1) insertMany.run(item.id, new Date().toISOString());
+    });
+    big();
+    // Walk the whole table at the cap: every fetch returns at most 200 rows
+    // and the walk is contiguous — no fetch ever reads the whole table.
+    let seen = 0;
+    let prev: number | null = null;
+    let after: number | string | null = null;
+    for (;;) {
+      const q = "history?limit=200" + (after === null ? "" : `&after=${after}`);
+      const page = await adminPage(s, q);
+      expect(page.status).toBe(200);
+      expect(page.body.rows!.length).toBeLessThanOrEqual(200);
+      for (const r of page.body.rows!) {
+        const id = Number(r.id);
+        if (prev !== null) expect(id).toBeLessThan(prev);
+        prev = id;
+        seen += 1;
+      }
+      if (page.body.nextAfter === null) break;
+      after = page.body.nextAfter;
+    }
+    expect(seen).toBe(total);
+  });
+
+  it("takes no factory lock: all admin GETs answer 200 while the lock is held", async () => {
+    const s = await makeServer();
+    seedAdminStore(s);
+    const release = acquireFactoryLock(s.h.root);
+    try {
+      const page = await fetch(s.url + "/admin");
+      expect(page.status).toBe(200);
+      await page.body?.cancel();
+      const tables = await fetch(s.url + "/api/admin/tables");
+      expect(tables.status).toBe(200);
+      await tables.body?.cancel();
+      const rows = await fetch(s.url + "/api/admin/table/history?limit=5");
+      expect(rows.status).toBe(200);
+      await rows.body?.cancel();
+    } finally {
+      release();
+    }
+  });
+
+  it("admin reads never mutate: per-table counts are identical after the full admin request matrix", async () => {
+    const s = await makeServer();
+    seedAdminStore(s);
+    // The observation handle the app polls is a readonly connection.
+    expect(s.rodb.db.readonly).toBe(true);
+    const before = ADMIN_TABLES.map((n) => s.rodb.countAdminTable(n));
+    // A broad sweep of the admin surface — pages, filters, bad input — must
+    // leave every table byte-identical in count.
+    const paths = [
+      "/api/admin/tables",
+      "/api/admin/table/items",
+      "/api/admin/table/history?limit=3",
+      "/api/admin/table/artifacts?limit=1",
+      "/api/admin/table/repo_locks",
+      "/api/admin/table/history?filter=item:1",
+      "/api/admin/table/history?filter=99999",
+      "/api/admin/table/history?limit=500",
+      "/api/admin/table/history?filter=oops",
+      "/api/admin/table/nope",
+    ];
+    for (const p of paths) {
+      const res = await fetch(s.url + p);
+      await res.body?.cancel();
+    }
+    const after = ADMIN_TABLES.map((n) => s.rodb.countAdminTable(n));
+    expect(after).toEqual(before);
   });
 });

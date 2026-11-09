@@ -44,6 +44,13 @@ import { sleep } from "../util.js";
 import { buildStatusPayload, statusFingerprint, toStatusItem, type StatusPayload } from "../status.js";
 import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, agentEnvFor } from "../adapters/sandcastle.js";
 import { PAGE_HTML } from "./page.js";
+import { PAGE_ADMIN_HTML } from "./admin-page.js";
+import {
+  ADMIN_TABLES,
+  ADMIN_TABLE_COLUMNS,
+  type AdminTableFilter,
+  type AdminTableName,
+} from "../db.js";
 
 export const DEFAULT_SERVE_PORT = 7466;
 export const DEFAULT_SERVE_HOST = "127.0.0.1";
@@ -76,6 +83,12 @@ export const SERVE_CSP =
  *  trees and unclaimed inbox item files. No other prefix (`archive/`, `kb/`,
  *  `proposals/`, `logs/`, store files) is ever served. */
 const ALLOWED_PREFIXES = ["items/", "inbox/"];
+
+/** Admin observation tab page size: default and hard cap
+ *  (specs/wb-serve-admin.spec.md §3). The cap is enforced server-side; the
+ *  page never asks for more. */
+export const DEFAULT_ADMIN_PAGE_ROWS = 50;
+export const MAX_ADMIN_PAGE_ROWS = 200;
 
 // ---------------------------------------------------------------- seam types
 
@@ -953,6 +966,82 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     sendJson(res, 202, { started: true, ...(r.capped !== undefined ? { capped: r.capped } : {}) });
   }
 
+  // ------------------------------------------------------------ admin
+
+  /** Admin observation (specs/wb-serve-admin.spec.md §3): the two GET
+   *  endpoints behind the `/admin` SQLite browser. Observation discipline —
+   *  byte-for-byte the same as `/api/status`, `/api/events`, and
+   *  `GET /api/items/:id`: reads go strictly through `deps.db` (the readonly
+   *  handle the app already holds; WAL keeps these reads lock-free against a
+   *  live writer). Never `acquireFactoryLock`, never a writable `FactoryDb`,
+   *  never the orchestrator, zero writes. There is no admin mutation endpoint
+   *  of any kind — non-GET on `/api/admin/*` falls through to the generic 404
+   *  (a test asserts this). */
+  function handleAdminTables(res: ServerResponse): void {
+    const tables = ADMIN_TABLES.map((name) => ({
+      name,
+      count: deps.db.countAdminTable(name),
+      columns: ADMIN_TABLE_COLUMNS[name],
+    }));
+    sendJson(res, 200, { tables });
+  }
+
+  /** Parse and validate the admin table-page query before any query runs
+   *  (all server-side, §3): a bounded `limit`, a typed cursor, and a filter
+   *  reduced to a typed shape — no raw request text ever reaches SQL. */
+  function parseAdminPageQuery(name: AdminTableName, url: URL): {
+    after: number | string | null;
+    limit: number;
+    filter?: AdminTableFilter;
+  } {
+    const limitRaw = url.searchParams.get("limit");
+    let limit = DEFAULT_ADMIN_PAGE_ROWS;
+    if (limitRaw !== null && limitRaw !== "") {
+      const n = Number(limitRaw);
+      if (!Number.isInteger(n) || n < 1 || n > MAX_ADMIN_PAGE_ROWS) {
+        throw new HttpError(400, { error: `limit must be an integer between 1 and ${MAX_ADMIN_PAGE_ROWS}` });
+      }
+      limit = n;
+    }
+    const afterRaw = url.searchParams.get("after");
+    let after: number | string | null = null;
+    if (afterRaw !== null && afterRaw !== "") {
+      if (name === "repo_locks") {
+        after = afterRaw; // any non-empty string is a repo-name cursor
+      } else {
+        const n = Number(afterRaw);
+        if (!Number.isInteger(n) || n < 0) {
+          throw new HttpError(400, { error: "after must be an integer >= 0" });
+        }
+        after = n;
+      }
+    }
+    const filterRaw = url.searchParams.get("filter");
+    let filter: AdminTableFilter | undefined;
+    if (filterRaw !== null && filterRaw.trim().length > 0) {
+      const f = filterRaw.trim();
+      let m = /^item:(\d+)$/.exec(f);
+      if (m) {
+        filter = { kind: "item", itemId: Number(m[1]) };
+      } else if (/^\d+$/.test(f)) {
+        filter = { kind: "id", id: Number(f) };
+      } else {
+        m = /^(\d+)-(\d+)$/.exec(f);
+        if (!m) throw new HttpError(400, { error: "filter must be <id>, <lo>-<hi>, or item:<id>" });
+        const lo = Number(m[1]);
+        const hi = Number(m[2]);
+        if (lo > hi) throw new HttpError(400, { error: "filter range must satisfy lo <= hi" });
+        filter = { kind: "range", lo, hi };
+      }
+    }
+    return { after, limit, ...(filter !== undefined ? { filter } : {}) };
+  }
+
+  function handleAdminTable(name: AdminTableName, url: URL, res: ServerResponse): void {
+    const page = deps.db.adminTablePage(name, parseAdminPageQuery(name, url));
+    sendJson(res, 200, { name, ...page });
+  }
+
   // ------------------------------------------------------------ routing
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -964,6 +1053,14 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     if (method === "GET" && url.pathname === "/") {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(PAGE_HTML);
+      return;
+    }
+    if (method === "GET" && url.pathname === "/admin") {
+      // Static shell markup, served exactly like `GET /` — no API guard
+      // (nothing dynamic in it), full CSP via handler(). Anything under
+      // /admin/<else> falls to the generic 404 below.
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(PAGE_ADMIN_HTML);
       return;
     }
     if (method === "GET" && url.pathname === "/api/status") {
@@ -986,6 +1083,19 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
     const dm = /^\/api\/items\/([1-9]\d*)$/.exec(url.pathname);
     if (method === "GET" && dm) {
       await handleItemDetail(Number(dm[1]), res);
+      return;
+    }
+    if (method === "GET" && url.pathname === "/api/admin/tables") {
+      handleAdminTables(res);
+      return;
+    }
+    const adminTable = /^\/api\/admin\/table\/([a-z_]+)$/.exec(url.pathname);
+    if (method === "GET" && adminTable) {
+      const name = adminTable[1] as AdminTableName;
+      if (!(ADMIN_TABLES as readonly string[]).includes(name)) {
+        throw new HttpError(404, { error: "unknown admin table" });
+      }
+      handleAdminTable(name, url, res);
       return;
     }
     if (method === "POST" && url.pathname === "/api/items") {
