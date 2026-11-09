@@ -4,7 +4,6 @@ import * as fs from "node:fs";
 import { piConfigMounts, freshAgentDir, ollamaEnv, NPM_GLOBAL_PREFIX, type PiConfigStage } from "../src/adapters/sandcastle.js";
 
 /** A stage literal is all freshAgentDir/piConfigMounts need. */
-const stage = (agentDir = "/factory/pi-config"): PiConfigStage => ({ agentDir, npmGlobalPrefixBase: null });
 
 describe("piConfigMounts", () => {
   it("with a prefix (agent mode): exactly two mounts, both writable", () => {

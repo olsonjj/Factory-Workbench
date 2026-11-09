@@ -3,7 +3,6 @@ import * as path from "node:path";
 import { existsSync } from "node:fs";
 import { createHarness, makeOrchestrator, claim, ScriptedRunner, pass, type TestHarness } from "./helpers.js";
 import { scanInbox } from "../src/inbox.js";
-import { artifactDir } from "../src/paths.js";
 import { matchAnswers } from "../src/pipeline.js";
 
 let harness: TestHarness;

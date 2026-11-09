@@ -9,7 +9,7 @@ import {
   slugForTitle,
   validateItemDraft,
 } from "../src/frontmatter.js";
-import { authorItem, buildEditorTemplate, expandRepoInput, stripEditorComments, type AuthoringIO } from "../src/new.js";
+import { authorItem, buildEditorTemplate, expandRepoInput, stripEditorComments, type AuthoringIO } from "../src/author.js";
 import { splitCommand } from "../src/prompt.js";
 
 class ScriptedIO implements AuthoringIO {

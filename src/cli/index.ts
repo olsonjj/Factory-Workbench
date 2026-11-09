@@ -11,11 +11,11 @@ import { FactoryDb } from "../db.js";
 import { acquireFactoryLock, lockHolderAlive, readLockInfo, STALE_LOCK_MS } from "../lock.js";
 import { scanInbox } from "../inbox.js";
 import { ITEM_TEMPLATE } from "../frontmatter.js";
-import { authorItem, type NewOptions } from "../new.js";
+import { authorItem, type NewOptions } from "../author.js";
 import { makeRealIO } from "../prompt.js";
 import { Orchestrator, matchAnswers } from "../pipeline.js";
 import { driveExitLine } from "../drive.js";
-import { GitBaseFreshnessChecker } from "../baseFreshness.js";
+import { GitBaseFreshnessChecker } from "../base-freshness.js";
 import { SandcastleStageRunner, GhPrPublisher, SandcastleCurator, agentEnvFor } from "../adapters/sandcastle.js";
 import { parseIntervalSeconds, startWatch, type WatchState } from "../watch.js";
 import { classifyInbox, formatAge, printStatusItems } from "../status.js";
@@ -96,7 +96,7 @@ function openAuthoringRoot(rootOverride?: string): {
   db: FactoryDb;
   release: () => void;
 } {
-  const { config, root } = loadConfig(rootOverride);
+  const { root } = loadConfig(rootOverride);
   ensureConfigFile(root);
   const paths = makePaths(root);
   ensureLayout(paths);
@@ -193,7 +193,12 @@ program
   .action(async (description: string | undefined, opts: NewOptions & { root?: string }) => {
     const { paths, db, release } = openAuthoringRoot(opts.root);
     try {
-      const result = await authorItem({ ...opts, description }, db, paths, makeRealIO());
+      const result = await authorItem(
+        { ...opts, ...(description !== undefined ? { description } : {}) },
+        db,
+        paths,
+        makeRealIO(),
+      );
       if (!result.ok) {
         console.error(result.aborted ? `aborted: ${result.reason}` : `factory: ${result.reason}`);
         nodeProcess.exit(1);

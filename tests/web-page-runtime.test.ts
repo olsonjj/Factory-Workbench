@@ -1371,7 +1371,7 @@ describe("wb serve page script (runtime behavior)", () => {
     // Stage label: the PILL carries the current stage name. Assert the pill
     // markup specifically — stageDots also renders all six stage names as
     // dotted-labels in every row, so a bare contains('implement') is vacuous.
-    expect(running).toMatch(/ring-blue-200\">implement<\/span>/);
+    expect(running).toMatch(/ring-blue-200">implement<\/span>/);
 
     // Queued row sits after the running row (attention order), all dots
     // hollow, stage label 'queued', nothing animating.
@@ -2105,7 +2105,6 @@ describe("wb serve page script (runtime behavior)", () => {
     ctx.fire("status", RUNNING_ALPHA);
     ctx.click("pulse", FLIGHT_ROW_TARGET);
     await ctx.settle((url) => (url === "/api/items/11" ? DETAIL_RESPONSE : undefined));
-    const artifactUrl = "/api/artifact?path=" + encodeURIComponent("items/alpha/artifacts/20261108-090500-001-implement.md");
     const tick = () => new Promise((r) => setTimeout(r, 10));
     // two selections in flight: A first, B second
     ctx.click("item-overlay", OVERLAY_ARTIFACT_TARGET);
@@ -2284,7 +2283,7 @@ describe("wb serve page script: interrupted drives (dead-drive observability)", 
     expect(feed.children).toHaveLength(1);
     const line = feed.children[0]!;
     expect(line.children).toHaveLength(3);
-    const [clock, event, body] = line.children as [StubElement, StubElement, StubElement];
+    const [, event, body] = line.children as [StubElement, StubElement, StubElement];
     expect(event.textContent).toBe("drive-interrupted");
     expect(event.style.color).toBe("#ea580c"); // the FEED_COLOR entry, orange
     expect(body.textContent).toContain("#27 item-27 · spec");

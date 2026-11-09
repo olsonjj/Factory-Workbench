@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { createHarness, makeOrchestrator, claim, ScriptedRunner, pass, gateFail, type TestHarness } from "./helpers.js";
+import { createHarness, makeOrchestrator, claim, ScriptedRunner, pass, type TestHarness } from "./helpers.js";
 
 let harness: TestHarness;
 afterEach(() => {

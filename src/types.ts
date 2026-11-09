@@ -1,8 +1,9 @@
 /**
  * Domain types shared across the factory.
  *
- * The StageRunner port in `runner.ts` is the one seam: everything above it
- * (state machine, gates, rework loop, parking, CLI) deals only in these types.
+ * The StageRunner port below (in this file) is the one seam: everything above
+ * it (state machine, gates, rework loop, parking, CLI) deals only in these
+ * types; one implementation per execution engine lives below it.
  */
 
 export const STAGES = [

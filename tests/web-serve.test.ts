@@ -31,7 +31,7 @@ import { ITEM_TEMPLATE, parseItemMarkdown } from "../src/frontmatter.js";
 import { classifyInbox, statusFingerprint, type StatusPayload } from "../src/status.js";
 import { STAGES, type ItemRecord, type StageRequest, type StageResult, type StageRunner } from "../src/types.js";
 import { acquireFactoryLock } from "../src/lock.js";
-import type { BaseFreshnessChecker, BaseFreshnessResult } from "../src/baseFreshness.js";
+import type { BaseFreshnessChecker, BaseFreshnessResult } from "../src/base-freshness.js";
 
 const CT = { "Content-Type": "application/json" } as const;
 const silentProceed: BaseFreshnessChecker = {

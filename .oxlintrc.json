@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  // Lint only; typechecking stays with `tsc --noEmit` (the `typeCheck`
+  // option would duplicate it). Type-aware rules run via tsgolint.
+  "plugins": ["typescript", "unicorn", "oxc"],
+  "env": { "node": true },
+  "ignorePatterns": ["dist", "factory", ".sandcastle", "pi-config"],
+  "options": {
+    "typeAware": true
+  },
+  "rules": {
+    // Async correctness rules are the reason this linter exists: lock
+    // handling, background drives, SSE writes, and the watch loop are all
+    // places where a dropped promise is a realistic failure mode.
+    "typescript/no-floating-promises": "error",
+    "typescript/no-misused-promises": "error",
+    "typescript/switch-exhaustiveness-check": "error",
+    // Deliberate, commented pattern in adapters/sandcastle.ts: non-null
+    // assertions on loop-invariant indexed access under
+    // noUncheckedIndexedAccess (e.g. `profiles[0]!.model`).
+    "typescript/no-non-null-assertion": "off"
+  }
+}

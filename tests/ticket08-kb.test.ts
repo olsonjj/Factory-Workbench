@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import * as path from "node:path";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { createHarness, makeOrchestrator, claim, ScriptedRunner, pass, gateFail, type TestHarness } from "./helpers.js";
+import { readFileSync, existsSync } from "node:fs";
+import { createHarness, makeOrchestrator, claim, ScriptedRunner, gateFail, type TestHarness } from "./helpers.js";
 import { readKbFile, projectKbFile, globalKbFile } from "../src/kb.js";
 
 let harness: TestHarness;

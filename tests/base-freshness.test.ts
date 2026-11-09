@@ -11,7 +11,7 @@ import {
   FRESHNESS_GIT_TIMEOUT_MS,
   type BaseFreshnessChecker,
   type BaseFreshnessResult,
-} from "../src/baseFreshness.js";
+} from "../src/base-freshness.js";
 import { projectKbFile } from "../src/kb.js";
 import { createHarness, makeOrchestrator, ScriptedRunner, FakePublisher, pass, type TestHarness } from "./helpers.js";
 import type { ItemRecord, StageName } from "../src/types.js";

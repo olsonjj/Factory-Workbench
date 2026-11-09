@@ -1,3 +1,11 @@
+/**
+ * `wb new` — author a work item into the inbox.
+ *
+ * Named author.ts, not new.ts: `new` is a reserved word and a module named
+ * after it forces the confusing `import ... from "./new.js"` at every call
+ * site. The export names (NewOptions, authorItem, …) stay keyed to the CLI
+ * command, which is the domain term.
+ */
 import { existsSync, statSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";

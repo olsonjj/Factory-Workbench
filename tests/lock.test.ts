@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import * as os from "node:os";
 import * as path from "node:path";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { acquireFactoryLock, FactoryBusyError } from "../src/lock.js";
 import { FactoryDb } from "../src/db.js";
 
