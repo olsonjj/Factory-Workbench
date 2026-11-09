@@ -81,6 +81,19 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .btn:disabled { cursor: default; }
   .btn-dark:disabled { background: #1c1917; }
   .btn-dark:disabled:hover { background: #1c1917; } /* suppress the hover darken */
+  /* The repo picker's mode toggles: btn + btn-out give the outline, hover
+   * tint, and pointer cursor; this sizes the button down and colors the
+   * affordance so it reads as a control, not a stray link. */
+  .btn-repo-toggle { color: #4f46e5; font-size: 12px; padding: 3px 10px; }
+  /* The inline add-repo form (Ok/Cancel) and the committed custom-repo
+   * chip — the chip's × resets the field to the picker. */
+  .repo-add-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  .repo-add-row .finput { width: auto; flex: 1; min-width: 0; }
+  .repo-add-actions { display: flex; gap: 6px; flex: none; }
+  .repo-add-actions .btn { font-size: 12px; padding: 5px 12px; }
+  .fchip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; border: 1px solid #a5b4fc; background: #eef2ff; color: #3730a3; border-radius: 9999px; padding: 4px 6px 4px 12px; font-size: 12px; }
+  .fchip .repo-chip-x { cursor: pointer; font-weight: 700; line-height: 1.1; padding: 0 6px; border-radius: 9999px; }
+  .fchip .repo-chip-x:hover { background: #c7d2fe; }
 
 /* ---- utilities: display / flex / grid / gaps ---- */
   .hidden { display: none; }
@@ -405,12 +418,21 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
           </label>
           <label class="block">
             <div class="lbl">Repository <span class="text-red-500">*</span></div>
-            <div>
-              <button type="button" id="repo-mode-new" class="block text-xs text-indigo-600 hover:underline hidden">＋ add a new repo path</button>
-              <button type="button" id="repo-mode-pick" class="block text-xs text-indigo-600 hover:underline hidden">← pick a known repo</button>
+            <select id="f-repo-select" class="finput font-mono" aria-label="known repositories"></select>
+            <div id="f-repo-chip" class="fchip hidden">
+              <span id="f-repo-chip-text" class="font-mono"></span>
+              <button type="button" id="f-repo-chip-x" class="repo-chip-x" title="clear the custom repo — back to the picker">×</button>
             </div>
-            <select id="f-repo-select" class="finput font-mono hidden" aria-label="known repositories"></select>
-            <input id="f-repo" class="finput font-mono" placeholder="repo name, Code/rel/path, ~/path, or /abs/path">
+            <div id="repo-add-row" class="repo-add-row hidden">
+              <input id="repo-add-input" class="finput font-mono" placeholder="repo name, Code/rel/path, ~/path, or /abs/path" aria-label="new repository path">
+              <div class="repo-add-actions">
+                <button type="button" id="repo-add-ok" class="btn btn-dark">Add</button>
+                <button type="button" id="repo-add-cancel" class="btn btn-out">Cancel</button>
+              </div>
+            </div>
+            <div class="mt-2">
+              <button type="button" id="repo-add-open" class="btn btn-out btn-repo-toggle">＋ Add a new repo path</button>
+            </div>
             <div class="ferr" data-err="repo"></div>
           </label>
           <label class="block">
@@ -796,58 +818,32 @@ function applyFlightCollapsed(collapsed) {
   if (btn && btn.setAttribute) btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
 }
 
-/* Repository picker — two modes over the one required field. 'pick': a
- * <select> of the payload's known repos (newest-first, option labels carry
- * a basename + per-repo item count) behind a disabled placeholder option —
- * the explicit unselected state the field resets to. 'new': the free-form
- * input whose value the server expands (~, bare known-repo name,
- * factory-root-relative, absolute — README's expansion rules, all
- * server-side). "Add a new repo path" is its own toggle link, never an
- * option inside the dropdown: the select only ever holds real repos, so a
- * mode switch can never masquerade as a picked value (the old
- * sentinel-in-the-select design left the sentinel selected after backing
- * out of add-new, and currentRepoValue() had to un-map it on submit).
- * Mode is sticky and changes only via the two toggle buttons, the one-time
- * default flip, or the empty-list autoflip; every button switch carries
- * focus to the newly revealed control, the flips never steal focus. */
-var repoFieldMode = 'new';
+/* Repository picker — one <select> of the payload's known repos
+ * (newest-first, option labels carry a basename + per-repo item count)
+ * behind a disabled placeholder option — the explicit unselected state the
+ * field resets to. "Add a new repo path" opens an inline Ok/Cancel form
+ * below the picker; Add commits the typed path as a removable chip, whose
+ * raw value the submit posts verbatim (expansion stays server-side: ~,
+ * bare known-repo name, factory-root-relative, absolute — README's
+ * expansion rules). The select only ever holds real repos, so a mode
+ * interaction can never masquerade as a picked value; the chip's × (or a
+ * Cancel) returns the field to the picker — no committed-but-invisible
+ * state. */
 var repoOptionsHtml = null;
-var repoDefaultFlipped = false;
+var repoCustomValue = '';
 
-/* \`block\` and \`hidden\` are both display utilities in this stylesheet, and
- * \`block\` wins the cascade — an element carrying both classes still renders.
- * Hiding a toggle therefore swaps the two instead of just adding \`hidden\`
- * (the both-links-visible bug). */
-function showToggle(btn) { btn.classList.remove('hidden'); btn.classList.add('block'); }
-function hideToggle(btn) { btn.classList.remove('block'); btn.classList.add('hidden'); }
+/* The field's value: a committed custom-repo chip wins; otherwise the
+ * select's value — an unselected field reads as '' (the disabled
+ * placeholder posts as an empty repo, server-side 422), never a mode
+ * token. */
+function currentRepoValue() {
+  if (repoCustomValue) return repoCustomValue;
+  return $('f-repo-select').value;
+}
 
 function repoBasename(repo) {
   var parts = String(repo).split(/[\\/]/);
   return parts[parts.length - 1];
-}
-
-function applyRepoMode(mode) {
-  repoFieldMode = mode;
-  var pick = mode === 'pick';
-  var sel = $('f-repo-select');
-  var input = $('f-repo');
-  if (pick) { sel.classList.remove('hidden'); input.classList.add('hidden'); }
-  else { sel.classList.add('hidden'); input.classList.remove('hidden'); }
-  /* Toggles: exactly one is ever visible — pick mode offers "add a new
-   * repo path"; add-new mode offers "pick a known repo" only while the
-   * list is non-empty — it can never cycle into an empty dropdown. */
-  var newBtn = $('repo-mode-new');
-  var pickBtn = $('repo-mode-pick');
-  if (pick) showToggle(newBtn); else hideToggle(newBtn);
-  var has = CURRENT && (CURRENT.knownRepos || []).length > 0;
-  if (!pick && has) showToggle(pickBtn); else hideToggle(pickBtn);
-}
-
-function currentRepoValue() {
-  /* In pick mode an unselected field reads as '' — the disabled placeholder
-   * posts as an empty repo (server-side 422), never a mode token. */
-  if (repoFieldMode === 'pick') return $('f-repo-select').value;
-  return $('f-repo').value;
 }
 
 function knownRepoListed(repo) {
@@ -876,27 +872,61 @@ function renderRepoOptions(knownRepos) {
     var keep = knownRepos.some(function (k) { return k.repo === prev; });
     sel.value = keep ? prev : '';
   }
-  /* One-time default flip: the first snapshot carrying known repos moves an
-   * untouched form to the dropdown — no focus steal (the operator may be
-   * typing elsewhere); a pre-typed input keeps add-new mode. */
-  if (!repoDefaultFlipped && knownRepos.length > 0) {
-    repoDefaultFlipped = true;
-    if (repoFieldMode === 'new' && !$('f-repo').value) applyRepoMode('pick');
-  }
-  /* Empty-list autoflip: gc/pr can shrink the derived list — pick mode with
-   * nothing to pick falls back to the input. */
-  if (repoFieldMode === 'pick' && knownRepos.length === 0) applyRepoMode('new');
-  /* Re-apply the current mode so toggle visibility matches CURRENT. */
-  applyRepoMode(repoFieldMode);
+  /* One-time default flip and empty-list autoflip are gone with the mode
+   * system: the select is always the resting control; snapshots only feed
+   * it options. */
 }
 
-$('repo-mode-new').addEventListener('click', function () {
-  applyRepoMode('new');
-  var f = $('f-repo'); if (f && f.focus) f.focus();
+/* The inline add form: open focuses its input, Ok commits a non-empty path
+ * as the chip (Enter is a commit path, Esc is a cancel path), Cancel
+ * dismisses without committing and the chip's × resets to the picker. */
+function openRepoAdd() {
+  $('repo-add-row').classList.remove('hidden');
+  var f = $('repo-add-input');
+  f.value = '';
+  if (f.focus) f.focus();
+}
+
+function closeRepoAdd() {
+  $('repo-add-row').classList.add('hidden');
+}
+
+function commitRepoValue(v) {
+  repoCustomValue = v;
+  $('f-repo-chip-text').textContent = v;
+  $('f-repo-chip').classList.remove('hidden');
+  /* The chip replaces the picker while committed — the field shows one
+   * control at a time; the × (or any reset) brings the picker back. */
+  $('f-repo-select').classList.add('hidden');
+  closeRepoAdd();
+}
+
+function clearRepoChip() {
+  repoCustomValue = '';
+  $('f-repo-chip-text').textContent = '';
+  $('f-repo-chip').classList.add('hidden');
+  $('f-repo-select').classList.remove('hidden');
+}
+
+$('repo-add-open').addEventListener('click', function () {
+  openRepoAdd();
 });
-$('repo-mode-pick').addEventListener('click', function () {
-  applyRepoMode('pick');
-  var s = $('f-repo-select'); if (s && s.focus) s.focus();
+$('repo-add-cancel').addEventListener('click', function () {
+  closeRepoAdd();
+  var b = $('repo-add-open'); if (b && b.focus) b.focus();
+});
+$('repo-add-ok').addEventListener('click', function () {
+  var v = $('repo-add-input').value.trim();
+  if (!v) { renderFieldErrors([{ field: 'repo', reason: 'repo path is required' }]); return; }
+  commitRepoValue(v);
+});
+$('repo-add-input').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter') { e.preventDefault(); var v = $('repo-add-input').value.trim(); if (v) commitRepoValue(v); }
+  else if (e.key === 'Escape') { closeRepoAdd(); var b = $('repo-add-open'); if (b && b.focus) b.focus(); }
+});
+$('f-repo-chip-x').addEventListener('click', function () {
+  clearRepoChip();
+  var b = $('repo-add-open'); if (b && b.focus) b.focus();
 });
 
 function stageDots(it) {
@@ -2251,17 +2281,16 @@ $('btn-template').addEventListener('click', function () {
         if (!$('f-title').value && fm.title) $('f-title').value = fm.title;
         if (!currentRepoValue() && fm.repo && fm.repo.indexOf('/path/to') !== 0) {
           /* Only fill an empty field, read through the canonical accessor —
-           * in pick mode the select's value IS the field's value, so a
-           * half-picked repo must not be clobbered by a prefill. Pick mode
-           * + a repo that is one of the known options: select it outright.
-           * Otherwise swap to the free-form input (no focus steal — the
-           * operator is clicking a button, not typing) and let the server
-           * expand the value. */
-          if (repoFieldMode === 'pick' && knownRepoListed(fm.repo)) {
+           * the select's value IS the field's value, so a half-picked repo
+           * must not be clobbered by a prefill. A repo that is one of the
+           * known options: select it outright. Anything else: commit it
+           * through the add-form path as the custom-repo chip (no focus
+           * steal — the operator is clicking a button, not typing; the
+           * server expands the raw value). */
+          if (knownRepoListed(fm.repo)) {
             $('f-repo-select').value = fm.repo;
           } else {
-            applyRepoMode('new');
-            $('f-repo').value = fm.repo;
+            commitRepoValue(fm.repo);
           }
         }
         if (!$('f-base').value && fm.base) $('f-base').value = fm.base;

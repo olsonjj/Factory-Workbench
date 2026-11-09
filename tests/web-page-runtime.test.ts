@@ -267,10 +267,14 @@ function makeContext() {
     /** Dispatch an element-level event (e.g. the repo select's `change`)
      * exactly like the browser does — the handler reads the element's
      * current state, so the test sets value/checked first. */
-    fireEl: (id: string, t: string) => {
+    fireEl: (id: string, t: string, ev?: { key?: string }) => {
       const el = document.getElementById(id);
       for (const fn of el.listeners.get(t) ?? []) {
-        (fn as (ev: { target: unknown }) => void)({ target: el });
+        (fn as (ev: { target: unknown; key?: string; preventDefault(): void }) => void)({
+          target: el,
+          preventDefault: () => {},
+          ...ev,
+        });
       }
     },
   };
@@ -2344,6 +2348,14 @@ const templateWith = (repo: string) => "---\ntitle: From template\nrepo: " + rep
 const focusSpy = (el: StubElement, log: string[], tag: string) => {
   el.focus = () => log.push(tag);
 };
+/** The stub never parses the served markup (see the item-overlay seeding
+ * note at ~1780), so the add form and chip's initial `hidden` state — part
+ * of the served HTML — must be seeded like a browser would render it. The
+ * runtime code then only ever toggles. */
+const seedPickerChrome = (ctx: ReturnType<typeof makeContext>) => {
+  ctx.el("repo-add-row").classList.add("hidden");
+  ctx.el("f-repo-chip").classList.add("hidden");
+};
 
 describe("wb serve page script: repository picker (runtime)", () => {
   it("builds the known-repos dropdown in payload order with escaped basename+count labels behind the unselected placeholder", async () => {
@@ -2403,81 +2415,101 @@ describe("wb serve page script: repository picker (runtime)", () => {
     expect(sel.value).toBe("");
   });
 
-  it("flips to the dropdown once on the first known-repos snapshot (no focus steal) — a pre-typed input keeps add-new mode", async () => {
+  it("the select is the starting control — no mode flips, and the first known-repos snapshot never moves focus", async () => {
     const ctx = makeContext();
     ctx.run(pageScript(PAGE_HTML));
     await ctx.settle();
+    seedPickerChrome(ctx);
     const focusLog: string[] = [];
     focusSpy(ctx.el("f-repo-select"), focusLog, "select");
-    focusSpy(ctx.el("f-repo"), focusLog, "input");
 
     ctx.fire("status", withRepos(KNOWN_REPOS));
     expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
-    expect(ctx.el("f-repo").classList.contains("hidden")).toBe(true);
-    expect(ctx.el("repo-mode-new").classList.contains("hidden")).toBe(false);
-    expect(ctx.el("repo-mode-pick").classList.contains("hidden")).toBe(true);
-    expect(focusLog).toEqual([]); // the default flip never moves focus
-
-    // Pre-typed input: the default flip is declined and never re-attempted.
-    const ctx2 = makeContext();
-    ctx2.run(pageScript(PAGE_HTML));
-    await ctx2.settle();
-    ctx2.el("f-repo").value = "typed";
-    ctx2.fire("status", withRepos(KNOWN_REPOS));
-    expect(ctx2.el("f-repo").classList.contains("hidden")).toBe(false);
-    expect(ctx2.el("f-repo-select").classList.contains("hidden")).toBe(true);
-    expect(ctx2.el("f-repo").value).toBe("typed");
-    expect(ctx2.el("repo-mode-pick").classList.contains("hidden")).toBe(false);
+    expect(ctx.el("repo-add-row").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(true);
+    expect(focusLog).toEqual([]); // snapshots never steal focus
   });
 
-  it("toggles switch modes with focus carry, backing out keeps a real selection or the placeholder, and the pick toggle hides on an empty list", async () => {
+  it("the inline add form: open carries focus, Ok and Enter commit the chip, and the chip is submitted verbatim", async () => {
     const ctx = makeContext();
     ctx.run(pageScript(PAGE_HTML));
     await ctx.settle();
+    seedPickerChrome(ctx);
     const focusLog: string[] = [];
-    focusSpy(ctx.el("f-repo"), focusLog, "input");
-    focusSpy(ctx.el("f-repo-select"), focusLog, "select");
+    focusSpy(ctx.el("repo-add-input"), focusLog, "add-input");
 
-    ctx.fire("status", withRepos(KNOWN_REPOS)); // default flip → pick mode
-    ctx.click("repo-mode-new");
-    expect(ctx.el("f-repo").classList.contains("hidden")).toBe(false);
-    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(true);
-    expect(focusLog).toEqual(["input"]);
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    ctx.click("repo-add-open");
+    expect(ctx.el("repo-add-row").classList.contains("hidden")).toBe(false);
+    expect(focusLog).toEqual(["add-input"]); // opening focuses the input
+    expect(ctx.el("repo-add-input").value).toBe(""); // each open starts clean
 
-    ctx.click("repo-mode-pick");
-    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
-    expect(ctx.el("f-repo").classList.contains("hidden")).toBe(true);
-    expect(focusLog).toEqual(["input", "select"]);
+    ctx.el("repo-add-input").value = "Code/x";
+    ctx.click("repo-add-ok");
+    expect(ctx.el("repo-add-row").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(false);
+    expect(ctx.el("f-repo-chip-text").textContent).toBe("Code/x");
 
-    // backing out never leaves a stale mode token in the select: an
-    // unselected field reads as '' (the placeholder), a real pick survives
-    ctx.el("f-repo-select").value = "/b/r2";
-    ctx.click("repo-mode-new");
-    ctx.click("repo-mode-pick");
-    expect(ctx.el("f-repo-select").value).toBe("/b/r2");
-    ctx.fire("status", withRepos([{ repo: "/a/r1", count: 2 }])); // /b/r2 vanishes
-    expect(ctx.el("f-repo-select").value).toBe("");
+    // the committed chip is the field's value — posted raw, server expands
+    ctx.el("f-title").value = "T";
+    ctx.click("btn-submit");
+    await ctx.settle((url) =>
+      url === "/api/items" ? { ok: true, status: 201, json: async () => ({ file: "f.md" }) } : undefined,
+    );
+    const [posted] = ctx.bodies("/api/items");
+    expect(posted.repo).toBe("Code/x");
 
-    // empty known-repo list: the pick toggle can never cycle into an empty
-    // dropdown — it stays hidden in add-new mode.
-    ctx.fire("status", withRepos([]));
-    expect(ctx.el("repo-mode-pick").classList.contains("hidden")).toBe(true);
-    expect(ctx.el("repo-mode-new").classList.contains("hidden")).toBe(true);
+    // a fresh open starts from a clean input (the cleared row keeps no stale text)
+    ctx.click("repo-add-open");
+    expect(ctx.el("repo-add-input").value).toBe("");
   });
 
-  it("autoflips out of pick mode when a snapshot empties the known-repo list", async () => {
+  it("the inline add form: Enter commits, Esc/Cancel dismiss, an empty Ok is declined, and the chip's × resets to the picker", async () => {
     const ctx = makeContext();
     ctx.run(pageScript(PAGE_HTML));
     await ctx.settle();
+    seedPickerChrome(ctx);
+    const focusLog: string[] = [];
+    focusSpy(ctx.el("repo-add-input"), focusLog, "add-input");
+    focusSpy(ctx.el("repo-add-open"), focusLog, "open");
 
-    ctx.fire("status", withRepos(KNOWN_REPOS)); // pick mode
-    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
-    ctx.fire("status", withRepos([])); // gc/pr shrank the derived list
-    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(true);
-    expect(ctx.el("f-repo").classList.contains("hidden")).toBe(false);
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    ctx.click("repo-add-open");
+    ctx.el("repo-add-input").value = "  ~/scratch  ";
+    ctx.fireEl("repo-add-input", "keydown", { key: "Enter" });
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(false);
+    expect(ctx.el("f-repo-chip-text").textContent).toBe("~/scratch"); // trimmed
+
+    // × resets: the chip is discarded, focus returns to the opener
+    ctx.click("f-repo-chip-x");
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("f-repo-chip-text").textContent).toBe("");
+    expect(focusLog).toEqual(["add-input", "open"]);
+
+    // Esc dismisses without committing; focus returns to the opener
+    ctx.click("repo-add-open");
+    ctx.el("repo-add-input").value = "typed-but-not-added";
+    ctx.fireEl("repo-add-input", "keydown", { key: "Escape" });
+    expect(ctx.el("repo-add-row").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(true);
+    expect(focusLog).toEqual(["add-input", "open", "add-input", "open"]);
+
+    // Cancel: same dismissal through the pointer path
+    ctx.click("repo-add-open");
+    ctx.click("repo-add-cancel");
+    expect(ctx.el("repo-add-row").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(true);
+
+    // an empty Ok is declined — the row stays open, nothing is committed
+    ctx.click("repo-add-open");
+    ctx.el("repo-add-input").value = "   ";
+    ctx.click("repo-add-ok");
+    expect(ctx.el("repo-add-row").classList.contains("hidden")).toBe(false);
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("f-repo-chip-text").textContent).toBe("");
   });
 
-  it("submits the select's value in pick mode and keeps the pick after a 201", async () => {
+  it("submits the select's value when a known repo is picked and keeps it after a 201", async () => {
     const ctx = makeContext();
     ctx.run(pageScript(PAGE_HTML));
     await ctx.settle();
@@ -2499,11 +2531,13 @@ describe("wb serve page script: repository picker (runtime)", () => {
     expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
   });
 
-  it("submits the raw free-form value in add-new mode — expansion stays server-side", async () => {
+  it("submits the raw committed chip value verbatim — expansion stays server-side", async () => {
     const ctx = makeContext();
     ctx.run(pageScript(PAGE_HTML));
     await ctx.settle();
-    ctx.el("f-repo").value = "Code/x";
+    ctx.click("repo-add-open");
+    ctx.el("repo-add-input").value = "Code/x";
+    ctx.click("repo-add-ok");
     ctx.el("f-title").value = "T";
 
     ctx.click("btn-submit");
@@ -2512,15 +2546,17 @@ describe("wb serve page script: repository picker (runtime)", () => {
     );
     const [posted] = ctx.bodies("/api/items");
     expect(posted.repo).toBe("Code/x");
+    // the chip survives the 201 (one-click next item)
+    expect(ctx.el("f-repo-chip").classList.contains("hidden")).toBe(false);
   });
 
-  it("an unselected pick-mode field posts an empty repo for the server's 422 — no mode token is ever submitted", async () => {
+  it("an unselected field posts an empty repo for the server's 422 — no mode token is ever submitted", async () => {
     const ctx = makeContext();
     ctx.run(pageScript(PAGE_HTML));
     await ctx.settle();
     ctx.fire("status", withRepos(KNOWN_REPOS));
-    // the operator backed out of add-new (or never picked): the disabled
-    // placeholder is the unselected state, and mouse users can't select it
+    // the disabled placeholder is the unselected state, and mouse users
+    // can't select it
     ctx.el("f-repo-select").value = "";
     ctx.el("f-title").value = "T";
 
@@ -2534,8 +2570,8 @@ describe("wb serve page script: repository picker (runtime)", () => {
     expect(posted.repo).toBe("");
   });
 
-  it("template prefill: selects a known repo in pick mode, swaps unknown repos into the input, never overwrites a non-empty field", async () => {
-    // known repo → selected outright in pick mode
+  it("template prefill: selects a known repo, commits an unknown repo as the chip, never overwrites a non-empty field", async () => {
+    // known repo → selected outright in the dropdown
     const ctx = makeContext();
     ctx.run(pageScript(PAGE_HTML));
     await ctx.settle();
@@ -2545,9 +2581,8 @@ describe("wb serve page script: repository picker (runtime)", () => {
       url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("/a/r1") } : undefined,
     );
     expect(ctx.el("f-repo-select").value).toBe("/a/r1");
-    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
 
-    // unknown repo → add-new mode with the raw value in the free-form input
+    // unknown repo → committed through the add-form path as the chip
     const ctx2 = makeContext();
     ctx2.run(pageScript(PAGE_HTML));
     await ctx2.settle();
@@ -2556,50 +2591,39 @@ describe("wb serve page script: repository picker (runtime)", () => {
     await ctx2.settle((url) =>
       url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("Code/x") } : undefined,
     );
-    expect(ctx2.el("f-repo").classList.contains("hidden")).toBe(false);
-    expect(ctx2.el("f-repo-select").classList.contains("hidden")).toBe(true);
-    expect(ctx2.el("f-repo").value).toBe("Code/x");
+    expect(ctx2.el("f-repo-chip").classList.contains("hidden")).toBe(false);
+    expect(ctx2.el("f-repo-chip-text").textContent).toBe("Code/x");
+    expect(ctx2.el("repo-add-row").classList.contains("hidden")).toBe(true);
+    expect(ctx2.el("f-repo-select").classList.contains("hidden")).toBe(true); // the chip replaces the picker
 
-    // a non-empty input is never overwritten
+    // a non-empty field is never overwritten
     const ctx3 = makeContext();
     ctx3.run(pageScript(PAGE_HTML));
     await ctx3.settle();
-    ctx3.el("f-repo").value = "keep-me";
+    seedPickerChrome(ctx3);
+    ctx3.el("f-repo-select").value = "/a/r1";
     ctx3.click("btn-template");
     await ctx3.settle((url) =>
-      url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("/a/r1") } : undefined,
+      url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("Code/x") } : undefined,
     );
-    expect(ctx3.el("f-repo").value).toBe("keep-me");
+    expect(ctx3.el("f-repo-select").value).toBe("/a/r1");
+    expect(ctx3.el("f-repo-chip").classList.contains("hidden")).toBe(true);
 
-    // a pick-mode selection is the field's value: a template naming a
-    // DIFFERENT known repo must not steal it (the guard reads
-    // currentRepoValue(), not the hidden input's raw value).
+    // likewise with a committed chip: it is the field's value, and a
+    // template naming a DIFFERENT repo must not steal it (the guard reads
+    // currentRepoValue()).
     const ctx4 = makeContext();
     ctx4.run(pageScript(PAGE_HTML));
     await ctx4.settle();
-    ctx4.fire("status", withRepos(KNOWN_REPOS)); // default flip → pick mode
-    ctx4.el("f-repo-select").value = "/b/r2";
+    ctx4.fire("status", withRepos(KNOWN_REPOS));
+    ctx4.click("repo-add-open");
+    ctx4.el("repo-add-input").value = "Code/keep";
+    ctx4.click("repo-add-ok");
     ctx4.click("btn-template");
     await ctx4.settle((url) =>
       url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("/a/r1") } : undefined,
     );
-    expect(ctx4.el("f-repo-select").value).toBe("/b/r2");
-    expect(ctx4.el("f-repo-select").classList.contains("hidden")).toBe(false);
-
-    // likewise for an unknown template repo: an already-picked value wins —
-    // the form does not swap to add-new mode and the selection survives.
-    const ctx5 = makeContext();
-    ctx5.run(pageScript(PAGE_HTML));
-    await ctx5.settle();
-    ctx5.fire("status", withRepos(KNOWN_REPOS));
-    ctx5.el("f-repo-select").value = "/b/r2";
-    ctx5.click("btn-template");
-    await ctx5.settle((url) =>
-      url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("Code/x") } : undefined,
-    );
-    expect(ctx5.el("f-repo-select").value).toBe("/b/r2");
-    expect(ctx5.el("f-repo-select").classList.contains("hidden")).toBe(false);
-    expect(ctx5.el("f-repo").classList.contains("hidden")).toBe(true);
-    expect(ctx5.el("f-repo").value).toBe("");
+    expect(ctx4.el("f-repo-chip-text").textContent).toBe("Code/keep");
+    expect(ctx4.el("f-repo-select").value).toBe("");
   });
 });

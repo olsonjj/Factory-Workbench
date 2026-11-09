@@ -368,25 +368,25 @@ with `Cache-Control: no-store`.
 
 Decision-desk layout (prototype variant C): pulse tiles (decisions amber /
 in flight / inbox / landed) + proportional flow bar (sub-9% segments demoted
-to a legend); the collapsible composer (title, repo picker — a two-mode
-control over the one required field: a `<select>` of the payload's known
+to a legend); the collapsible composer (title, repo picker — one required
+field over one visible control: a `<select>` of the payload's known
 repos (newest-first, option labels carry a basename + per-repo item count,
 all `esc()`-escaped, values the stored repo strings posted verbatim)
 behind a disabled `— pick a repository —` placeholder option — the
-explicit unselected state the field resets to — and the free-form input
-(`~`, bare repo name, factory-root-relative, absolute — expansion stays
-entirely server-side, unchanged); "add a new repo path" is its own toggle
-link, never an option inside the dropdown, so a mode switch can never
-masquerade as a picked value; the mode is sticky and switches only via
-the two toggle buttons (each carries focus to the newly
-revealed control), a one-time default flip (first known-repos snapshot,
-empty input — no focus steal), or an empty-list autoflip; the option
+explicit unselected state the field resets to; "add a new repo path" opens
+an inline Ok/Cancel form below the picker — Add (or Enter) commits the
+trimmed path as a removable chip whose raw value the submit posts
+verbatim (`~`, bare repo name, factory-root-relative, absolute — expansion
+stays entirely server-side, unchanged), Esc/Cancel dismiss without
+committing, and the chip's × resets the field to the picker; the option
 rebuild is change-gated and preserves an in-progress selection across
-snapshots; submit posts `currentRepoValue()` — an unselected pick posts
-as an empty repo (server-side 422), and template prefill only fills an
-empty field — emptiness is read through `currentRepoValue()`, so a pick-mode
-selection is the field's value: a known repo is selected outright in pick
-mode, anything else swaps to the free-form input — base default "main", five approval-gate checkboxes, markdown
+snapshots; submit posts `currentRepoValue()` — a committed chip wins,
+otherwise an unselected field posts as an empty repo (server-side 422),
+and template prefill only fills an empty
+field — emptiness is read through `currentRepoValue()`, so an existing
+choice (picked repo or chip) is the field's value: a known repo is
+selected outright, anything else commits through the add-form path as the
+chip — base default "main", five approval-gate checkboxes, markdown
 description, "Start from template" prefill from `/api/template`, "start processing now",
 and a file drop zone); the parking lot — one card per parked item (decision
 order: awaiting-approval, needs-human, exhausted-rework,
@@ -543,10 +543,11 @@ JSON, artifact, error, SSE) and the page's self-containment (no CDN script,
 no remote URLs) plus the Start Processing button's static markers (idle
 label, composer checkbox wording, spinner/disabled CSS, old-string absence)
 and the repo picker's static markers (the `f-repo-select` dropdown, the
-`repo-mode-new`/`repo-mode-pick`
-toggles, the singular/plural count-label logic, the free-form placeholder —
-the old datalist combobox's absence, and the sentinel mode token's absence
-from the page entirely);
+inline add form (`repo-add-open`/`repo-add-input`/`repo-add-ok`/`repo-add-cancel`) and
+its chip pieces (`f-repo-chip`/`f-repo-chip-x`), the singular/plural
+count-label logic, the add-form placeholder — the old datalist combobox's
+absence, and every mode-token (`repo-mode-*`, `__wb_new__`) absence from
+the page entirely);
 CLI entry (spawned): fresh-root refusal
 (exit 0), invalid `--port` (friendly message, exit 1), EADDRINUSE (friendly
 message, exit 1); the item detail endpoint (`GET /api/items/:id`: envelope
@@ -602,19 +603,20 @@ count labels, behind the disabled unselected placeholder and with no
 sentinel token anywhere in the dropdown; the skip-if-identical change-gate
 on the option rebuild;
 selection preservation across a composition-changed snapshot and the drop
-of a vanished selection; the one-time default flip to the dropdown without
-a focus steal and its pre-typed-input opt-out; the toggle mode
-switches with focus carry and a back-out that keeps a real selection or
-the placeholder; the empty-list autoflip and the pick toggle
-hidden while the list is empty; submit routing from both modes asserted
-through the real `postJSON` bodies — the select's value in pick mode, the
-raw free-form value in add-new mode, and an unselected pick never
-submitting a mode token (posted as an empty repo); and the
-template-prefill matrix — a known repo
-selected outright in pick mode, an unknown repo swapped into the free-form
-input, and a non-empty field never overwritten — including pick mode, where
-an already-selected repo is never displaced by a template naming a
-different or unknown repo); the item detail overlay (open from a flight row / parked card /
+of a vanished selection; snapshots never stealing focus and the one
+visible-control invariant (add row and chip closed at rest); the inline
+add form — open focusing its input, Ok/Enter committing the trimmed chip,
+Esc/Cancel dismissing with focus returned to the opener, an empty Ok
+declined in place, the chip posted verbatim through the real `postJSON`
+body, and the chip's × resetting to the picker; submit routing asserted
+through the real `postJSON` bodies — the select's value when a known repo
+is picked, the raw committed chip value verbatim, and an unselected field
+never submitting a mode token (posted as an empty repo);
+and the template-prefill matrix — a known repo
+selected outright, an unknown repo committed as the chip through the
+add-form path, and a non-empty field never overwritten — including a
+committed chip that is never displaced by a template naming a different
+or unknown repo); the item detail overlay (open from a flight row / parked card /
 glance chip / inbox row with exactly one fetch; action/control clicks never
 open it; inbox mode via the artifact route; Esc/backdrop/close dismissals
 with focus returned to the opener; an open overlay survives a live SSE

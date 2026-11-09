@@ -244,15 +244,20 @@ describe("wb serve: page, template, snapshot (CLI status contract)", () => {
     expect(PAGE_HTML).toContain('id="glance-body"');
     expect(PAGE_HTML).toContain("data-glance-summary");
     // Repo picker: a known-repos <select> (rebuilt by the runtime script
-    // behind a disabled placeholder option) plus the two mode toggles —
-    // "add a new repo path" is its own control, never an option inside the
-    // dropdown (the datalist combobox is gone, and with it the
-    // sentinel-in-the-select mode token). Option labels carry the per-repo
-    // item-count logic (escaped), and the free-form input advertises the
-    // accepted forms.
+    // behind a disabled placeholder option) plus the inline add-repo form
+    // (Ok/Cancel) and its opener button — "add a new repo path" opens the
+    // form and commits a chip; the datalist combobox is gone, and so is
+    // every sentinel-in-the-select or two-mode token. Option labels carry
+    // the per-repo item-count logic (escaped).
     expect(PAGE_HTML).toContain('id="f-repo-select"');
-    expect(PAGE_HTML).toContain('id="repo-mode-new"');
-    expect(PAGE_HTML).toContain('id="repo-mode-pick"');
+    expect(PAGE_HTML).toContain('id="repo-add-open"');
+    expect(PAGE_HTML).toContain('id="repo-add-ok"');
+    expect(PAGE_HTML).toContain('id="repo-add-cancel"');
+    expect(PAGE_HTML).toContain('id="repo-add-input"');
+    expect(PAGE_HTML).toContain('id="f-repo-chip-x"');
+    expect(PAGE_HTML).toContain('btn btn-out btn-repo-toggle');
+    expect(PAGE_HTML).not.toContain('repo-mode-new');
+    expect(PAGE_HTML).not.toContain('repo-mode-pick');
     expect(PAGE_HTML).not.toContain('__wb_new__');
     expect(PAGE_HTML).not.toContain('list="repos-dl"');
     expect(PAGE_HTML).not.toContain("<datalist");
