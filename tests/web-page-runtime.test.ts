@@ -572,6 +572,197 @@ describe("wb serve page script (runtime behavior)", () => {
     expect(ctx.el("glance").innerHTML).not.toContain("data-glance-summary");
   });
 
+  it("makes the inbox pulse tile clickable — expands the glance, scrolls to it, and focuses the first claimable chip", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    const INBOX = payload([{ id: 31, slug: "epsilon", status: "done" }], null, {
+      claimable: ["a.md", "b.md"],
+    });
+    ctx.fire("status", INBOX);
+
+    // A non-empty inbox renders the tile as a real <button> (keyboard path);
+    // a drained inbox reverts to the plain non-clickable div.
+    expect(ctx.el("pulse").innerHTML).toContain('<button type="button" data-tile-inbox');
+    const glance = ctx.el("glance");
+    expect(glance.innerHTML).toContain('id="glance-body" class="mt-3 hidden"');
+    ctx.fire("status", IDLE_PAYLOAD);
+    expect(ctx.el("pulse").innerHTML).not.toContain("data-tile-inbox");
+
+    ctx.fire("status", INBOX);
+    // Install a focus spy + chip lookup the way the Tab-trap tests install
+    // their own DOM: the stub's default querySelector returns null (the
+    // scroll/focus guards must tolerate that), so a REAL chip target proves
+    // the handler actually focuses the first claimable chip.
+    const focusLog: string[] = [];
+    const scrollLog: string[] = [];
+    glance.scrollIntoView = (opts: unknown) => scrollLog.push(JSON.stringify(opts));
+    glance.querySelector = ((sel: string) =>
+      sel === "[data-inbox-file]"
+        ? { focus: (o: unknown) => focusLog.push(JSON.stringify(o)) }
+        : null) as unknown as StubElement["querySelector"];
+
+    // Collapsed → click the tile → expanded + scrolled + first chip focused.
+    ctx.syncGlanceBodyFromMarkup();
+    expect(ctx.el("glance-body").classList.contains("hidden")).toBe(true);
+    ctx.click("pulse", {
+      closest: (sel: string) => (sel === "button[data-tile-inbox]" ? { attributes: {} } : null),
+    });
+    expect(ctx.el("glance-body").classList.contains("hidden")).toBe(false);
+    expect(scrollLog).toEqual(['{"behavior":"smooth","block":"start"}']);
+    expect(focusLog).toEqual(['{"preventScroll":true}']);
+
+    // The expansion survives the NEXT payload re-render (glanceCollapsed is
+    // the single source of truth — same sticky guarantee as the summary toggle).
+    ctx.fire("status", INBOX);
+    expect(ctx.el("glance").innerHTML).toContain('id="glance-body" class="mt-3"');
+    expect(ctx.el("glance").innerHTML).toContain('aria-expanded="true"');
+
+    // An unrelated pulse click (a flight row) must not re-trigger the tile path.
+    ctx.click("pulse", { closest: () => null });
+    expect(focusLog).toHaveLength(1);
+  });
+
+  it("caps glance chips at the newest 10 with a More… control that expands and restores", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    // 14 landed items: only the newest 10 render; the summary count still
+    // says the whole truth (14 landed).
+    const BACKLOG = payload(
+      Array.from({ length: 14 }, (_, i) => ({ id: i + 1, slug: "s" + (i + 1), stage: "pr", status: "done" })),
+      null,
+    );
+    ctx.fire("status", BACKLOG);
+    let html = ctx.el("glance").innerHTML;
+    expect(html).toContain("14 landed");
+    expect(html).toContain('#14 s14');   // newest leads
+    expect(html).not.toContain('#4 s4'); // 11th item is below the cap
+    expect(html).toContain('data-glance-more');
+    expect(html).toContain("More… (4 older)");
+    expect(html).not.toContain("data-glance-less");
+
+    // More… reveals the rest: every chip renders, the control flips to the
+    // restore direction (the just-clicked button is replaced by the
+    // re-render — one-shot by design).
+    ctx.click("glance", { closest: (sel: string) => (sel === "button[data-glance-more]" ? { attributes: {} } : null) });
+    html = ctx.el("glance").innerHTML;
+    expect(html).toContain('#4 s4');
+    expect(html).toContain('#1 s1');
+    expect(html).not.toContain("data-glance-more");
+    expect(html).toContain("data-glance-less");
+    expect(html).toContain("show the newest 10 only");
+
+    // The expansion is sticky across payload re-renders (glanceShowAll is
+    // the single source of truth, same guarantee as the collapse state).
+    ctx.fire("status", BACKLOG);
+    expect(ctx.el("glance").innerHTML).toContain('#1 s1');
+    expect(ctx.el("glance").innerHTML).toContain("data-glance-less");
+
+    // The restore control drops back to the recency window.
+    ctx.click("glance", { closest: (sel: string) => (sel === "button[data-glance-less]" ? { attributes: {} } : null) });
+    html = ctx.el("glance").innerHTML;
+    expect(html).not.toContain('#4 s4');
+    expect(html).toContain('#14 s14');
+    expect(html).toContain("data-glance-more");
+    // The click that hit neither the window controls nor the summary button
+    // is ignored (no state flip).
+    ctx.click("glance", { closest: () => null });
+    expect(ctx.el("glance").innerHTML).toContain("data-glance-more");
+  });
+
+  it("caps only landed chips at exactly the boundary — 10 done renders no window control", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    // Strict '>': exactly GLANCE_CAP landed items means capped stays false —
+    // no More…, nothing hidden.
+    const TEN = payload(
+      Array.from({ length: 10 }, (_, i) => ({ id: i + 1, slug: "s" + (i + 1), stage: "pr", status: "done" })),
+      null,
+    );
+    ctx.fire("status", TEN);
+    const html = ctx.el("glance").innerHTML;
+    expect(html).toContain("10 landed");
+    expect(html).toContain("#1 s1");
+    expect(html).not.toContain("data-glance-more");
+    expect(html).not.toContain("data-glance-less");
+  });
+
+  it("never caps running/queued chips — a long-running item below 10 newer landed items still flashes", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    // Item #2 runs through a long stage while #3–#14 land: 12 landed + 1
+    // running. The cap keeps the newest 10 done chips but #2's chip must
+    // still exist — the RUNNING-pill flash queries it by data-item-id, and
+    // dropping it would silently no-op the affordance (reviewer finding 1).
+    const LONG_RUN = payload(
+      [
+        { id: 2, slug: "slow-runner", stage: "build", status: "running" },
+        ...Array.from({ length: 12 }, (_, i) => ({ id: i + 3, slug: "s" + (i + 3), stage: "pr", status: "done" })),
+      ],
+      { alive: true, pid: 7, ageMs: 1000 },
+    );
+    ctx.fire("status", LONG_RUN);
+    const html = ctx.el("glance").innerHTML;
+    expect(html).toContain('#2 slow-runner'); // live chip escapes the cap
+    expect(html).toContain('data-item-id="2"'); // flash target resolvable
+    expect(html).not.toContain('#4 s4');        // 11th landed item is below the cap
+    expect(html).toContain("More… (2 older)");
+  });
+
+  it("tolerates a stale inbox-tile click after the inbox drained between snapshots (documented guard)", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", payload([], null, { claimable: ["a.md"] }));
+    expect(ctx.el("pulse").innerHTML).toContain("data-tile-inbox");
+
+    // The inbox drains (Run claims the file) before the user's click lands:
+    // the tile is now a plain div, and the glance re-rendered to the empty
+    // state. The stale delegated click must still be a safe no-op — expand
+    // applies to nothing, chip focus is conditional, nothing throws.
+    ctx.fire("status", IDLE_PAYLOAD);
+    expect(ctx.el("pulse").innerHTML).not.toContain("data-tile-inbox");
+    expect(ctx.el("glance").innerHTML).toContain("no items in flight");
+    expect(() =>
+      ctx.click("pulse", {
+        closest: (sel: string) => (sel === "button[data-tile-inbox]" ? { attributes: {} } : null),
+      }),
+    ).not.toThrow();
+    expect(ctx.el("glance").innerHTML).toContain("no items in flight");
+  });
+
+  it("orders the glance chips newest-first so the recently-landed work leads", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    // db.listItems feeds the payload ascending by id (oldest first); the
+    // chip render must reverse it — the top of a 26-done backlog is the
+    // interesting end.
+    const BACKLOG = payload(
+      [
+        { id: 11, slug: "alpha", stage: "pr", status: "done" },
+        { id: 13, slug: "gamma", stage: "review", status: "done" },
+        { id: 14, slug: "delta", stage: "build", status: "running" },
+        { id: 12, slug: "beta", stage: "pr", status: "done" },
+      ],
+      null,
+    );
+    ctx.fire("status", BACKLOG);
+    const html = ctx.el("glance").innerHTML;
+    expect(html.indexOf('#14 delta')).toBeLessThan(html.indexOf('#13 gamma'));
+    expect(html.indexOf('#13 gamma')).toBeLessThan(html.indexOf('#12 beta'));
+    expect(html.indexOf('#12 beta')).toBeLessThan(html.indexOf('#11 alpha'));
+  });
+
   it("keeps the inbox-unreadable error row visible outside the collapsible body", async () => {
     const ctx = makeContext();
     ctx.run(pageScript(PAGE_HTML));
@@ -1786,9 +1977,16 @@ describe("wb serve page script (runtime behavior)", () => {
     // focus target and no Enter/Space path — finding 5)
     expect(ctx.el("pulse").innerHTML).toContain('<button type="button" data-flight-row="11"');
     expect(ctx.el("glance").innerHTML).toContain('<button type="button" data-item-id="11"');
-    // an unclaimed inbox row is a button too
+    // an unclaimed inbox row is a button too — with ATTENTION styling (solid
+    // indigo accent, shadow). The old dashed/50%-white/gray look read as
+    // disabled, which is exactly why claimable specs went unnoticed; pin the
+    // accent classes so a regression back to muted fails here.
     ctx.fire("status", payload([], null, { claimable: ["a.md"] }));
     expect(ctx.el("glance").innerHTML).toContain('<button type="button" data-inbox-file="a.md"');
+    expect(ctx.el("glance").innerHTML).toContain("border-indigo-300 bg-indigo-50");
+    expect(ctx.el("glance").innerHTML).toContain("text-indigo-800 shadow-sm");
+    expect(ctx.el("glance").innerHTML).not.toContain("border-dashed border-ink-300");
+    expect(ctx.el("glance").innerHTML).not.toContain("bg-white/50");
     // a parked card carries a Details button (the card itself must stay a
     // div — it nests the note/reject inputs)
     const PARKED = payload(
