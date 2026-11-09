@@ -2787,6 +2787,32 @@ describe("wb serve admin page script (runtime behavior)", () => {
     await ctx.settle(adminRespond());
   });
 
+  it("boots through malformed deep links (?filter=%, ?tab=%zz) — a decode failure never aborts the script", async () => {
+    // Regression (rework feedback / KB 2026-11-09 failed gate): the URL bar
+    // and crafted links are user input too; decodeURIComponent('%') and
+    // ('%zz') throw URIError, and an uncaught throw in the boot path left
+    // the whole page inert. safeDecode must fall back to the raw string so
+    // an undecodable value simply fails validation and falls to defaults.
+    const withFilter = runAdminPage("?filter=%"); // runAdminPage throws if boot throws
+    expect(withFilter.el("admin-tabs").innerHTML).toContain('data-tab="sqlite"');
+    expect(withFilter.replaceStateCalls).toEqual([
+      "/admin?tab=sqlite&table=items&filter=%25",
+    ]);
+    // The undecodable filter survives raw: the page hands '%' to the server
+    // verbatim (percent-encoded as %25) for the grammar check to 400 —
+    // exactly one page fetch, still on the items default.
+    expect(withFilter.countRequests("/api/admin/table/items?limit=50&filter=%25")).toBe(1);
+    await withFilter.settle(adminRespond());
+    expect(withFilter.el("admin-grid").innerHTML).toContain("normal-slug");
+
+    const withTab = runAdminPage("?tab=%zz"); // no throw here either
+    expect(withTab.el("admin-tabs").innerHTML).toContain('data-tab="sqlite"');
+    expect(withTab.replaceStateCalls).toEqual(["/admin?tab=sqlite&table=items"]);
+    expect(withTab.countRequests("/api/admin/tables")).toBe(1);
+    expect(withTab.countRequests("/api/admin/table/items?limit=50")).toBe(1);
+    await withTab.settle(adminRespond());
+  });
+
   it("renders every DB value escaped — hostile payloads stay inert", async () => {
     const ctx = runAdminPage("?table=items");
     await ctx.settle(adminRespond());

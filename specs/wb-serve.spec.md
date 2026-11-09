@@ -668,7 +668,10 @@ the ` — item requeued (last holder pid …)` / `(holder unknown)` detail
 clause). The admin page's inline script (`PAGE_ADMIN_HTML`) runs through the
 same harness (the stub gains a minimal `location`/`history.replaceState`):
 the tab strip renders and activates the SQLite tab (unknown tab deep link →
-sqlite), the table strip renders live counts and marks the active table with
+sqlite), malformed deep links (`?filter=%`, `?tab=%zz`) boot without an
+uncaught exception (decode failures fall back to the raw string and the
+page falls to the sqlite/items defaults), the table strip renders live
+counts and marks the active table with
 exactly one counts fetch + one page fetch per activation, every rendered DB
 value stays escaped against hostile fixtures (a `<script>`-bearing detail, a
 markup-bearing slug — raw markup absent from the grid), JSON columns

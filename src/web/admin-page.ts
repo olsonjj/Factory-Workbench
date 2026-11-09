@@ -129,6 +129,17 @@ function esc(s) {
   });
 }
 
+/* decodeURIComponent throws URIError on malformed percent-encoding
+ * (a stray '%' or '%zz'), and an uncaught throw in the boot path would
+ * abort the whole script and leave the page inert. Never assume only
+ * self-generated URLs reach the parser — the URL bar and crafted links
+ * are user input too. On failure fall back to the raw (still-encoded)
+ * string so an undecodable value simply fails tab/table lookup or the
+ * server-side filter grammar and falls to defaults. */
+function safeDecode(s) {
+  try { return decodeURIComponent(s.replace(/\\+/g, ' ')); } catch (e) { return s; }
+}
+
 /* Minimal location.search parser (no URLSearchParams dependency): returns a
  * plain object of decoded key -> decoded value (last write wins, which is
  * fine for this page's single-valued keys). */
@@ -142,8 +153,8 @@ function readSearch() {
     var eq = parts[i].indexOf('=');
     var k = eq < 0 ? parts[i] : parts[i].slice(0, eq);
     var v = eq < 0 ? '' : parts[i].slice(eq + 1);
-    k = decodeURIComponent(k.replace(/\\+/g, ' '));
-    v = decodeURIComponent(v.replace(/\\+/g, ' '));
+    k = safeDecode(k);
+    v = safeDecode(v);
     out[k] = v;
   }
   return out;

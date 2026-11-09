@@ -229,6 +229,13 @@ constraints, not style):
   - SQLite tab state: `table=<name>` (default `items`; unknown → `items`),
     `after=<cursor>` (page cursor, default absent = page 1),
     `filter=<expr>` (default absent).
+  - Decoding is defensive: the URL bar and crafted links are user input,
+    and `decodeURIComponent` throws `URIError` on malformed
+    percent-encoding — an uncaught throw in the boot path would abort the
+    whole script. `safeDecode` wraps the call and falls back to the raw
+    (still-encoded) string, so an undecodable value simply fails
+    tab/table lookup or the server-side filter grammar and falls to
+    defaults (regression tested with `?filter=%` and `?tab=%zz`).
   - Every state change (table click, next-page click, filter submit, tab
     switch) writes the full parameter set back with
     `history.replaceState` — refresh restores the exact inspection session
@@ -356,7 +363,10 @@ filter box submit issues one GET with the expected query string and a 400
 renders the escaped inline error; table/cursor/tab clicks call
 `history.replaceState` with the full parameter set; refresh simulation
 (re-run the script with the populated `location.search`) restores
-tab/table/cursor/filter and re-issues the matching fetches.
+tab/table/cursor/filter and re-issues the matching fetches; malformed deep
+links (`?filter=%`, `?tab=%zz`) boot without an uncaught exception — the
+parser falls back to the raw string and the page falls to sqlite/items
+defaults.
 
 ### Spec-lockstep
 
