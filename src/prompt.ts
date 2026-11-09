@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, rmSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { stamp } from "./util.js";
-import { stripEditorComments, type AuthoringIO } from "./new.js";
+import { stripEditorComments, type AuthoringIO } from "./author.js";
 
 async function promptLine(question: string): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });

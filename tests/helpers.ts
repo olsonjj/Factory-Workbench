@@ -6,7 +6,7 @@ import { makePaths, type FactoryPaths } from "../src/paths.js";
 import { loadConfig, type FactoryConfig } from "../src/config.js";
 import { scanInbox } from "../src/inbox.js";
 import { Orchestrator, type PrPublishRequest, type PrPublisher } from "../src/pipeline.js";
-import type { BaseFreshnessChecker, BaseFreshnessResult } from "../src/baseFreshness.js";
+import type { BaseFreshnessChecker, BaseFreshnessResult } from "../src/base-freshness.js";
 import type { CuratorRunner, PrPublishResult, StageRequest, StageResult, StageRunner } from "../src/types.js";
 
 export interface TestHarness {

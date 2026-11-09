@@ -7,7 +7,7 @@ import type { FactoryPaths } from "./paths.js";
 import { artifactDir, itemDir } from "./paths.js";
 import type { FactoryConfig } from "./config.js";
 import { parseItemMarkdown } from "./frontmatter.js";
-import type { BaseFreshnessChecker, BaseFreshnessResult } from "./baseFreshness.js";
+import type { BaseFreshnessChecker, BaseFreshnessResult } from "./base-freshness.js";
 import { appendEntry, chunkKbLayer, globalKbFile, kbDigestIndex, loadKbSnapshot, projectKbFile, readKbFile, repoSlug, type KbDigestIndex } from "./kb.js";
 import { stamp } from "./util.js";
 
@@ -867,8 +867,8 @@ export class Orchestrator {
       approvals: item.approvals,
       body,
       ...(spec ? { spec } : {}),
-      feedback: item.feedback ?? undefined,
-      answers: answers.length > 0 ? answers : undefined,
+      ...(item.feedback !== undefined && item.feedback !== null ? { feedback: item.feedback } : {}),
+      ...(answers.length > 0 ? { answers } : {}),
       branchName: item.branchName,
     };
   }

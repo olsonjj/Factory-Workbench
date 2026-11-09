@@ -36,9 +36,9 @@ import { driveExitLine } from "../drive.js";
 import type { CuratorRunner, ItemRecord, StageRunner } from "../types.js";
 import type { PrPublisher } from "../pipeline.js";
 import { ITEM_TEMPLATE, parseApprovalsInput } from "../frontmatter.js";
-import { authorItem, expandRepoInput, validateRepoPath, type AuthoringIO } from "../new.js";
+import { authorItem, expandRepoInput, validateRepoPath, type AuthoringIO } from "../author.js";
 import { scanInbox } from "../inbox.js";
-import { GitBaseFreshnessChecker, type BaseFreshnessChecker } from "../baseFreshness.js";
+import { GitBaseFreshnessChecker, type BaseFreshnessChecker } from "../base-freshness.js";
 import { parseIntervalSeconds } from "../watch.js";
 import { sleep } from "../util.js";
 import { buildStatusPayload, statusFingerprint, toStatusItem, type StatusPayload } from "../status.js";
@@ -492,7 +492,7 @@ export function createServeApp(deps: ServeAppDeps): ServeApp {
           sleep,
           baseCheck: baseCheck !== undefined ? baseCheck : new GitBaseFreshnessChecker(),
           interruptedDrive: { lastHolderPid: preLock?.pid ?? null },
-          maxResumeTicks: deps.maxResumeTicks,
+          ...(deps.maxResumeTicks !== undefined ? { maxResumeTicks: deps.maxResumeTicks } : {}),
         });
         // The claim pass belongs to run/resume (the openFactory-equivalent),
         // never to serve startup or per-item actions.

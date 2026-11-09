@@ -655,10 +655,14 @@ Return your verdict as JSON inside a <test>...</test> tag:
         report: v.report,
         feedback: v.report,
         lesson: v.lesson ?? v.report,
-        fix: v.fix ?? undefined,
+        ...(v.fix != null ? { fix: v.fix } : {}),
       };
     }
-    return { outcome: "pass", artifacts: [{ name: "test-report", content: v.report }], fix: v.fix ?? undefined };
+    return {
+      outcome: "pass",
+      artifacts: [{ name: "test-report", content: v.report }],
+      ...(v.fix != null ? { fix: v.fix } : {}),
+    };
   }
 
   private async runReview(req: StageRequest, model: string, wt: Worktree): Promise<StageResult> {
@@ -698,7 +702,7 @@ Return your verdict as JSON inside a <test>...</test> tag:
             ? v.fix ?? v.findings
             : `review profile "${gate.name}" failed the review gate:\n${v.fix ?? v.findings}`,
           lesson: v.lesson ?? v.findings,
-          fix: v.fix ?? undefined,
+          ...(v.fix != null ? { fix: v.fix } : {}),
           usage: singleGate ? { model: gateModel } : { model: profiles[0]!.model, profiles },
         };
       }
@@ -708,7 +712,7 @@ Return your verdict as JSON inside a <test>...</test> tag:
       return {
         outcome: "pass",
         artifacts,
-        prSummary: lastVerdict?.prSummary ?? undefined,
+        ...(lastVerdict?.prSummary != null ? { prSummary: lastVerdict.prSummary } : {}),
         usage: { model: profiles[0]!.model },
       };
     }
@@ -723,7 +727,7 @@ Return your verdict as JSON inside a <test>...</test> tag:
       outcome: "pass",
       artifacts: [...artifacts, { name: "review-verdict", content: combined }],
       report: combined,
-      prSummary: lastVerdict?.prSummary ?? undefined,
+      ...(lastVerdict?.prSummary != null ? { prSummary: lastVerdict.prSummary } : {}),
       usage: { model: profiles[0]!.model, profiles },
     };
   }

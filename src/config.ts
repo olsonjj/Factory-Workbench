@@ -4,12 +4,16 @@ import { z } from "zod";
 
 export interface StageModels {
   default: string;
-  triage?: string;
-  spec?: string;
-  implement?: string;
-  test?: string;
-  review?: string;
-  curate?: string;
+  // `| undefined`: these come from zod `.optional()` fields, whose inferred
+  // type includes explicit undefined — legal to pass under
+  // exactOptionalPropertyTypes (absent and "present but undefined" are both
+  // meaningful here only as "use the default").
+  triage?: string | undefined;
+  spec?: string | undefined;
+  implement?: string | undefined;
+  test?: string | undefined;
+  review?: string | undefined;
+  curate?: string | undefined;
 }
 
 export interface Budgets {
@@ -45,9 +49,9 @@ export interface ReviewGate {
   /** Unique, non-empty lens name ("quality"/"performance" built in; unknown names legal and built from a generic lens). */
   name: string;
   /** Optional model override; defaults to models.review then models.default. */
-  model?: string;
+  model?: string | undefined;
   /** Appended verbatim to the built-in prompt as its own section (KB-lesson channel). */
-  extraInstructions?: string;
+  extraInstructions?: string | undefined;
 }
 
 export interface ReviewConfig {
@@ -61,7 +65,7 @@ export interface FactoryConfig {
   models: StageModels;
   agent: AgentConfig;
   /** Multi-profile review gates (ticket 11). Absent ⇒ one implicit "quality" gate. */
-  review?: ReviewConfig;
+  review?: ReviewConfig | undefined;
   budgets: Budgets;
   sandbox: SandboxConfig;
   kb: KbConfig;
