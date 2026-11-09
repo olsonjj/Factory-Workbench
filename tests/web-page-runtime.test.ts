@@ -117,6 +117,10 @@ function makeContext() {
     // The live feed builds its rows with createElement (appendFeed).
     createElement: () => makeStubElement(),
     querySelector: () => null,
+    // Document-level selector sweeps (clearFieldErrors' `.ferr` pass, the
+    // 201-reset's `.approval-cb:checked`) — empty: the stub has no parsed
+    // DOM, and no runtime test needs those elements cleared.
+    querySelectorAll: () => [],
     addEventListener: (t: string, fn: (ev: unknown) => void) => {
       const fns = documentListeners.get(t) ?? [];
       fns.push(fn);
@@ -162,9 +166,13 @@ function makeContext() {
 
   const fetches: Array<{ url: string; resolve: (r: unknown) => void }> = [];
   const requestLog: string[] = []; // every fetch call, ever — survives settle()'s drain
-  const fetch = (url: string) =>
+  /** Every request body string the page handed fetch (URL → body), for the
+   * composer submit-routing asserts. */
+  const bodyLog: Array<{ url: string; body?: string }> = [];
+  const fetch = (url: string, init?: { body?: string }) =>
     new Promise((resolve) => {
       requestLog.push(url);
+      bodyLog.push({ url, body: init?.body });
       fetches.push({ url, resolve });
     });
 
@@ -249,6 +257,22 @@ function makeContext() {
     /** Total fetches ever issued for a URL (the no-double-fire guard needs
      * the cumulative count — the pending queue drains on settle). */
     totalRequests: (url: string) => requestLog.filter((u: string) => u === url).length,
+    /** The JSON-parsed bodies POSTed to a URL, oldest first — the composer
+     * contract is asserted through the real postJSON call, not by
+     * re-reading input stubs. */
+    bodies: (url: string) =>
+      bodyLog
+        .filter((b) => b.url === url && b.body !== undefined)
+        .map((b) => JSON.parse(b.body!)),
+    /** Dispatch an element-level event (e.g. the repo select's `change`)
+     * exactly like the browser does — the handler reads the element's
+     * current state, so the test sets value/checked first. */
+    fireEl: (id: string, t: string) => {
+      const el = document.getElementById(id);
+      for (const fn of el.listeners.get(t) ?? []) {
+        (fn as (ev: { target: unknown }) => void)({ target: el });
+      }
+    },
   };
 }
 
@@ -2301,5 +2325,243 @@ describe("wb serve page script: interrupted drives (dead-drive observability)", 
     });
     expect(feed.children).toHaveLength(2);
     expect(feed.children[1]!.children[2]!.textContent).toContain(" — item requeued (holder unknown)");
+  });
+});
+
+/** The repo picker's known-repos fixtures — payload order IS the dropdown
+ * order (the server delivers newest-first via knownReposNewestFirst). */
+const KNOWN_REPOS = [
+  { repo: "/a/r1", count: 2 },
+  { repo: "/b/r2", count: 1 },
+];
+/** A status payload variant carrying known repos (payload() hard-codes the
+ * default-mode `knownRepos: []`, so repo-picker tests spread it). */
+const withRepos = (repos: unknown[]) => ({ ...IDLE_PAYLOAD, knownRepos: repos });
+/** /api/template front-matter response body for the prefill matrix. */
+const templateWith = (repo: string) => "---\ntitle: From template\nrepo: " + repo + "\n---\nBody";
+/** Focus spy — the page guards every focus carry with `if (x && x.focus)`,
+ * so installing one on a stub element turns the guard into an assertion. */
+const focusSpy = (el: StubElement, log: string[], tag: string) => {
+  el.focus = () => log.push(tag);
+};
+
+describe("wb serve page script: repository picker (runtime)", () => {
+  it("builds the known-repos dropdown in payload order with escaped basename+count labels and the sentinel last", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle(); // initial paint: idle payload, add-new mode
+
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    const html = ctx.el("f-repo-select").innerHTML;
+    expect(html).toContain('<option value="/a/r1">r1 (2 items)</option>');
+    expect(html).toContain('<option value="/b/r2">r2 (1 item)</option>');
+    // newest-first = payload order, and the sentinel trails the list
+    expect(html.indexOf("/a/r1")).toBeLessThan(html.indexOf("/b/r2"));
+    expect(html.indexOf("__wb_new__")).toBeGreaterThan(html.indexOf("/b/r2"));
+    expect(html.endsWith('<option value="__wb_new__">➕ add a new repo path…</option>')).toBe(true);
+
+    // Hostile repo string: both the value and the basename label are esc()'d.
+    ctx.fire("status", withRepos([{ repo: '/x/r"q<r', count: 1 }]));
+    expect(ctx.el("f-repo-select").innerHTML).toContain(
+      '<option value="/x/r&quot;q&lt;r">r&quot;q&lt;r (1 item)</option>',
+    );
+  });
+
+  it("change-gates the option rebuild — identical snapshots write nothing, a changed list does", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    const sel = ctx.el("f-repo-select");
+    const writes = sel.innerHTMLWrites;
+    ctx.fire("status", withRepos(KNOWN_REPOS)); // byte-identical composition
+    expect(sel.innerHTMLWrites).toBe(writes);
+    expect(sel.innerHTML).toContain("/b/r2");
+    // one repo gone → the rebuild fires
+    ctx.fire("status", withRepos([{ repo: "/a/r1", count: 2 }]));
+    expect(sel.innerHTMLWrites).toBe(writes + 1);
+    expect(sel.innerHTML).not.toContain("/b/r2");
+  });
+
+  it("preserves the operator's in-progress selection across a changed snapshot", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    const sel = ctx.el("f-repo-select");
+    sel.value = "/b/r2";
+    // counts changed (fresh innerHTML on a real <select> resets selection)
+    ctx.fire("status", withRepos([{ repo: "/a/r1", count: 2 }, { repo: "/b/r2", count: 3 }]));
+    expect(sel.innerHTML).toContain("r2 (3 items)");
+    expect(sel.value).toBe("/b/r2");
+    // a selection that no longer exists is dropped, not silently submitted
+    ctx.fire("status", withRepos([{ repo: "/a/r1", count: 2 }]));
+    expect(sel.value).toBe("");
+  });
+
+  it("flips to the dropdown once on the first known-repos snapshot (no focus steal) — a pre-typed input keeps add-new mode", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    const focusLog: string[] = [];
+    focusSpy(ctx.el("f-repo-select"), focusLog, "select");
+    focusSpy(ctx.el("f-repo"), focusLog, "input");
+
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
+    expect(ctx.el("f-repo").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("repo-mode-new").classList.contains("hidden")).toBe(false);
+    expect(ctx.el("repo-mode-pick").classList.contains("hidden")).toBe(true);
+    expect(focusLog).toEqual([]); // the default flip never moves focus
+
+    // Pre-typed input: the default flip is declined and never re-attempted.
+    const ctx2 = makeContext();
+    ctx2.run(pageScript(PAGE_HTML));
+    await ctx2.settle();
+    ctx2.el("f-repo").value = "typed";
+    ctx2.fire("status", withRepos(KNOWN_REPOS));
+    expect(ctx2.el("f-repo").classList.contains("hidden")).toBe(false);
+    expect(ctx2.el("f-repo-select").classList.contains("hidden")).toBe(true);
+    expect(ctx2.el("f-repo").value).toBe("typed");
+    expect(ctx2.el("repo-mode-pick").classList.contains("hidden")).toBe(false);
+  });
+
+  it("toggles and sentinel switch modes with focus carry — and the pick toggle hides on an empty list", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    const focusLog: string[] = [];
+    focusSpy(ctx.el("f-repo"), focusLog, "input");
+    focusSpy(ctx.el("f-repo-select"), focusLog, "select");
+
+    ctx.fire("status", withRepos(KNOWN_REPOS)); // default flip → pick mode
+    ctx.click("repo-mode-new");
+    expect(ctx.el("f-repo").classList.contains("hidden")).toBe(false);
+    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(true);
+    expect(focusLog).toEqual(["input"]);
+
+    ctx.click("repo-mode-pick");
+    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
+    expect(ctx.el("f-repo").classList.contains("hidden")).toBe(true);
+    expect(focusLog).toEqual(["input", "select"]);
+
+    // the sentinel option is a mode switch, not a value
+    ctx.el("f-repo-select").value = "__wb_new__";
+    ctx.fireEl("f-repo-select", "change");
+    expect(ctx.el("f-repo").classList.contains("hidden")).toBe(false);
+    expect(focusLog).toEqual(["input", "select", "input"]);
+
+    // empty known-repo list: the pick toggle can never cycle into an empty
+    // dropdown — it stays hidden in add-new mode.
+    ctx.fire("status", withRepos([]));
+    expect(ctx.el("repo-mode-pick").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("repo-mode-new").classList.contains("hidden")).toBe(true);
+  });
+
+  it("autoflips out of pick mode when a snapshot empties the known-repo list", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+
+    ctx.fire("status", withRepos(KNOWN_REPOS)); // pick mode
+    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
+    ctx.fire("status", withRepos([])); // gc/pr shrank the derived list
+    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(true);
+    expect(ctx.el("f-repo").classList.contains("hidden")).toBe(false);
+  });
+
+  it("submits the select's value in pick mode and keeps the pick after a 201", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    ctx.el("f-repo-select").value = "/b/r2";
+    ctx.el("f-title").value = "T";
+
+    ctx.click("btn-submit");
+    expect(ctx.countRequests("/api/items")).toBe(1);
+    await ctx.settle((url) => {
+      if (url === "/api/items") return { ok: true, status: 201, json: async () => ({ file: "inbox/x.md" }) };
+      if (url === "/api/status") return { ok: true, status: 200, json: async () => withRepos(KNOWN_REPOS) };
+      return undefined;
+    });
+    const [posted] = ctx.bodies("/api/items");
+    expect(posted.repo).toBe("/b/r2");
+    // 201 success leaves the repo control alone (one-click next item)
+    expect(ctx.el("f-repo-select").value).toBe("/b/r2");
+    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
+  });
+
+  it("submits the raw free-form value in add-new mode — expansion stays server-side", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    ctx.el("f-repo").value = "Code/x";
+    ctx.el("f-title").value = "T";
+
+    ctx.click("btn-submit");
+    await ctx.settle((url) =>
+      url === "/api/items" ? { ok: true, status: 201, json: async () => ({ file: "f.md" }) } : undefined,
+    );
+    const [posted] = ctx.bodies("/api/items");
+    expect(posted.repo).toBe("Code/x");
+  });
+
+  it("never submits the sentinel — it posts as an empty repo for the server's 422", async () => {
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    ctx.fire("status", withRepos(KNOWN_REPOS));
+    ctx.el("f-repo-select").value = "__wb_new__";
+    ctx.el("f-title").value = "T";
+
+    ctx.click("btn-submit");
+    await ctx.settle((url) =>
+      url === "/api/items"
+        ? { ok: true, status: 422, json: async () => ({ errors: [{ field: "repo", reason: "repo is required" }] }) }
+        : undefined,
+    );
+    const [posted] = ctx.bodies("/api/items");
+    expect(posted.repo).toBe("");
+  });
+
+  it("template prefill: selects a known repo in pick mode, swaps unknown repos into the input, never overwrites a non-empty field", async () => {
+    // known repo → selected outright in pick mode
+    const ctx = makeContext();
+    ctx.run(pageScript(PAGE_HTML));
+    await ctx.settle();
+    ctx.fire("status", withRepos([{ repo: "/a/r1", count: 2 }]));
+    ctx.click("btn-template");
+    await ctx.settle((url) =>
+      url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("/a/r1") } : undefined,
+    );
+    expect(ctx.el("f-repo-select").value).toBe("/a/r1");
+    expect(ctx.el("f-repo-select").classList.contains("hidden")).toBe(false);
+
+    // unknown repo → add-new mode with the raw value in the free-form input
+    const ctx2 = makeContext();
+    ctx2.run(pageScript(PAGE_HTML));
+    await ctx2.settle();
+    ctx2.fire("status", withRepos([{ repo: "/a/r1", count: 2 }]));
+    ctx2.click("btn-template");
+    await ctx2.settle((url) =>
+      url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("Code/x") } : undefined,
+    );
+    expect(ctx2.el("f-repo").classList.contains("hidden")).toBe(false);
+    expect(ctx2.el("f-repo-select").classList.contains("hidden")).toBe(true);
+    expect(ctx2.el("f-repo").value).toBe("Code/x");
+
+    // a non-empty input is never overwritten
+    const ctx3 = makeContext();
+    ctx3.run(pageScript(PAGE_HTML));
+    await ctx3.settle();
+    ctx3.el("f-repo").value = "keep-me";
+    ctx3.click("btn-template");
+    await ctx3.settle((url) =>
+      url === "/api/template" ? { ok: true, status: 200, text: async () => templateWith("/a/r1") } : undefined,
+    );
+    expect(ctx3.el("f-repo").value).toBe("keep-me");
   });
 });

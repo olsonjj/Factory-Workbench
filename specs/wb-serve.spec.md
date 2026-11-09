@@ -368,9 +368,21 @@ with `Cache-Control: no-store`.
 
 Decision-desk layout (prototype variant C): pulse tiles (decisions amber /
 in flight / inbox / landed) + proportional flow bar (sub-9% segments demoted
-to a legend); the collapsible composer (title, repo combobox — free-form
-input plus a known-repos datalist whose option labels carry per-repo item
-counts, newest-first — base default "main", five approval-gate checkboxes, markdown
+to a legend); the collapsible composer (title, repo picker — a two-mode
+control over the one required field: a `<select>` of the payload's known
+repos (newest-first, option labels carry a basename + per-repo item count,
+all `esc()`-escaped, values the stored repo strings posted verbatim)
+ending in a `➕ add a new repo path…` sentinel, and the free-form input
+(`~`, bare repo name, factory-root-relative, absolute — expansion stays
+entirely server-side, unchanged); the mode is sticky and switches only via
+the two toggle buttons or the sentinel (each carries focus to the newly
+revealed control), a one-time default flip (first known-repos snapshot,
+empty input — no focus steal), or an empty-list autoflip; the option
+rebuild is change-gated and preserves an in-progress selection across
+snapshots; submit posts `currentRepoValue()` — the sentinel posts as an
+empty repo (server-side 422), and template prefill only fills an empty
+field — a known repo is selected outright in pick mode, anything else
+swaps to the free-form input — base default "main", five approval-gate checkboxes, markdown
 description, "Start from template" prefill from `/api/template`, "start processing now",
 and a file drop zone); the parking lot — one card per parked item (decision
 order: awaiting-approval, needs-human, exhausted-rework,
@@ -525,7 +537,11 @@ wrong-port / absent Host and mismatched Origin on `/api/*` → 403 while the
 static page is served regardless; the strict CSP on every response (page,
 JSON, artifact, error, SSE) and the page's self-containment (no CDN script,
 no remote URLs) plus the Start Processing button's static markers (idle
-label, composer checkbox wording, spinner/disabled CSS, old-string absence);
+label, composer checkbox wording, spinner/disabled CSS, old-string absence)
+and the repo picker's static markers (the `f-repo-select` dropdown, the
+`__wb_new__` sentinel option, the `repo-mode-new`/`repo-mode-pick`
+toggles, the singular/plural count-label logic, the free-form placeholder —
+and the old datalist combobox's absence);
 CLI entry (spawned): fresh-root refusal
 (exit 0), invalid `--port` (friendly message, exit 1), EADDRINUSE (friendly
 message, exit 1); the item detail endpoint (`GET /api/items/:id`: envelope
@@ -575,7 +591,19 @@ state, and the Start Processing button's label/disabled/tooltip lifecycle
 (idle → live-lock `Processing…` with spinner and the stop tooltip → stale
 and idle re-enable), its no-double-fire guard while disabled (zero
 `POST /api/run` entries), and the 202 toast copy (plain and capped
-suffix); the item detail overlay (open from a flight row / parked card /
+suffix); the repository picker (option build in payload order — escaped
+basename + singular/plural count labels, the `➕ add a new repo path…`
+sentinel last; the skip-if-identical change-gate on the option rebuild;
+selection preservation across a composition-changed snapshot and the drop
+of a vanished selection; the one-time default flip to the dropdown without
+a focus steal and its pre-typed-input opt-out; the toggle/sentinel mode
+switches with focus carry; the empty-list autoflip and the pick toggle
+hidden while the list is empty; submit routing from both modes asserted
+through the real `postJSON` bodies — the select's value in pick mode, the
+raw free-form value in add-new mode, and the sentinel never submitting
+(posted as an empty repo); and the template-prefill matrix — a known repo
+selected outright in pick mode, an unknown repo swapped into the free-form
+input, and a non-empty field never overwritten); the item detail overlay (open from a flight row / parked card /
 glance chip / inbox row with exactly one fetch; action/control clicks never
 open it; inbox mode via the artifact route; Esc/backdrop/close dismissals
 with focus returned to the opener; an open overlay survives a live SSE

@@ -243,9 +243,16 @@ describe("wb serve: page, template, snapshot (CLI status contract)", () => {
     // tests/web-page-runtime.test.ts).
     expect(PAGE_HTML).toContain('id="glance-body"');
     expect(PAGE_HTML).toContain("data-glance-summary");
-    // Combobox: the known-repos datalist options carry a per-repo item-count
-    // label (escaped), and the repo input advertises the accepted forms.
-    expect(PAGE_HTML).toContain("repos-dl");
+    // Repo picker: a known-repos <select> ending in the "add a new repo
+    // path" sentinel plus the two mode toggles (the datalist combobox is
+    // gone). Option labels carry the per-repo item-count logic (escaped),
+    // and the free-form input advertises the accepted forms.
+    expect(PAGE_HTML).toContain('id="f-repo-select"');
+    expect(PAGE_HTML).toContain('<option value="__wb_new__">');
+    expect(PAGE_HTML).toContain('id="repo-mode-new"');
+    expect(PAGE_HTML).toContain('id="repo-mode-pick"');
+    expect(PAGE_HTML).not.toContain('list="repos-dl"');
+    expect(PAGE_HTML).not.toContain("<datalist");
     expect(PAGE_HTML).toContain("k.count === 1 ? ' item' : ' items'");
     expect(PAGE_HTML).toContain("placeholder=\"repo name, Code/rel/path, ~/path, or /abs/path\"");
     // Start Processing button: the renamed label, the renamed composer

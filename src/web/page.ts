@@ -405,8 +405,12 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
           </label>
           <label class="block">
             <div class="lbl">Repository <span class="text-red-500">*</span></div>
-            <input id="f-repo" class="finput font-mono" list="repos-dl" placeholder="repo name, Code/rel/path, ~/path, or /abs/path">
-            <datalist id="repos-dl"></datalist>
+            <div>
+              <button type="button" id="repo-mode-new" class="block text-xs text-indigo-600 hover:underline hidden">＋ add a new repo path</button>
+              <button type="button" id="repo-mode-pick" class="block text-xs text-indigo-600 hover:underline hidden">← pick a known repo</button>
+            </div>
+            <select id="f-repo-select" class="finput font-mono hidden" aria-label="known repositories"></select>
+            <input id="f-repo" class="finput font-mono" placeholder="repo name, Code/rel/path, ~/path, or /abs/path">
             <div class="ferr" data-err="repo"></div>
           </label>
           <label class="block">
@@ -603,7 +607,7 @@ function render(p) {
    * fast-finished drive) — either way the Run button must come back. */
   if (runInFlight && flightAwaited && !flightPending) clearRunFlight();
   renderPulse(p);
-  renderDatalist(p.knownRepos || []);
+  renderRepoOptions(p.knownRepos || []);
   renderParking(p);
   renderGlance(p);
   renderRunState(p);
@@ -792,17 +796,100 @@ function applyFlightCollapsed(collapsed) {
   if (btn && btn.setAttribute) btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
 }
 
-/* Dropdown options carry a per-repo item-count label. Chromium/WebKit
- * surface option labels; Firefox shows values only — acceptable, since the
- * value (the absolute known-repo path) is the pick data and free-form entry
- * keeps working regardless. */
-function renderDatalist(knownRepos) {
-  var dl = $('repos-dl');
-  dl.innerHTML = knownRepos.map(function (k) {
-    var label = k.count > 0 ? (k.count + (k.count === 1 ? ' item' : ' items')) : '';
-    return '<option value="' + esc(k.repo) + '">' + esc(label) + '</option>';
-  }).join('');
+/* Repository picker — two modes over the one required field. 'pick': a
+ * <select> of the payload's known repos (newest-first, option labels carry
+ * a basename + per-repo item count) ending in the "add a new repo path…"
+ * sentinel. 'new': the free-form input whose value the server expands
+ * (~, bare known-repo name, factory-root-relative, absolute — README's
+ * expansion rules, all server-side). Mode is sticky and changes only via
+ * the two toggle buttons, the sentinel option, the one-time default flip,
+ * or the empty-list autoflip; every button/sentinel switch carries focus
+ * to the newly revealed control, the flips never steal focus. */
+var repoFieldMode = 'new';
+var repoOptionsHtml = null;
+var repoDefaultFlipped = false;
+
+function repoBasename(repo) {
+  var parts = String(repo).split(/[\\/]/);
+  return parts[parts.length - 1];
 }
+
+function applyRepoMode(mode) {
+  repoFieldMode = mode;
+  var pick = mode === 'pick';
+  var sel = $('f-repo-select');
+  var input = $('f-repo');
+  if (pick) { sel.classList.remove('hidden'); input.classList.add('hidden'); }
+  else { sel.classList.add('hidden'); input.classList.remove('hidden'); }
+  /* Toggles: pick mode offers "add a new repo path"; add-new mode offers
+   * "pick a known repo" only while the list is non-empty — it can never
+   * cycle into an empty dropdown. */
+  var newBtn = $('repo-mode-new');
+  var pickBtn = $('repo-mode-pick');
+  if (pick) newBtn.classList.remove('hidden'); else newBtn.classList.add('hidden');
+  var has = CURRENT && (CURRENT.knownRepos || []).length > 0;
+  if (!pick && has) pickBtn.classList.remove('hidden'); else pickBtn.classList.add('hidden');
+}
+
+function currentRepoValue() {
+  if (repoFieldMode === 'pick') {
+    var v = $('f-repo-select').value;
+    return v === '__wb_new__' ? '' : v;   // the sentinel is a mode switch, never a value
+  }
+  return $('f-repo').value;
+}
+
+function knownRepoListed(repo) {
+  return !!(CURRENT && (CURRENT.knownRepos || []).some(function (k) { return k.repo === repo; }));
+}
+
+/* Options are rebuilt only on fingerprint-changed status events (never on
+ * the 1s clock), and the skip-if-identical gate makes repeated snapshots do
+ * zero DOM writes — the renderParking guard pattern. */
+function renderRepoOptions(knownRepos) {
+  knownRepos = knownRepos || [];
+  var html = knownRepos.map(function (k) {
+    var label = repoBasename(k.repo) + (k.count > 0 ? ' (' + k.count + (k.count === 1 ? ' item' : ' items') + ')' : '');
+    return '<option value="' + esc(k.repo) + '">' + esc(label) + '</option>';
+  }).join('') + '<option value="__wb_new__">➕ add a new repo path…</option>';
+  var sel = $('f-repo-select');
+  if (html !== repoOptionsHtml) {
+    repoOptionsHtml = html;
+    /* A fresh innerHTML on a real <select> resets the selection — restore
+     * the operator's previous pick when it survives the new list so a live
+     * snapshot never erases a half-completed form. */
+    var prev = sel.value;
+    sel.innerHTML = html;
+    var keep = prev === '__wb_new__' || knownRepos.some(function (k) { return k.repo === prev; });
+    sel.value = keep ? prev : '';
+  }
+  /* One-time default flip: the first snapshot carrying known repos moves an
+   * untouched form to the dropdown — no focus steal (the operator may be
+   * typing elsewhere); a pre-typed input keeps add-new mode. */
+  if (!repoDefaultFlipped && knownRepos.length > 0) {
+    repoDefaultFlipped = true;
+    if (repoFieldMode === 'new' && !$('f-repo').value) applyRepoMode('pick');
+  }
+  /* Empty-list autoflip: gc/pr can shrink the derived list — pick mode with
+   * nothing to pick falls back to the input. */
+  if (repoFieldMode === 'pick' && knownRepos.length === 0) applyRepoMode('new');
+  /* Re-apply the current mode so toggle visibility matches CURRENT. */
+  applyRepoMode(repoFieldMode);
+}
+
+$('repo-mode-new').addEventListener('click', function () {
+  applyRepoMode('new');
+  var f = $('f-repo'); if (f && f.focus) f.focus();
+});
+$('repo-mode-pick').addEventListener('click', function () {
+  applyRepoMode('pick');
+  var s = $('f-repo-select'); if (s && s.focus) s.focus();
+});
+$('f-repo-select').addEventListener('change', function () {
+  if ($('f-repo-select').value !== '__wb_new__') return;
+  applyRepoMode('new');
+  var f = $('f-repo'); if (f && f.focus) f.focus();
+});
 
 function stageDots(it) {
   /* Queued rows (the in-flight panel) render all six dots hollow — a queued
@@ -2116,7 +2203,7 @@ $('btn-submit').addEventListener('click', function () {
   document.querySelectorAll('.approval-cb:checked').forEach(function (cb) { approvals.push(cb.value); });
   var body = {
     title: $('f-title').value,
-    repo: $('f-repo').value,
+    repo: currentRepoValue(),
     base: $('f-base').value || 'main',
     approvals: approvals,
     description: $('f-desc').value,
@@ -2154,7 +2241,18 @@ $('btn-template').addEventListener('click', function () {
           if (m) fm[m[1]] = m[2];
         });
         if (!$('f-title').value && fm.title) $('f-title').value = fm.title;
-        if (!$('f-repo').value && fm.repo && fm.repo.indexOf('/path/to') !== 0) $('f-repo').value = fm.repo;
+        if (!$('f-repo').value && fm.repo && fm.repo.indexOf('/path/to') !== 0) {
+          /* Only fill an empty field. Pick mode + a repo that is one of the
+           * known options: select it outright. Otherwise swap to the
+           * free-form input (no focus steal — the operator is clicking a
+           * button, not typing) and let the server expand the value. */
+          if (repoFieldMode === 'pick' && knownRepoListed(fm.repo)) {
+            $('f-repo-select').value = fm.repo;
+          } else {
+            applyRepoMode('new');
+            $('f-repo').value = fm.repo;
+          }
+        }
         if (!$('f-base').value && fm.base) $('f-base').value = fm.base;
         if (fm.approvals) {
           var inner = fm.approvals.replace(/#.*$/, '').replace(/^[\\[]+/, '').replace(/[\\]]+$/, '').trim();
