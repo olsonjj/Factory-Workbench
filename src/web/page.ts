@@ -386,9 +386,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
 </header>
 
 <main class="max-w-3xl mx-auto px-4 pb-24">
-  <div id="pulse" class="pt-4"></div>
-
-  <div class="mt-5">
+  <div class="pt-4">
     <div class="rounded-2xl border-2 border-dashed border-indigo-300 bg-white shadow-sm overflow-hidden">
       <button id="composer-toggle" class="w-full flex items-center justify-between px-5 py-3 hover:bg-indigo-50/50 transition-colors">
         <span class="flex items-center gap-2">
@@ -445,6 +443,8 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
       </div>
     </div>
   </div>
+
+  <div id="pulse" class="mt-5"></div>
 
   <div id="parking-lot" class="mt-8"></div>
   <div id="glance" class="mt-10"></div>
