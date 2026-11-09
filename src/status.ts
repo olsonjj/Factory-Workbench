@@ -152,7 +152,12 @@ export function isParkedStatus(status: string): boolean {
     !(TERMINAL_STATUSES as readonly string[]).includes(status);
 }
 
-function toStatusItem(item: ItemRecord, artifactsByItem: ReadonlyMap<number, { name: string; stage: StageName | null; path: string; createdAt: string }[]>): StatusItem {
+/** The `ItemRecord` → `StatusItem` serializer shared by `buildStatusPayload`
+ *  and the web detail endpoint (`GET /api/items/:id`): an `ItemRecord` plus at
+ *  most the three derived fields (artifacts/prUrl/questions — see
+ *  `StatusItem`). Exported for the detail route; `buildStatusPayload`'s output
+ *  and `statusFingerprint` are untouched by this. */
+export function toStatusItem(item: ItemRecord, artifactsByItem: ReadonlyMap<number, { name: string; stage: StageName | null; path: string; createdAt: string }[]>): StatusItem {
   const out: StatusItem = { ...item };
   if (item.status === "awaiting-approval") {
     // The parked stage's artifacts — "read the spec before approving".
