@@ -210,6 +210,12 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .whitespace-pre-wrap { white-space: pre-wrap; }
   .underline { text-decoration: underline; }
   .underline-offset-2 { text-underline-offset: 2px; }
+/* Fix 2 (reviewer): missing text-left utility — buttons default to centered
+ * text in the UA stylesheet; the page preflight resets font/color/background
+ * only. Both the clickable inbox tile and the data-flight-row cards relied
+ * on this class without it existing, visibly centering their content in
+ * Chrome/Safari. */
+  .text-left { text-align: left; }
   .text-center { text-align: center; }
   .tabular-nums { font-variant-numeric: tabular-nums; }
 
@@ -230,6 +236,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .text-amber-950 { color: #451a03; }
   .text-blue-500 { color: #3b82f6; }
   .text-blue-700 { color: #1d4ed8; }
+  .text-indigo-800 { color: #3730a3; }
   .text-emerald-500 { color: #10b981; }
   .text-emerald-600 { color: #059669; }
   .text-emerald-700 { color: #047857; }
@@ -267,6 +274,7 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .bg-fuchsia-100 { background-color: #fae8ff; }
   .bg-fuchsia-500 { background-color: #d946ef; }
   .bg-indigo-50 { background-color: #eef2ff; }
+  .bg-indigo-100 { background-color: #e0e7ff; }
   .bg-indigo-600 { background-color: #4f46e5; }
   .bg-orange-50 { background-color: #fff7ed; }
   .bg-orange-100 { background-color: #ffedd5; }
@@ -361,6 +369,9 @@ input::placeholder, textarea::placeholder { color: #a8a29e; opacity: 1; }
   .hover\\:\\!bg-red-700:hover { background-color: #b91c1c !important; }
   .hover\\:bg-indigo-700:hover { background-color: #4338ca; }
   .hover\\:bg-indigo-50\\/50:hover { background-color: rgba(238, 242, 255, 0.5); }
+  .hover\\:bg-indigo-100:hover { background-color: #e0e7ff; }
+  .hover\\:bg-ink-100:hover { background-color: #f5f5f4; }
+  .hover\\:text-ink-700:hover { color: #57534e; }
 </style>
 </head>
 <body class="bg-paper text-ink-900">
@@ -598,13 +609,25 @@ function render(p) {
   renderRunState(p);
 }
 
-function tile(accent, big, small, title, sub) {
-  return '<div class="rounded-xl border border-ink-200 bg-white shadow-sm p-4 pl-5 relative overflow-hidden">' +
+function tile(accent, big, small, title, sub, clickable) {
+  /* The inbox tile is the operator's only "a number, but no way to act on
+   * it" surface — when the inbox is non-empty it renders as a real
+   * <button> (keyboard path, see the glance-summary note) that expands the
+   * glance section where the claimable spec chips live. Same card look, plus
+   * the standard hover affordance shared with the other clickable rows. */
+  var open = '<div class="rounded-xl border border-ink-200 bg-white shadow-sm p-4 pl-5 relative overflow-hidden">';
+  var close = '</div>';
+  if (clickable) {
+    open = '<button type="button" data-tile-inbox title="review the inbox specs — expands Factory at a glance" ' +
+      'class="rounded-xl border border-ink-200 bg-white shadow-sm p-4 pl-5 relative overflow-hidden text-left cursor-pointer hover:bg-indigo-50/50 transition-colors">';
+    close = '</button>';
+  }
+  return open +
     '<div class="absolute left-0 top-0 bottom-0 w-1 ' + accent + '"></div>' +
     '<div class="text-3xl font-bold tabular-nums leading-none ' + accent.replace('bg-', 'text-') + '">' + big +
     (small ? '<span class="text-sm font-medium text-ink-400"> ' + small + '</span>' : '') + '</div>' +
     '<div class="text-xs font-semibold text-ink-700 mt-1.5">' + esc(title) + '</div>' +
-    '<div class="text-[10px] text-ink-400 uppercase tracking-wide">' + esc(sub) + '</div></div>';
+    '<div class="text-[10px] text-ink-400 uppercase tracking-wide">' + esc(sub) + '</div>' + close;
 }
 
 function renderPulse(p) {
@@ -616,7 +639,7 @@ function renderPulse(p) {
    * it belongs — the flow bar's done segment (below) and the glance chips
    * (unchanged). Accent colors stay attached to their tiles. */
   var html = '<div class="grid grid-cols-3 gap-3">' +
-    tile('bg-ink-400', c.inbox, '', 'inbox', 'awaiting claim') +
+    tile('bg-ink-400', c.inbox, '', 'inbox', 'awaiting claim', c.inbox > 0) +
     tile('bg-blue-500', c.running, '+ ' + c.queued, 'in flight', 'running + queued') +
     tile('bg-amber-400', c.decisions, '', 'waiting on you', 'decisions pending') +
     '</div>';
@@ -652,11 +675,18 @@ function renderPulse(p) {
    * renderRunState pattern): capture BEFORE the write — activeElement is
    * already <body> the moment innerHTML is replaced — then restore to the
    * new summary button so Enter/Space keep toggling without a Tab-back. */
-  var hadFlightFocus = !!(document.activeElement && document.activeElement.closest &&
-    document.activeElement.closest('button[data-flight-summary]'));
+  var focusSel = null;
+  var activeEl = document.activeElement;
+  if (activeEl && activeEl.closest) {
+    // Reviewer finding 3: the inbox tile is a second focusable the ~2s SSE
+    // re-render can destroy — carry focus for it exactly like the flight
+    // summary (which keeps its restore path below).
+    if (activeEl.closest('button[data-tile-inbox]')) focusSel = 'button[data-tile-inbox]';
+    else if (activeEl.closest('button[data-flight-summary]')) focusSel = 'button[data-flight-summary]';
+  }
   $('pulse').innerHTML = html + bar + flightPanelHtml(p);
-  if (hadFlightFocus) {
-    var fbtn = $('pulse').querySelector('button[data-flight-summary]');
+  if (focusSel) {
+    var fbtn = $('pulse').querySelector(focusSel);
     if (fbtn && fbtn.focus) fbtn.focus();
   }
 }
@@ -993,9 +1023,38 @@ function renderParking(p) {
   applyDrafts(captured);
 }
 
+/* Glance chip cap (recency window): the default render keeps only the
+ * newest GLANCE_CAP landed chips — with a 26-done backlog the tail is
+ * landed history nobody scans, and every chip costs a line of wrap.
+ * Running/queued chips are NEVER capped (see the partition note inside
+ * renderGlance). "More…" below reveals the rest in one click (no
+ * pagination: payloads are small and the overlay fetches per item
+ * anyway); "show the newest N only" restores the window. glanceShowAll is
+ * sticky for the session — payload re-renders re-derive from it, the same
+ * single-writer pattern as glanceCollapsed. */
+var GLANCE_CAP = 10;
+var glanceShowAll = false;
+
 function renderGlance(p) {
-  var glance = p.items.filter(function (it) { return it.status === 'running' || it.status === 'queued' || it.status === 'done'; });
-  var chips = glance.map(function (it) {
+  /* Newest first: the operator reviews recency — the just-landed PRs are the
+   * interesting end of a 26-done backlog, and db.listItems feeds payloads
+   * ascending by id (oldest first), which buried them at the end. */
+  var glance = p.items.filter(function (it) { return it.status === 'running' || it.status === 'queued' || it.status === 'done'; })
+    .sort(function (a, b) { return b.id - a.id; });
+  /* Reviewer finding 1 — live work escapes the cap: running/queued chips
+   * render unconditionally, because the #26 RUNNING-pill flash affordance
+   * queries chips by data-item-id, and a long-running item (#2, say) can
+   * easily sit below 10 newer landed items — capping it would silently
+   * no-op the flash the pill promises. The cap applies to done only (it
+   * exists for landed history); the merged list keeps the newest-first
+   * order (live work leads, then the landed window). Live work is always
+   * few — the cap would never fit more than a couple of live chips anyway.
+   */
+  var live = glance.filter(function (it) { return it.status !== 'done'; });
+  var landed = glance.filter(function (it) { return it.status === 'done'; });
+  var capped = !glanceShowAll && landed.length > GLANCE_CAP;
+  var visible = live.concat(capped ? landed.slice(0, GLANCE_CAP) : landed);
+  var chips = visible.map(function (it) {
     var hint = '';
     if (it.status === 'queued' && it.parkedReason === 'stale-base' && it.parkedDetail && it.parkedDetail.repo) {
       hint = '<span class="text-ink-400" title="stale base: ' + esc(it.parkedDetail.base) + ' is behind origin/' + esc(it.parkedDetail.base) + '">⚑ git pull in ' + esc(it.parkedDetail.repo) + '</span>';
@@ -1005,16 +1064,38 @@ function renderGlance(p) {
       pr = '<a href="' + esc(it.prUrl) + '" target="_blank" rel="noopener" class="text-emerald-700 underline underline-offset-2">PR' +
         (it.prDraft ? ' (draft)' : '') + '</a>';
     }
-    return '<button type="button" data-item-id="' + it.id + '" class="inline-flex items-center gap-2 rounded-full border border-ink-200 bg-white px-3 py-1.5 text-xs shadow-sm cursor-pointer" title="view detail">' +
+    /* Two-tier chip styling: running/queued are live work — the active white
+     * chip; done is landed history — muted gray so the recency sort (newest
+     * first) reads as "fading into the past" and the indigo inbox chips stay
+     * the loudest thing in the section. The PR link keeps its own color. */
+    var chipCls = it.status === 'done'
+      ? 'inline-flex items-center gap-2 rounded-full border border-ink-100 bg-ink-100/70 px-3 py-1.5 text-xs text-ink-500 cursor-pointer hover:bg-ink-100 transition-colors'
+      : 'inline-flex items-center gap-2 rounded-full border border-ink-200 bg-white px-3 py-1.5 text-xs shadow-sm cursor-pointer hover:bg-indigo-50/50 transition-colors';
+    return '<button type="button" data-item-id="' + it.id + '" class="' + chipCls + '" title="view detail">' +
       '<span class="h-1.5 w-1.5 rounded-full ' + (STATUS_DOT[it.status] || 'bg-ink-300') + (it.status === 'running' ? ' animate-pulse' : '') + '"></span>' +
       '<span class="font-medium">#' + it.id + ' ' + esc(it.slug) + '</span>' +
       '<span class="text-ink-400">' + esc(it.stage || '') + '</span>' + hint + '</button>' + pr;
   }).join('');
+  /* Chip-window control — a plain text button under the chips. Static words
+   * + numbers only (no untrusted data), the same esc-free rule as the
+   * summary segments. The click handler swaps glanceShowAll and re-renders
+   * from CURRENT — no fetch, no server change. */
+  var moreCtl = '';
+  if (capped) {
+    var hiddenN = landed.length - GLANCE_CAP;
+    moreCtl = '<div class="mt-2"><button type="button" data-glance-more title="show the remaining ' + hiddenN + ' older items" class="text-xs text-ink-500 underline underline-offset-2 cursor-pointer hover:text-ink-700">More… (' + hiddenN + ' older)</button></div>';
+  } else if (glanceShowAll && landed.length > GLANCE_CAP) {
+    moreCtl = '<div class="mt-2"><button type="button" data-glance-less title="drop back to the newest ' + GLANCE_CAP + ' items" class="text-xs text-ink-500 underline underline-offset-2 cursor-pointer hover:text-ink-700">show the newest ' + GLANCE_CAP + ' only</button></div>';
+  }
   var inbox = (p.inbox.claimable || []).map(function (f) {
     /* A real <button>: the detail overlay's inbox entry point must be
      * reachable by keyboard (Greptile PR-32 finding 5) — a bare div with a
-     * hover cursor had no focus target and no Enter/Space path. */
-    return '<button type="button" data-inbox-file="' + esc(f) + '" class="rounded-md border border-dashed border-ink-300 bg-white/50 px-2.5 py-1 text-xs font-mono text-ink-500 cursor-pointer" title="view this inbox file">📄 ' + esc(f) + '</button>';
+     * hover cursor had no focus target and no Enter/Space path.
+     * Attention styling, not muted: indigo accent + solid border + shadow —
+     * the OLD dashed/50%-white/gray look read as disabled, which is exactly
+     * why the claimable specs went unnoticed. The muted look now belongs to
+     * the landed chips (below), the low-interest end of the glance. */
+    return '<button type="button" data-inbox-file="' + esc(f) + '" class="inline-flex items-center gap-2 rounded-full border border-indigo-300 bg-indigo-50 px-3 py-1.5 text-xs font-medium text-indigo-800 shadow-sm cursor-pointer hover:bg-indigo-100 transition-colors" title="review this unclaimed spec">📄 ' + esc(f) + '</button>';
   }).join('');
   var skipped = (p.inbox.alreadyClaimed || []).map(function (s) {
     return '<div class="text-[11px] text-ink-400">⚠ ' + esc(s.file) + ' will be skipped — slug already claimed (#' + s.item.id + ', ' + esc(s.item.status) + ')</div>';
@@ -1023,10 +1104,18 @@ function renderGlance(p) {
    * empty state) — a failure that was always visible pre-collapse must not
    * hide behind display:none when the section is collapsed. */
   var errorRow = p.inbox.error ? '<div class="text-[11px] text-red-600">inbox unreadable: ' + esc(p.inbox.error) + '</div>' : '';
-  /* Keyboard focus carried across the innerHTML replacement: if the summary
-   * button itself was focused when a payload re-render replaced it, restore
-   * focus to the new button (Enter/Space keep toggling without re-navigation). */
-  var hadFocus = !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('button[data-glance-summary]'));
+  /* Keyboard focus carried across the innerHTML replacement (Greptile PR-33
+   * finding): the summary button AND the chip-window controls are all
+   * focusables a payload re-render can destroy — capture which one was
+   * focused BEFORE the write, restore to the new twin after (Enter/Space
+   * keep working without a Tab-back from <body>). */
+  var focusSel = null;
+  var activeEl = document.activeElement;
+  if (activeEl && activeEl.closest) {
+    if (activeEl.closest('button[data-glance-summary]')) focusSel = 'button[data-glance-summary]';
+    else if (activeEl.closest('button[data-glance-more]')) focusSel = 'button[data-glance-more]';
+    else if (activeEl.closest('button[data-glance-less]')) focusSel = 'button[data-glance-less]';
+  }
   var runningCount = 0, queuedCount = 0, doneCount = 0;
   glance.forEach(function (it) {
     if (it.status === 'running') runningCount++;
@@ -1063,13 +1152,14 @@ function renderGlance(p) {
     '</button>' +
     '<div id="glance-body" class="mt-3' + (glanceCollapsed ? ' hidden' : '') + '">' +
     '<div class="flex flex-wrap gap-2">' + chips + '</div>' +
+    moreCtl +
     ((inbox || skipped) ? '<div class="mt-4 flex flex-wrap gap-2">' + inbox + '</div><div class="mt-2 space-y-0.5">' + skipped + '</div>' : '') +
     '</div>' +
     errorRow +
     '</div>';
-  if (hadFocus) {
-    var summary = $('glance').querySelector('button[data-glance-summary]');
-    if (summary && summary.focus) summary.focus();
+  if (focusSel) {
+    var restore = $('glance').querySelector(focusSel);
+    if (restore && restore.focus) restore.focus();
   }
 }
 
@@ -1276,6 +1366,27 @@ $('glance').addEventListener('click', function (ev) {
     applyGlanceCollapsed(!glanceCollapsed);
     return;
   }
+  // Chip-window controls: "More…" reveals the capped older chips, "show the
+  // newest 10 only" restores the default. renderGlance(CURRENT) repaints
+  // from the last full payload — no fetch; the just-clicked button is
+  // replaced by the re-render (the control is intentionally one-shot).
+  // Reviewer finding 3: the clicked window control is destroyed by the
+  // re-render — re-focus its counterpart so Enter keeps working from inside
+  // the section instead of ejecting a keyboard user to <body>.
+  var more = ev.target.closest && ev.target.closest('button[data-glance-more]');
+  if (more) {
+    glanceShowAll = true; renderGlance(CURRENT);
+    var m = $('glance').querySelector('button[data-glance-less]');
+    if (m && m.focus) m.focus();
+    return;
+  }
+  var less = ev.target.closest && ev.target.closest('button[data-glance-less]');
+  if (less) {
+    glanceShowAll = false; renderGlance(CURRENT);
+    var l = $('glance').querySelector('button[data-glance-more]');
+    if (l && l.focus) l.focus();
+    return;
+  }
   // Links keep their own behavior (Greptile PR-32 finding 7 — the rule the
   // parking-lot handler already applies): a chip's PR anchor opens the PR in
   // its tab; it must not also open the detail overlay behind it.
@@ -1310,6 +1421,28 @@ $('pulse').addEventListener('click', function (ev) {
     flightExplicit = collapsed; // session-sticky; beats even a stale stored pref when the write fails
     try { localStorage.setItem(FLIGHT_PREF_KEY, collapsed ? 'collapsed' : 'open'); } catch (e) { /* storage unavailable: flightExplicit keeps the choice for the session */ }
     applyFlightCollapsed(collapsed);
+    return;
+  }
+  // Inbox pulse-tile entry: the tile is a real <button> while the inbox is
+  // non-empty (renderPulse). Clicking it drives the EXISTING glance writer —
+  // applyGlanceCollapsed(false), the same one the glance summary toggle uses,
+  // so a payload re-render keeps the section open (glanceCollapsed is the
+  // single source of truth) — then scrolls the glance section into view and
+  // focuses the first claimable 📄 chip so Enter opens the same detail
+  // overlay the in-flight rows open. Guards: the test stub's elements carry
+  // no scrollIntoView/focus, and with the inbox drained mid-click the
+  // re-render may have swapped the body for the empty state — expanding an
+  // empty glance is still the correct outcome, so only the chip focus is
+  // conditional.
+  var tile = ev.target.closest && ev.target.closest('button[data-tile-inbox]');
+  if (tile) {
+    applyGlanceCollapsed(false);
+    var g = $('glance');
+    if (g) {
+      if (g.scrollIntoView) g.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      var chip = g.querySelector('[data-inbox-file]');
+      if (chip && chip.focus) chip.focus({ preventScroll: true });
+    }
     return;
   }
   // Item-detail overlay entry: clicking an in-flight row opens its detail the
